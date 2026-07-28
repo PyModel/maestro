@@ -117,10 +117,23 @@ A PreToolUse hook blocks your Edit/Write/MultiEdit on real source files (`.ts .t
 
 The hook is registered for `Edit|Write|MultiEdit` only. `Bash`, MCP tools, and `Workflow`/`Agent` are *not* matched, so a redirect, `sed -i`, or a write-capable MCP call reaches the tree untouched. The rule above is a discipline you keep, not a control that keeps you. Never tell the user "the gate blocks this" as evidence a change is safe — say what actually ran and what you verified.
 
-Two known holes, both real today:
+One known hole, still real today:
 
 - The direct-edit override keys off `session_id`, which subagents share (`agent_id` is what distinguishes them). One "edit it yourself" therefore opens the gate for every agent in a fan-out.
-- `write_lock_path` resolves via `git rev-parse --git-dir`, which is per-worktree. N linked worktrees means N independent leases, so the lease does not serialize across them. `--git-common-dir` is the fix.
+
+Fixed: the lease used to resolve via `git rev-parse --git-dir`, which is per-worktree, so N linked worktrees held N independent leases. It now anchors to `--git-common-dir` and serializes repository-wide.
+
+**Detection, since prevention is unavailable.** A probe measured it: `Edit` and `Write` are blocked, while a `Bash` redirect, `sed -i`, and `git commit` all reached the tree and moved `HEAD`. Prevention would mean enumerating an unbounded set of write paths, so Maestro compares state instead — path-agnostic, and indifferent to whether bytes arrived via `Edit`, `Bash`, an MCP tool, or a workflow agent.
+
+Each write-mode acquisition digests the repository — refs, tracked deltas, untracked non-ignored file *contents*, every linked worktree — and compares it against the snapshot the previous dispatch left. A mismatch prints one line before the job starts:
+
+```
+PROVENANCE: BASELINE GAP — tree at acquisition differs from the prior completed snapshot (prior_job=…, expected=…, observed=…); author unknown
+```
+
+Read it as *state diverged*, never as *the orchestrator cheated*. Lease metadata delimits an interval; it never identifies which process performed the write. The gap is recorded to `<common-git-dir>/maestro-provenance.log` and the observed state adopted, so it reports once rather than alarming forever — it does not block, and it never changes `LOOP_STATE` or an exit code.
+
+Two limits worth stating plainly. Ignored paths are **out of observation scope** — not "not source": `.env` and generated inputs do affect behavior, but hashing `node_modules` on every dispatch has unbounded cost, and a diagnostic that slows every run gets turned off. And the log lives inside the repository it watches, so anything able to write anywhere can rewrite it. This catches accidental convention failures and unnoticed agent writes, which is what actually happens. It is not an adversarial control, and must never be described as one.
 
 ## Model choice
 
