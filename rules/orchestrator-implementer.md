@@ -111,6 +111,17 @@ Never silently patch Codex's work yourself — fixes go back through the impleme
 
 A PreToolUse hook blocks your Edit/Write/MultiEdit on real source files (`.ts .tsx .js .py .go .rs …`) for the whole task. Never gated: `~/.claude`, `~/.codex`, `/tmp`, `~/Desktop`, and any non-code file — plan files, notes, and config are always yours to write. The gate opens only when the user explicitly says "edit it yourself" / "sen yap", and resets on the next task. Codex unreachable and the change is trivial → ask the user for direct-edit approval; don't route around the gate.
 
+**What the gate is, exactly — do not overstate it.**
+
+> The orchestrator must not author source or delegate source writing to subagents. The gate blocks direct Edit, Write, and MultiEdit calls as a guardrail, not a complete filesystem boundary; Maestro does not currently prevent or reliably attribute repository mutations made through other execution paths.
+
+The hook is registered for `Edit|Write|MultiEdit` only. `Bash`, MCP tools, and `Workflow`/`Agent` are *not* matched, so a redirect, `sed -i`, or a write-capable MCP call reaches the tree untouched. The rule above is a discipline you keep, not a control that keeps you. Never tell the user "the gate blocks this" as evidence a change is safe — say what actually ran and what you verified.
+
+Two known holes, both real today:
+
+- The direct-edit override keys off `session_id`, which subagents share (`agent_id` is what distinguishes them). One "edit it yourself" therefore opens the gate for every agent in a fan-out.
+- `write_lock_path` resolves via `git rev-parse --git-dir`, which is per-worktree. N linked worktrees means N independent leases, so the lease does not serialize across them. `--git-common-dir` is the fix.
+
 ## Model choice
 
 The orchestrator model is a `/model` choice, not a config here: Opus 5 as the everyday master, Fable 5 when the planning or review judgment is the expensive part. The implementer model is whatever your Codex login reaches.
