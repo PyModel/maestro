@@ -29,6 +29,18 @@ function backup(file) {
   }
 }
 
+function atomicCopy(src, dest) {
+  const tmp = `${dest}.maestro-tmp-${process.pid}`;
+  fs.copyFileSync(src, tmp);
+  try { fs.chmodSync(tmp, fs.statSync(src).mode); } catch {}
+  try {
+    fs.renameSync(tmp, dest);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw error;
+  }
+}
+
 // --- 1. Prerequisite: the codex-plugin-cc companion must exist ---
 function findCompanion() {
   const base = path.join(CLAUDE, 'plugins', 'cache', 'openai-codex', 'codex');
@@ -69,7 +81,7 @@ const HOOK_FILES = [
   'lib-companion.sh', 'codex-model-select.sh', 'codex-mcp-check.sh',
 ];
 for (const f of HOOK_FILES) {
-  fs.copyFileSync(path.join(REPO, 'hooks', f), path.join(HOOKS, f));
+  atomicCopy(path.join(REPO, 'hooks', f), path.join(HOOKS, f));
 }
 for (const f of ['implementer-watchdog.sh', 'implementer-loop.sh', 'discussion-loop.sh', 'codex-model-select.sh', 'codex-mcp-check.sh']) {
   try { fs.chmodSync(path.join(HOOKS, f), 0o755); } catch {}
@@ -81,7 +93,7 @@ for (const f of RULE_FILES) {
   const dest = path.join(RULES, f);
   // you may already have a rule by this name — keep a copy before overwriting it
   if (fs.existsSync(dest) && !fs.readFileSync(dest).equals(fs.readFileSync(src))) backup(dest);
-  fs.copyFileSync(src, dest);
+  atomicCopy(src, dest);
 }
 log(`copied ${HOOK_FILES.length} hooks → ~/.claude/hooks and ${RULE_FILES.length} rules → ~/.claude/rules`);
 
@@ -91,7 +103,7 @@ function installSkill(name) {
   const dest = path.join(destDir, 'SKILL.md');
   fs.mkdirSync(destDir, { recursive: true });
   if (fs.existsSync(dest) && !fs.readFileSync(dest).equals(fs.readFileSync(src))) backup(dest);
-  fs.copyFileSync(src, dest);
+  atomicCopy(src, dest);
   log(`copied skills/${name} → ~/.claude/skills (loaded on demand, not every session)`);
 }
 
