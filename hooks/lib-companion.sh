@@ -410,7 +410,38 @@ companion_poll() {
       last_phase="$phase"
     fi
     if [ "$preview" != "$last_preview" ]; then
-      preview_emit=$(printf '%s\n' "$preview" | head -4)
+      preview_emit=$(
+        awk '
+          FNR == NR {
+            prev[++prev_len] = $0
+            next
+          }
+          {
+            cur[++cur_len] = $0
+          }
+          END {
+            max_overlap = prev_len < cur_len ? prev_len : cur_len
+            overlap = 0
+            for (k = max_overlap; k > 0; k--) {
+              matches = 1
+              for (i = 1; i <= k; i++) {
+                if (prev[prev_len - k + i] != cur[i]) {
+                  matches = 0
+                  break
+                }
+              }
+              if (matches) {
+                overlap = k
+                break
+              }
+            }
+            for (i = overlap + 1; i <= cur_len; i++) {
+              print cur[i]
+            }
+          }
+        ' <(printf '%s\n' "$last_preview" | head -4) \
+          <(printf '%s\n' "$preview" | head -4)
+      )
       while IFS= read -r line; do
         [ -n "$line" ] || continue
         if [ "${#line}" -gt 160 ]; then
