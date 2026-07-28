@@ -6,11 +6,12 @@
 #   progress <message>                     → writes one progress line to FD 3
 #   write_lock_acquire [job]               → returns 0 acquired/inherited | 11 live contention
 #   write_lock_set_job <job>               → records a known job id for the current owner
-#   write_lock_release                     → releases only a lock acquired by this process
+#   write_lock_release                     → releases an acquired lock only after its lease ends
 #   companion_resolve                      → prints companion path, or returns 3
 #   companion_pin                          → prints model<TAB>effort, or returns 3
 #   companion_start <C> <prompt> [write]   → prints job id, or returns 3 (fails closed without a pin)
 #   companion_verify_pin <C> <job> <model> <effort> → returns 0 match | 4 mismatch
+#   companion_workspace_writers <C>        → prints job<TAB>write, or returns 4
 #   companion_poll  <C> <job> <idle> <sec> → returns 0 done | 4 failed | 124 hung | 6 status-lost
 #   companion_result <C> <job>             → prints result (retried), or returns 4
 #
@@ -43,9 +44,109 @@ write_lock_metadata_value() {
   sed -n "s/^${field}=//p" "$metadata" 2>/dev/null | head -1
 }
 
+companion_workspace_writers() {
+  local C="$1" status parsed rc
+  if ! status=$(node "$C" status --all --json 2>/dev/null); then
+    return 4
+  fi
+  [ -n "${status//[[:space:]]/}" ] || return 4
+
+  parsed=$(printf '%s\n' "$status" | awk '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    BEGIN {
+      first = ""
+      last = ""
+      seen_running = 0
+      closed_running = 0
+      in_running = 0
+      depth = 0
+      bad = 0
+    }
+    {
+      line = $0
+      stripped = trim(line)
+      if (stripped != "") {
+        if (first == "") first = stripped
+        last = stripped
+      }
+
+      if (!in_running) {
+        if (line ~ /^[[:space:]]*"running"[[:space:]]*:[[:space:]]*\[[[:space:]]*\][[:space:]]*,?[[:space:]]*$/) {
+          seen_running = 1
+          closed_running = 1
+        } else if (line ~ /^[[:space:]]*"running"[[:space:]]*:[[:space:]]*\[[[:space:]]*$/) {
+          seen_running = 1
+          in_running = 1
+        }
+        next
+      }
+
+      if (depth == 0 && line ~ /^[[:space:]]*\][[:space:]]*,?[[:space:]]*$/) {
+        in_running = 0
+        closed_running = 1
+        next
+      }
+
+      if (line ~ /\{[[:space:]]*$/) {
+        depth++
+        if (depth == 1) {
+          job_id = ""
+          write_flag = ""
+        }
+        next
+      }
+
+      if (line ~ /^[[:space:]]*\}[[:space:]]*,?[[:space:]]*$/) {
+        if (depth == 1) {
+          if (job_id == "" || write_flag == "") {
+            bad = 1
+          } else {
+            print job_id, write_flag
+          }
+        }
+        depth--
+        if (depth < 0) bad = 1
+        next
+      }
+
+      if (depth == 1 && line ~ /^[[:space:]]*"id"[[:space:]]*:[[:space:]]*"[^"]*"[[:space:]]*,?[[:space:]]*$/) {
+        value = line
+        sub(/^[[:space:]]*"id"[[:space:]]*:[[:space:]]*"/, "", value)
+        sub(/"[[:space:]]*,?[[:space:]]*$/, "", value)
+        job_id = value
+      } else if (depth == 1 && line ~ /^[[:space:]]*"write"[[:space:]]*:[[:space:]]*(true|false)[[:space:]]*,?[[:space:]]*$/) {
+        value = line
+        sub(/^[[:space:]]*"write"[[:space:]]*:[[:space:]]*/, "", value)
+        sub(/[[:space:]]*,?[[:space:]]*$/, "", value)
+        write_flag = value
+      }
+    }
+    END {
+      if (first != "{" || last != "}" || !seen_running || !closed_running || in_running || depth != 0 || bad) {
+        exit 4
+      }
+    }
+  ')
+  rc=$?
+  [ "$rc" -eq 0 ] || return 4
+  [ -n "$parsed" ] && printf '%s\n' "$parsed"
+  return 0
+}
+
+write_lock_workspace_writers() {
+  local companion
+  companion=$(companion_resolve) || return 4
+  companion_workspace_writers "$companion"
+}
+
 write_lock_acquire() {
   local requested_job="${1:-unknown}" metadata recorded_token owner_pid owner_start
-  local owner_job started_epoch current_start stale held now attempt token process_start
+  local owner_job started_epoch current_start held now attempt token process_start
+  local writers writers_rc
   MAESTRO_LOCK_ACQUIRED=0
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
   metadata="$MAESTRO_LOCK_DIR/metadata"
@@ -97,21 +198,47 @@ write_lock_acquire() {
     owner_job=$(write_lock_metadata_value "$metadata" job_id)
     started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
     owner_job=${owner_job:-unknown}
-    stale=0
-    if [ -z "$owner_pid" ] || ! kill -0 "$owner_pid" 2>/dev/null; then
-      stale=1
-    else
+    current_start=""
+    if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
       current_start=$(ps -o lstart= -p "$owner_pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-      [ -n "$current_start" ] && [ "$current_start" != "$owner_start" ] && stale=1
     fi
 
-    if [ "$stale" -eq 1 ]; then
-      if rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null &&
-        rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
-        progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job pid=${owner_pid:-unknown}"
-        attempt=$((attempt + 1))
-        continue
+    if [ -n "$current_start" ] && [ "$current_start" = "$owner_start" ]; then
+      case "$started_epoch" in
+        ''|*[!0-9]*) held="unknown" ;;
+        *)
+          now=$(date +%s)
+          held=$((now - started_epoch))
+          [ "$held" -lt 0 ] && held=0
+          held="${held}s"
+          ;;
+      esac
+      progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)"
+      return 11
+    fi
+
+    writers=$(write_lock_workspace_writers)
+    writers_rc=$?
+    if [ "$writers_rc" -eq 4 ]; then
+      progress "MAESTRO_LOCK: dispatcher is gone but job liveness could not be determined; write lock retained (job=$owner_job pid=${owner_pid:-unknown}, lock: $MAESTRO_LOCK_DIR)"
+      return 11
+    fi
+
+    if [ "$owner_job" != "unknown" ]; then
+      if printf '%s\n' "$writers" | awk -v job="$owner_job" '$1 == job { found = 1 } END { exit !found }'; then
+        progress "MAESTRO_LOCK: write dispatch blocked; lease retained because orphaned job=$owner_job is still running (lock: $MAESTRO_LOCK_DIR)"
+        return 11
       fi
+    elif printf '%s\n' "$writers" | awk '$2 == "true" { found = 1 } END { exit !found }'; then
+      progress "MAESTRO_LOCK: write dispatch blocked; lease retained because an unidentified write-capable job is still running (lock: $MAESTRO_LOCK_DIR)"
+      return 11
+    fi
+
+    if rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null &&
+      rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
+      progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job pid=${owner_pid:-unknown}"
+      attempt=$((attempt + 1))
+      continue
     fi
 
     case "$started_epoch" in
@@ -155,12 +282,31 @@ write_lock_set_job() {
 }
 
 write_lock_release() {
-  local metadata recorded_token
+  local metadata recorded_token owner_job writers writers_rc
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || return 0
   metadata="${MAESTRO_LOCK_DIR:-}/metadata"
   [ -n "${MAESTRO_LOCK_DIR:-}" ] && [ -f "$metadata" ] || return 0
   recorded_token=$(write_lock_metadata_value "$metadata" token)
   [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || return 0
+  owner_job=$(write_lock_metadata_value "$metadata" job_id)
+  owner_job=${owner_job:-unknown}
+
+  writers=$(write_lock_workspace_writers)
+  writers_rc=$?
+  if [ "$writers_rc" -eq 4 ]; then
+    progress "MAESTRO_LOCK: job liveness could not be determined; write lease retained (job=$owner_job, lock: $MAESTRO_LOCK_DIR)"
+    return 0
+  fi
+  if [ "$owner_job" != "unknown" ]; then
+    if printf '%s\n' "$writers" | awk -v job="$owner_job" '$1 == job { found = 1 } END { exit !found }'; then
+      progress "MAESTRO_LOCK: write lease retained because job $owner_job is still running; a later dispatch will resolve it (lock: $MAESTRO_LOCK_DIR)"
+      return 0
+    fi
+  elif printf '%s\n' "$writers" | awk '$2 == "true" { found = 1 } END { exit !found }'; then
+    progress "MAESTRO_LOCK: write lease retained because an unidentified write-capable job is still running; a later dispatch will resolve it (lock: $MAESTRO_LOCK_DIR)"
+    return 0
+  fi
+
   rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null || return 0
   rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
   MAESTRO_LOCK_ACQUIRED=0

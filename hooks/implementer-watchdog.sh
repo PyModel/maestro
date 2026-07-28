@@ -22,8 +22,9 @@
 # script prints IMPLEMENTER_STATE: DONE|NEEDS_ANSWERS|BLOCKED|FAILED|MISSING to
 # stderr so callers never parse prose for the verdict.
 #
-# Exit codes: 0 = result printed | 124 = hung, cancelled | 3 = could not start
-#             4 = job failed | 11 = write lock held
+# Exit codes: 0 = DONE result printed | 10 = NEEDS_ANSWERS result printed
+#             11 = BLOCKED result printed or write lock held | 124 = hung, cancelled
+#             3 = could not start | 4 = job failed or result missing
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -31,24 +32,37 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$HERE/lib-companion.sh"
 progress_init
 
-FINAL_STATE="FAILED"
+FINAL_STATE="INTERRUPTED"
+FINAL_RC=4
+maestro_finish() {
+  FINAL_STATE="$1"
+  FINAL_RC="$2"
+  exit "$FINAL_RC"
+}
+maestro_interrupt() {
+  maestro_finish "INTERRUPTED" 4
+}
 cleanup() {
-  local rc=$?
+  trap - EXIT HUP INT TERM
   write_lock_release
-  progress "MAESTRO_FINAL: WATCHDOG $FINAL_STATE rc=$rc"
+  progress "MAESTRO_FINAL: WATCHDOG $FINAL_STATE rc=$FINAL_RC"
+  exit "$FINAL_RC"
 }
 trap cleanup EXIT
+trap maestro_interrupt HUP INT TERM
 
 if [ "${1:-}" = "--file" ]; then
-  FILE="${2:?plan file required after --file}"
+  [ $# -ge 2 ] || { echo "WATCHDOG_ERROR: plan file required after --file" >&2; maestro_finish "FAILED" 3; }
+  FILE="$2"
   if [ ! -f "$FILE" ]; then
     echo "WATCHDOG_ERROR: plan file not found: $FILE" >&2
-    exit 3
+    maestro_finish "FAILED" 3
   fi
   PROMPT=$(cat "$FILE")
   shift 2
 else
-  PROMPT="${1:?plan required}"
+  [ $# -ge 1 ] || { echo "WATCHDOG_ERROR: plan required" >&2; maestro_finish "FAILED" 3; }
+  PROMPT="$1"
   shift 1
 fi
 MAX_IDLE="${1:-300}"
@@ -57,8 +71,8 @@ POLL="${2:-20}"
 write_lock_acquire
 lock_rc=$?
 if [ "$lock_rc" -ne 0 ]; then
-  [ "$lock_rc" -eq 11 ] && FINAL_STATE="BLOCKED"
-  exit "$lock_rc"
+  [ "$lock_rc" -eq 11 ] && maestro_finish "BLOCKED" 11
+  maestro_finish "FAILED" "$lock_rc"
 fi
 
 # Implementer contract — appended to every dispatch so each run is disciplined by
@@ -98,23 +112,22 @@ PROMPT="${PROMPT}${CONTRACT}"
 
 C=$(companion_resolve) || {
   echo "WATCHDOG_ERROR: codex-companion.mjs not found. Is the openai/codex-plugin-cc plugin installed? (run: /plugin install codex@openai-codex)" >&2
-  exit 3
+  maestro_finish "FAILED" 3
 }
 
 PIN=$(companion_pin 2>/dev/null) || {
   echo "WATCHDOG_ERROR: no Codex model/effort pinned — run codex-model-select.sh <model> <effort> first." >&2
-  exit 3
+  maestro_finish "FAILED" 3
 }
 PIN_MODEL=${PIN%%$'\t'*}
 PIN_EFFORT=${PIN#*$'\t'}
 
 JOB=$(companion_start "$C" "$PROMPT" write) || {
   echo "WATCHDOG_ERROR: could not start Codex job (see above)." >&2
-  exit 3
+  maestro_finish "FAILED" 3
 }
 write_lock_set_job "$JOB"
 progress "WATCHDOG: started $JOB (model=$PIN_MODEL effort=$PIN_EFFORT, write mode, max_idle=${MAX_IDLE}s poll=${POLL}s)"
-echo "WATCHDOG: started $JOB (model=$PIN_MODEL effort=$PIN_EFFORT, write mode, max_idle=${MAX_IDLE}s poll=${POLL}s)" >&2
 companion_verify_pin "$C" "$JOB" "$PIN_MODEL" "$PIN_EFFORT" || :
 
 companion_poll "$C" "$JOB" "$MAX_IDLE" "$POLL"
@@ -123,7 +136,7 @@ case "$rc" in
   0)
     if ! OUT=$(companion_result "$C" "$JOB"); then
       echo "WATCHDOG_FAILED: job $JOB completed but returned no result. Continue on Opus alone." >&2
-      exit 4
+      maestro_finish "FAILED" 4
     fi
     printf '%s\n' "$OUT"
     STATE=$(printf '%s' "$OUT" | grep -oE '^RESULT:[[:space:]]*(DONE|NEEDS_ANSWERS|BLOCKED|FAILED)' | head -1 | sed 's/^RESULT:[[:space:]]*//')
@@ -131,19 +144,22 @@ case "$rc" in
       FINAL_STATE="$STATE"
       echo "IMPLEMENTER_STATE: $STATE" >&2
     else
-      FINAL_STATE="MISSING"
       echo "IMPLEMENTER_STATE: MISSING (no RESULT line — treat as FAILED and re-dispatch with the output)" >&2
+      maestro_finish "MISSING" 4
     fi
-    exit 0 ;;
+    case "$STATE" in
+      DONE) maestro_finish "DONE" 0 ;;
+      NEEDS_ANSWERS) maestro_finish "NEEDS_ANSWERS" 10 ;;
+      BLOCKED) maestro_finish "BLOCKED" 11 ;;
+      FAILED) maestro_finish "FAILED" 4 ;;
+    esac ;;
   124)
-    FINAL_STATE="HUNG"
     progress "WATCHDOG_HUNG: job $JOB stalled for ${MAX_IDLE}s (no log growth); cancelled. Re-dispatch with a narrower plan or ask the user."
-    echo "WATCHDOG_HUNG: job $JOB stalled for ${MAX_IDLE}s (no log growth); cancelled. Re-dispatch with a narrower plan or ask the user." >&2
-    exit 124 ;;
+    maestro_finish "HUNG" 124 ;;
   6)
     echo "WATCHDOG_FAILED: companion status unreachable; job $JOB state unknown. Check the tree before re-dispatching." >&2
-    exit 4 ;;
+    maestro_finish "FAILED" 4 ;;
   *)
     echo "WATCHDOG_FAILED: job $JOB ended failed. Re-dispatch with the failure evidence, or ask the user." >&2
-    exit 4 ;;
+    maestro_finish "FAILED" 4 ;;
 esac
