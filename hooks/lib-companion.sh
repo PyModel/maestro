@@ -28,7 +28,8 @@ progress() { printf '%s\n' "$*" >&3; }
 write_lock_path() {
   local workspace git_dir
   workspace=$(pwd -P)
-  if git_dir=$(git rev-parse --git-dir 2>/dev/null); then
+  if { git_dir=$(git rev-parse --git-common-dir 2>/dev/null) && [ -n "$git_dir" ]; } ||
+    git_dir=$(git rev-parse --git-dir 2>/dev/null); then
     case "$git_dir" in
       /*) ;;
       *) git_dir="$workspace/$git_dir" ;;
