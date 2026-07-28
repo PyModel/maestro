@@ -8,7 +8,6 @@
 #   write_lock_acquire [job]               → returns 0 acquired/inherited | 11 live contention
 #   write_lock_set_job <job>               → records a known job id for the current owner
 #   write_lock_release                     → releases an acquired lock only after its lease ends
-#   provenance_check                       → prints the repository provenance status
 #   companion_resolve                      → prints companion path, or returns 3
 #   companion_pin                          → prints model<TAB>debate-effort<TAB>impl-effort, or returns 3
 #   companion_start <C> <prompt> [write]   → prints job id, or returns 3 (fails closed without a pin)
@@ -40,7 +39,7 @@ companion_wrapper_accepts_effort() {
 }
 
 repo_digest() {
-  local inside worktrees digest
+  local inside worktrees digest untracked untracked_digest
   inside=$(git rev-parse --is-inside-work-tree 2>/dev/null) || return 1
   [ "$inside" = "true" ] || return 1
   worktrees=$(git worktree list --porcelain 2>/dev/null) || return 1
@@ -56,6 +55,20 @@ repo_digest() {
       git -C "$worktree" diff HEAD --binary -- 2>/dev/null || exit 1
       printf 'status\n'
       git -C "$worktree" status --porcelain 2>/dev/null || exit 1
+      printf 'untracked\n'
+      # Ignored paths are out of observation scope, not "not source": hashing them has
+      # unbounded cost (for example node_modules and build outputs).
+      git -C "$worktree" ls-files --others --exclude-standard -z 2>/dev/null |
+        LC_ALL=C sort -z |
+        while IFS= read -r -d '' untracked; do
+          printf 'path\0%s\0' "$untracked"
+          if untracked_digest=$(git -C "$worktree" hash-object -- "$untracked" 2>/dev/null); then
+            printf 'contents=%s\n' "$untracked_digest"
+          else
+            # The entry may vanish after enumeration; preserve a degraded marker.
+            printf 'contents=unavailable\n'
+          fi
+        done
     done <<< "$worktrees"
   } | shasum | awk '{print $1}') || return 1
   [ -n "$digest" ] || return 1
@@ -197,7 +210,7 @@ write_lock_workspace_writers() {
 write_lock_acquire() {
   local requested_job="${1:-unknown}" metadata recorded_token owner_pid owner_start
   local owner_job started_epoch current_start held now attempt token process_start
-  local writers writers_rc digest_before
+  local writers writers_rc digest_before log_path last prior_job prior_after observed_at
   MAESTRO_LOCK_ACQUIRED=0
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
   metadata="$MAESTRO_LOCK_DIR/metadata"
@@ -222,6 +235,24 @@ write_lock_acquire() {
       fi
       now=$(date +%s)
       digest_before=$(repo_digest 2>/dev/null) || digest_before=unavailable
+      if log_path=$(provenance_log_path 2>/dev/null) && [ -f "$log_path" ]; then
+        last=$(grep -E '^[^ ]+ type=dispatch job=[^ ]+ before=[^ ]+ after=[^ ]+$' \
+          "$log_path" 2>/dev/null | tail -1)
+        if [ -n "$last" ]; then
+          prior_job=${last#* job=}
+          prior_job=${prior_job%% *}
+          prior_after=${last##* after=}
+          if [ "$prior_after" != "unavailable" ] &&
+            [ "$digest_before" != "unavailable" ] &&
+            [ "$prior_after" != "$digest_before" ]; then
+            observed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+            progress "PROVENANCE: BASELINE GAP — tree at acquisition differs from the prior completed snapshot (prior_job=$prior_job, expected=$prior_after, observed=$digest_before); author unknown"
+            printf '%s type=gap prior_job=%s expected=%s observed=%s\n' \
+              "$observed_at" "$prior_job" "$prior_after" "$digest_before" \
+              >> "$log_path" 2>/dev/null || :
+          fi
+        fi
+      fi
       if ! printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
         "$token" "$$" "$process_start" "$requested_job" \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$now" "$digest_before" > "$metadata"; then
@@ -372,47 +403,12 @@ write_lock_release() {
   rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
   if log_path=$(provenance_log_path 2>/dev/null); then
     # Best-effort diagnostic only, not an enforcement boundary: repository writers can rewrite this log.
-    printf '%s job=%s before=%s after=%s\n' \
+    # A differing before/after pair is a dispatch-window change with an unknown author:
+    # lease metadata delimits an interval; it never identifies which process wrote.
+    printf '%s type=dispatch job=%s before=%s after=%s\n' \
       "$released_at" "$owner_job" "$digest_before" "$digest_after" >> "$log_path" 2>/dev/null || :
   fi
   MAESTRO_LOCK_ACQUIRED=0
-}
-
-provenance_check() {
-  local lock_path metadata log_path last current after job at
-  if lock_path=$(write_lock_path 2>/dev/null) &&
-    [ -d "$lock_path" ] && [ -r "$lock_path/metadata" ]; then
-    metadata="$lock_path/metadata"
-    job=$(write_lock_metadata_value "$metadata" job_id)
-    job=${job:-unknown}
-    # Accept the known false negative from a stale lease until the next dispatch resolves it:
-    # this is a diagnostic, not an enforcement boundary, so do not add liveness checks here.
-    printf '%s\n' "PROVENANCE: in flight — a write lease is held (job=$job), so the tree is mid-dispatch"
-    return 0
-  fi
-  if ! log_path=$(provenance_log_path 2>/dev/null) || [ ! -f "$log_path" ]; then
-    printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"
-    return 0
-  fi
-  last=$(grep -E '^[^ ]+ job=[^ ]+ before=[^ ]+ after=[^ ]+$' "$log_path" 2>/dev/null | tail -1)
-  if [ -z "$last" ]; then
-    printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"
-    return 0
-  fi
-
-  current=$(repo_digest 2>/dev/null) || current=unavailable
-  after=${last##* after=}
-  if [ "$current" = "$after" ]; then
-    printf '%s\n' "PROVENANCE: clean — tree matches the last dispatch"
-    return 0
-  fi
-
-  at=${last%% *}
-  job=${last#* job=}
-  job=${job%% *}
-  # Best-effort diagnostic only, not an enforcement boundary or a dispatch verdict.
-  printf '%s\n' "PROVENANCE: UNATTRIBUTED CHANGE — the tree differs from the state the last dispatch left (job=$job, at $at)"
-  return 1
 }
 
 companion_resolve() {

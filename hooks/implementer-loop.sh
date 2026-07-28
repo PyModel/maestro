@@ -46,14 +46,11 @@ maestro_interrupt() {
   maestro_finish "INTERRUPTED" 4
 }
 cleanup() {
-  local provenance_line=""
   trap - EXIT HUP INT TERM
   [ -n "$ATTEMPTS" ] && rm -f "$ATTEMPTS"
   [ -n "$DISPATCH" ] && rm -f "$DISPATCH"
   [ -n "$ERRF" ] && rm -f "$ERRF"
   write_lock_release
-  provenance_line=$(provenance_check 2>/dev/null) || :
-  [ -n "$provenance_line" ] && progress "$provenance_line"
   progress "MAESTRO_FINAL: LOOP $FINAL_STATE rc=$FINAL_RC"
   exit "$FINAL_RC"
 }
