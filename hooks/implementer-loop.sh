@@ -144,7 +144,8 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
       maestro_finish "BLOCKED" 11 ;;
     DONE)
       progress "LOOP: RESULT: DONE on iteration $i — verifying locally: $VERIFY"
-      VOUT=$(bash -c "$VERIFY" 2>&1)
+      # Close FD 3 so verifier progress re-points to stdout and lands in VOUT instead of the operator channel.
+      VOUT=$(bash -c "$VERIFY" 2>&1 3>&-)
       vrc=$?
       if [ "$vrc" -eq 0 ]; then
         printf '%s\n' "$OUT"
