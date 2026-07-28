@@ -125,13 +125,23 @@ Fixed: the lease used to resolve via `git rev-parse --git-dir`, which is per-wor
 
 **Detection, since prevention is unavailable.** A probe measured it: `Edit` and `Write` are blocked, while a `Bash` redirect, `sed -i`, and `git commit` all reached the tree and moved `HEAD`. Prevention would mean enumerating an unbounded set of write paths, so Maestro compares state instead — path-agnostic, and indifferent to whether bytes arrived via `Edit`, `Bash`, an MCP tool, or a workflow agent.
 
-Each write-mode acquisition digests the repository — refs, tracked deltas, untracked non-ignored file *contents*, every linked worktree — and compares it against the snapshot the previous dispatch left. A mismatch prints one line before the job starts:
+Each write-mode acquisition digests the **materialized tree** — path, type, mode and content for tracked and non-ignored untracked files, across every linked worktree and every initialized submodule — and compares it against the snapshot the previous dispatch left. `HEAD` and the index are deliberately *not* covered. A mismatch prints one line before the job starts:
 
 ```
 PROVENANCE: BASELINE GAP — tree at acquisition differs from the prior completed snapshot (prior_job=…, expected=…, observed=…); author unknown
 ```
 
-Read it as *state diverged*, never as *the orchestrator cheated*. Lease metadata delimits an interval; it never identifies which process performed the write. The gap is recorded to `<common-git-dir>/maestro-provenance.log` and the observed state adopted, so it reports once rather than alarming forever — it does not block, and it never changes `LOOP_STATE` or an exit code.
+Content, not refs, is what the next job reads — and anchoring to refs made the loop's own prescribed step fire the alarm. Reviewing a dispatch and committing it moved the digest without changing a byte on disk, so every round reported a gap: a 100% false-positive rate on the normal path, which is the alarm fatigue this design rejected when it ruled out sticky warnings. So committing does not move the digest; a `checkout`, `reset`, or stray `sed -i` that changes content still does. A history rewrite that preserves file content is invisible, which is intended.
+
+The digest value is self-describing (`tree-v2:…`). A reader takes the **newest** record and *then* inspects the prefix: an unrecognised or `unavailable` value means **no observation** — never equal, never unequal. Selecting records by prefix instead would skip past newer records to a stale comparable one and manufacture the gap this exists to avoid. One consequence, and it is correct: the first dispatch after a digest-version change finds no comparable baseline, says nothing, and establishes a new one.
+
+Read a gap as *state diverged*, never as *the orchestrator cheated*. Lease metadata delimits an interval; it never identifies which process performed the write. The gap is recorded to `<common-git-dir>/maestro-provenance.log` and the observed state adopted, so it reports once rather than alarming forever — it does not block, and it never changes `LOOP_STATE` or an exit code.
+
+A second line covers the one interval Maestro genuinely cannot observe. When a later dispatch steals an orphaned lease, everything between the orphan's last write and the steal is unattributable — Maestro cannot see when the orphan stopped. Rather than resolve that in the orphan's favour, the synthesized record is typed `orphan-adopted` and, when the tree moved, says so:
+
+```
+PROVENANCE: ADOPTED UNOBSERVED INTERVAL — the tree changed while an orphaned lease was held (job=…, expected=…, observed=…); the interval was not observed and the author is unknown
+```
 
 Two limits worth stating plainly. Ignored paths are **out of observation scope** — not "not source": `.env` and generated inputs do affect behavior, but hashing `node_modules` on every dispatch has unbounded cost, and a diagnostic that slows every run gets turned off. And the log lives inside the repository it watches, so anything able to write anywhere can rewrite it. This catches accidental convention failures and unnoticed agent writes, which is what actually happens. It is not an adversarial control, and must never be described as one.
 
