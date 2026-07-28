@@ -1,16 +1,42 @@
-# Maestro
+<div align="center">
 
-**Claude Opus 5 (or Fable 5) is the master — Codex is the hands.**
+# 🎼 Maestro
 
-The orchestrator thinks through *what* and *how* — architecture, plans, reviews, talking to you — but never touches source files. Codex, dispatched through a watchdog, writes the code, runs the verification, and returns a structured result: evidence, or the questions it needs answered. A gate stops Claude from writing source at all, so the split is a mechanism, not a resolution.
+### **Claude is the master. Codex is the hands.**
+
+*An orchestrator/implementer loop for Claude Code — Opus plans, debates, and reviews; Codex writes the code and proves it works.*
+
+[![License](https://img.shields.io/badge/license-MIT-3DA639?style=for-the-badge)](LICENSE)
+[![Claude](https://img.shields.io/badge/Claude-Opus%205%20·%20Fable%205-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://claude.com/claude-code)
+[![Codex](https://img.shields.io/badge/Codex-write--enabled-412991?style=for-the-badge&logo=openai&logoColor=white)](https://openai.com/codex)
+[![Bash](https://img.shields.io/badge/shell-bash-4EAA25?style=for-the-badge&logo=gnubash&logoColor=white)](hooks/)
+[![Node](https://img.shields.io/badge/runtime-Node-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)](install.mjs)
+[![Platform](https://img.shields.io/badge/platform-macOS%20·%20Linux-0A84FF?style=for-the-badge&logo=apple&logoColor=white)](#requirements)
+[![Tests](https://img.shields.io/badge/tests-6%20suites-00B34A?style=for-the-badge)](tests/)
+[![No API key](https://img.shields.io/badge/no%20API%20key-ChatGPT%20login-FF6B35?style=for-the-badge)](#requirements)
+
+</div>
+
+---
+
+The orchestrator thinks through *what* and *how* — architecture, plans, reviews, talking to you — but never touches source files. Codex, dispatched through a watchdog, writes the code, runs the verification, and returns a structured result: evidence, or the questions it needs answered.
 
 It runs on your existing **ChatGPT Plus / Codex login**. No OpenAI API key, no proxy, no second subscription.
 
-Maestro makes Claude the orchestrating brain and Codex the write-enabled implementer: Claude plans, debates, and reviews; Codex executes and verifies.
+```bash
+git clone https://github.com/Pythoughts-labs/maestro.git
+cd maestro && node install.mjs
+```
+
+> Restart Claude Code (plain `claude`) afterward so the rules and hooks load.
+
+---
 
 ## Why
 
-Some teams trust Claude's judgment more than its patience, and Codex's typing more than its plans. Maestro is for that split: the model you want making decisions (Opus 5 / Fable 5) holds the plan and the final review; the model you want grinding through edits holds the pen. The loop also fixes what breaks in practice — Codex hanging mid-task, an implementer that guesses when the plan is ambiguous, a review that rubber-stamps its own plan.
+Some teams trust Claude's judgment more than its patience, and Codex's typing more than its plans. Maestro is for that split: the model you want making decisions (Opus 5 / Fable 5) holds the plan and the final review; the model you want grinding through edits holds the pen.
+
+The loop also fixes what breaks in practice — Codex hanging mid-task, an implementer that guesses when the plan is ambiguous, a review that rubber-stamps its own plan.
 
 ## How it works
 
@@ -29,57 +55,107 @@ your prompt
    → done
 ```
 
-Ten pieces, all installed under `~/.claude` (plus one shared library they source):
+### Exit codes
 
-- **`session-start.mjs`** — a `SessionStart` hook that opens each new session with the Codex setup question: which model and which reasoning effort the implementer should run this session. Resumed sessions get a one-line status instead of a re-ask. Toggle with `codex-model-select.sh --ask-on-start off`.
-- **`codex-model-select.sh`** — pins `model` + `model_reasoning_effort` in the top level of `~/.codex/config.toml` (TOML-safe, backed up, idempotent; keys inside `[tables]` never touched). One setting feeds both loops. Effort guide: minimal/low for mechanical fixes, medium default, high for debates and delicate judgment. Mid-session, saying *"codex model"* re-opens the picker.
-- **`codex-mcp-check.sh`** — shows exactly which `[mcp_servers.*]` your background Codex jobs inherit from `~/.codex/config.toml`, with env keys masked, plus the built-in `web_search` status (disabled on purpose; MCPs unaffected). Run it once after setup to confirm tavily/context7 are visible to the loops.
-- **`implementer-loop.sh`** — the autonomous heart. Wraps the watchdog in a bounded, evidence-fed, self-verifying loop: dispatch the plan → parse the `RESULT` → on a DONE claim, re-run your verify command *locally* (a claim is not proof) → on any failure, append the actual failing output to the next dispatch so Codex never repeats an approach blind. No babysitting between rounds: it exits only as `VERIFIED_DONE` (0), `NEEDS_ANSWERS` (10), `BLOCKED` (11), or `STUCK` at the iteration cap (12) with the full attempts log. `--max-iters 0` is prohibited — an unbounded write loop is a runaway, not autonomy.
+The loop never ends in prose. Every run finishes on a machine-readable state:
 
-- **`discussion-loop.sh`** — the bidirectional debate channel. Claude drives it like a user would: it writes its turn (position + strongest evidence) to a file, the script appends it to a persistent transcript and dispatches the *whole* transcript to Codex **read-only** — nobody edits code mid-argument. Codex shares no memory between calls, so the transcript *is* the memory. Every reply opens with a stance (`STANCE: AGREE / PUSHBACK / ALTERNATIVE / REFRAME`), every discussion must terminate in `CONVERGED` (agreed design + why the losers lost), `ESCALATE` (a genuine human fork, relayed verbatim), or the enforced 6-turn cap. After each reply the script prints a machine-readable `DISCUSSION_STATE: CONVERGED / ESCALATE / CONTINUE` so the orchestrator never guesses whether to stop. Transient job failures retry automatically (read-only retries are free); hangs don't (a hang is usually prompt-induced). A per-transcript lock stops racing turns, and an orphaned turn is replaced, not duplicated. Appends the discussion doctrine — steelman-then-attack, name the deciding risk, no manufactured objections *and* no manufactured agreement — to every turn so neither side drifts into politeness.
+| Code | State | What it means | What you do |
+|:---:|---|---|---|
+| `0` | **VERIFIED_DONE** | Plan executed *and* the verify command passed locally | Review the diff — a claim is not proof |
+| `10` | **NEEDS_ANSWERS** | Codex hit real ambiguity and stopped instead of guessing | Answer the `QUESTIONS:` block, re-run |
+| `11` | **BLOCKED** | Missing access, a destructive step, or lease contention | Surface it; never improvise around it |
+| `12` | **STUCK** | Hit the iteration cap without verification | Read the attempts log, re-plan — don't just raise the cap |
 
-- **`implementer-watchdog.sh`** — the single-dispatch layer under the loop (and the fallback for one-shot work). Runs Codex **with `--write`**, polls its log, cancels it if it stalls for 5 minutes, and prints `IMPLEMENTER_STATE:` to stderr so callers never parse prose for the verdict. Appends the implementer contract — execute-this-plan-only, no scope creep, paste actual verification output, end with exactly one `RESULT:` line — to every dispatch. No blind retries here by design: a failed write-mode job may have left the tree half-edited, so re-dispatch belongs to the loop, which feeds the failure evidence back in.
-- **`orchestrator-inject.mjs`** — a `UserPromptSubmit` hook that resets the direct-edit flag on each new task, opens the gate when you say *"edit it yourself"*, and states the loop — but only when the prompt actually carries a code/design signal. Everything else gets silence. A directive that fires on "how much does this cost" is one the model learns to skip, so the selectivity is what keeps it worth reading.
-- **`orchestrator-gate.mjs`** — a `PreToolUse` hook that blocks Claude's Edit/Write/MultiEdit on real source-code files, period. Notes, configs, `~/.claude`, `~/.codex`, `/tmp`, and `~/Desktop` are exempt — plan files for dispatch are always Claude's to write. The gate opens only on an explicit user override and closes again on the next task.
-- **`orchestrator-implementer.md`** — the behavioral spec Claude reads every session.
-- **`coding-discipline.md`** — a short rule covering both plan-writing and any direct edits: minimum scope, surgical changes, verifiable goals. Independent of the loop; useful on its own.
+## Components
 
-Four design choices that matter:
+Installed under `~/.claude`, plus one shared library they source.
 
-- **Grilling is structured, not vibes.** Multi-turn debate between models fails in two known ways: endless courteous loops, and one side caving to sound cooperative. The discussion doctrine kills both — a mandatory stance line forces Codex to commit each turn, an AGREE still has to name the assumption most likely to be wrong, REFRAME gives it explicit license to reject the question itself, and the 6-turn cap forces every debate to land on `CONVERGED` with stated assumptions or `ESCALATE` to you with both sides' cases intact. Debugging duels run on evidence, not eloquence: the settling experiment gets named before convergence. The output isn't lost either — the CONVERGED design, losing alternatives, and rejection reasons become the **Decisions** section of the implementation plan, so the implementer sees the debate it wasn't part of.
+| File | Role |
+|---|---|
+| **`session-start.mjs`** | Opens each session with the Codex model + effort picker. Resumed sessions get a status line instead of a re-ask. |
+| **`codex-model-select.sh`** | Pins `model` and reasoning effort in `~/.codex/config.toml` — TOML-safe, backed up, idempotent. Debate and implementation get separate tiers. |
+| **`codex-mcp-check.sh`** | Shows exactly which MCP servers your background Codex jobs inherit, env keys masked. |
+| **`implementer-loop.sh`** | The autonomous heart: dispatch → parse `RESULT` → re-verify **locally** → feed failure evidence back in. Bounded by `--max-iters`. |
+| **`discussion-loop.sh`** | The bidirectional debate channel. Read-only — nobody edits code mid-argument. |
+| **`implementer-watchdog.sh`** | Single dispatch with `--write`, cancels a job that stalls for 5 minutes. |
+| **`orchestrator-inject.mjs`** | Resets the direct-edit flag per task; states the loop only when the prompt carries a code/design signal. |
+| **`orchestrator-gate.mjs`** | Blocks the orchestrator's `Edit`/`Write`/`MultiEdit` on source files. |
+| **`lib-companion.sh`** | Shared library: the write lease, provenance detection, companion resolution. |
 
-- **Write access is scoped by contract, reviewed by diff.** Codex really edits your tree — that's the point. The discipline is that it may touch only the files the plan names, must report every file it changed, and *nothing it does is believed* until Opus re-reads the actual `git diff` against the stated goal. Fixes never get silently patched by the orchestrator; they go back to Codex so the diff stays single-author.
-- **Questions are a first-class channel, not a failure.** A background Codex job can't ask interactively, so the contract gives it a structured way to stop instead of guess: `RESULT: NEEDS_ANSWERS` plus a numbered `QUESTIONS:` block — what it found, what it needs decided, what each answer implies. Opus relays them verbatim to you (or answers from context when certain) and re-dispatches with answers appended. An implementer that guesses is worse than one that asks.
-- **The final review is mandatory, honest about being same-vendor.** Opus reviews Codex's execution of Opus's own plan — the spec says so out loud, and compensates: re-read the diff fresh against the goal, re-run cheap verification commands yourself, check for scope creep beyond the named files, and open with **SHIP / FIX-FIRST / RETHINK**. FIX-FIRST dispatches a fix plan back to Codex; RETHINK goes back to you.
+Plus the behavioral specs: **`orchestrator-implementer.md`** (read every session) and **`coding-discipline.md`** (useful standalone).
 
-Codex's *built-in* web search is disabled (that was the thing that kept hanging) — but its **configured MCP servers (tavily, context7, …) stay available to both loops** for version-sensitive facts: library versions, API changes, current docs. Research still flows plan-first — Opus pre-researches with its own MCPs/web and embeds facts before dispatching — and Codex verifies what turns out version-sensitive, capped at 2 lookups per turn/run with no retries on stall (the watchdog's idle cancel is the backstop). Verified facts come back labeled `verified via <mcp>: <fact>` so the reviewer can trust them over either model's training data. MCP config is per-side: Opus uses Claude Code's MCPs, Codex uses `~/.codex/config.toml` — `codex-mcp-check.sh` shows exactly what the background jobs inherit.
+## Four design choices that matter
+
+<details>
+<summary><b>Grilling is structured, not vibes</b></summary>
+
+Multi-turn debate between models fails in two known ways: endless courteous loops, and one side caving to sound cooperative. A mandatory stance line (`AGREE` / `PUSHBACK` / `ALTERNATIVE` / `REFRAME`) forces Codex to commit each turn; an `AGREE` still has to name the assumption most likely to be wrong; `REFRAME` gives it explicit license to reject the question itself. A 6-turn cap forces every debate to land on `CONVERGED` with stated assumptions, or `ESCALATE` to you with both cases intact.
+
+The output isn't lost either — the converged design, the losing alternatives, and their rejection reasons become the **Decisions** section of the plan, so the implementer sees the debate it wasn't part of.
+</details>
+
+<details>
+<summary><b>Write access is scoped by contract, reviewed by diff</b></summary>
+
+Codex really edits your tree — that's the point. It may touch only the files the plan names, must report every file it changed, and *nothing it does is believed* until the orchestrator re-reads the actual `git diff` against the stated goal. Fixes never get silently patched by the orchestrator; they go back to Codex so the diff stays single-author.
+</details>
+
+<details>
+<summary><b>Questions are a first-class channel, not a failure</b></summary>
+
+A background job can't ask interactively, so the contract gives it a structured way to stop instead of guess: `RESULT: NEEDS_ANSWERS` plus a numbered `QUESTIONS:` block. An implementer that guesses is worse than one that asks.
+</details>
+
+<details>
+<summary><b>The final review is mandatory, and honest about being same-vendor</b></summary>
+
+The orchestrator reviews its own plan's execution. The spec says so out loud and compensates: fresh-eyes diff read, re-run the cheap verification yourself, check for scope creep, open with **SHIP / FIX-FIRST / RETHINK**. If you want a cross-vendor review, pair Maestro with a separate read-only advisor for the review step only.
+</details>
+
+## Research
+
+Codex's *built-in* web search is disabled — that was the thing that kept hanging. Its **configured MCP servers (tavily, context7, …) stay available to both loops** for version-sensitive facts.
+
+Research flows plan-first: the orchestrator pre-researches and embeds facts before dispatching, and Codex verifies only what turns out version-sensitive — capped at 2 lookups per run, no retries on stall. Verified facts come back labeled `verified via <mcp>: <fact>`, so the reviewer can trust them over either model's training data.
+
+## Tests
+
+```bash
+bash tests/run.sh
+```
+
+Six suites covering the write lease and provenance detection. They drive the real entry points end to end — acquiring real leases, mutating real repositories between dispatches — rather than calling helpers directly, because a gate that tests a component instead of the product path can pass while the feature detects nothing.
+
+They are slow on purpose: several suites wait on real lease timeouts.
 
 ## Requirements
 
-- **Claude Code** (ships Node), with **Opus 5** (the Max default; `claude-opus-5`) or **Fable 5** (`claude-fable-5`) as the session model — a `/model` choice, not a config here.
+- **Claude Code** (ships Node), with **Opus 5** (`claude-opus-5`) or **Fable 5** (`claude-fable-5`) as the session model — a `/model` choice, not a config here.
 - The **Codex plugin** — `/plugin install codex@openai-codex` inside Claude Code.
 - A **ChatGPT Plus / Codex login** — `codex login`. Not an API key.
-- *Optional, only for `--with-workflow`:* the **ralph-loop plugin** — `/plugin install ralph-loop@claude-plugins-official`.
+- *Optional, for `--with-workflow`:* `/plugin install ralph-loop@claude-plugins-official`.
 
 ## Install
 
 ```bash
-git clone <this repo>
+git clone https://github.com/Pythoughts-labs/maestro.git
 cd maestro
 node install.mjs
 ```
 
 Or hand the repo to Claude Code and say: *"run `node install.mjs` in this repo."*
 
-The installer is idempotent — re-running it changes nothing. It backs up `settings.json`, `config.toml`, and any rule file it would overwrite (`.maestro.bak`), merges its hooks without touching your existing ones, and offers to disable Codex web search. Restart Claude Code (plain `claude`) afterward so the rules and hooks load.
+The installer is idempotent — re-running it changes nothing. It backs up `settings.json`, `config.toml`, and any rule file it would overwrite (`.maestro.bak`), merges its hooks without touching your existing ones, and offers to disable Codex web search.
 
-### Optional: the workflow rule
+<details>
+<summary><b>Optional: the workflow rule</b></summary>
 
 ```bash
 node install.mjs --with-workflow
 ```
 
-Adds `workflow.md` plus the `ralph-protocol` skill it defers to: a bounded execution loop on top of the orchestration loop. Plans live in `tasks/todo.md`, a verifier hierarchy decides what counts as proof, and long jobs run through `/ralph-loop` capped at 8 iterations with an explicit `RESULT: VERIFIED_COMPLETE` / `RESULT: BLOCKED` stop line. The Ralph loop drives the *orchestration* (plan → dispatch → review); the implementer inside it is still Codex.
+Adds `workflow.md` plus the `ralph-protocol` skill it defers to: a bounded execution loop on top of the orchestration loop. Plans live in `tasks/todo.md`, a verifier hierarchy decides what counts as proof, and long jobs run through `/ralph-loop` capped at 8 iterations with an explicit stop line. The Ralph loop drives the *orchestration*; the implementer inside it is still Codex.
+</details>
 
 ## Uninstall
 
@@ -91,11 +167,15 @@ Removes the hooks, strips only its own entries from `settings.json`, and leaves 
 
 ## Limits
 
-- **Model pin depends on config being honored:** the picker writes `model` / `model_reasoning_effort` into `~/.codex/config.toml`, which Codex reads by default. If your companion version overrides the model with its own flags, the pin won't take — check with `codex-model-select.sh --show` plus one dispatch's behavior, and say "codex model" to adjust.
-- **Plugin flag drift:** the watchdog passes `--write` to the companion's `task` subcommand (the companion can also run read-only *without* it). If your plugin version renamed the flag, `node <companion> task --help` will tell you — it's one variable at the top of the script.
-- **Same-vendor review:** the orchestrator reviews its own plan's execution. The spec forces a fresh-eyes diff read and a verdict to compensate, but if you want a cross-vendor final review, pair Maestro with a separate read-only advisor model for the review step only.
-- **Windows:** the watchdog is a bash script. Run Claude Code from Git Bash or WSL; pure PowerShell can't execute it.
-- **Codex on Plus:** the implementer model is whatever your ChatGPT plan's Codex can reach.
+Stated plainly, because a tool that overstates its guarantees is worse than one that has fewer.
+
+- **The gate is a guardrail, not a boundary.** It is registered for `Edit|Write|MultiEdit` only. `Bash`, MCP tools, and `Workflow`/`Agent` are *not* matched, so a redirect or `sed -i` reaches the tree untouched. The orchestrator not writing source is a discipline it keeps, not a control that keeps it.
+- **Provenance detection reports, it never attributes.** Each write-lease acquisition digests the materialized tree and compares it to the snapshot the previous dispatch left. A mismatch names an interval — never a writer. Ignored paths are out of observation scope on cost grounds, and the log lives inside the repository it watches. It catches accidental convention failures and unnoticed agent writes. It is not an adversarial control.
+- **Same-vendor review.** The orchestrator reviews its own plan's execution.
+- **Model pin depends on config being honored.** If your companion version overrides the model with its own flags, the pin won't take — check `codex-model-select.sh --show` against one dispatch's behavior.
+- **Plugin flag drift.** The watchdog passes `--write` to the companion's `task` subcommand. If your plugin version renamed it, that's one variable at the top of the script.
+- **Windows.** The watchdog is a bash script — run Claude Code from Git Bash or WSL.
+- **Codex on Plus.** The implementer model is whatever your ChatGPT plan's Codex can reach.
 
 ## License
 
