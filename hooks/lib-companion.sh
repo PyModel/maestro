@@ -40,13 +40,31 @@ companion_wrapper_accepts_effort() {
 }
 
 repo_digest() {
-  local inside worktrees digest material tracked untracked paths entries
+  local inside worktrees roots root_list digest material tracked untracked paths entries
   local regular_paths hashes link_output link_rc path type mode contents worktree
   inside=$(git rev-parse --is-inside-work-tree 2>/dev/null) || return 1
   [ "$inside" = "true" ] || return 1
   worktrees=$(git worktree list --porcelain 2>/dev/null) || return 1
   worktrees=$(printf '%s\n' "$worktrees" | sed -n 's/^worktree //p' | LC_ALL=C sort) || return 1
   [ -n "$worktrees" ] || return 1
+  root_list=$(mktemp "${TMPDIR:-/tmp}/maestro-repo-roots.XXXXXX") || return 1
+  if ! (
+    while IFS= read -r worktree; do
+      [ -n "$worktree" ] || continue
+      printf '%s\n' "$worktree"
+      git -C "$worktree" submodule foreach --recursive --quiet \
+        'printf "%s\n" "$PWD"' 2>/dev/null || exit 1
+    done <<< "$worktrees"
+  ) > "$root_list"; then
+    rm -f "$root_list"
+    return 1
+  fi
+  roots=$(LC_ALL=C sort -u "$root_list") || {
+    rm -f "$root_list"
+    return 1
+  }
+  rm -f "$root_list"
+  [ -n "$roots" ] || return 1
 
   material=$(mktemp "${TMPDIR:-/tmp}/maestro-repo-digest.XXXXXX") || return 1
   tracked="${material}.tracked"
@@ -136,7 +154,7 @@ repo_digest() {
           "$path" "$type" "$mode" "$contents"
       done < "$entries" || exit 1
       exec 8<&-
-    done <<< "$worktrees"
+    done <<< "$roots"
   ) > "$material"; then
     rm -f "$material" "$tracked" "$untracked" "$paths" "$entries" "$regular_paths" "$hashes"
     return 1
@@ -538,6 +556,7 @@ provenance_check() {
   after=${last##* after=}
   current=$(repo_digest 2>/dev/null) || current=unavailable
   if ! repo_digest_is_observed "$after" || ! repo_digest_is_observed "$current"; then
+    printf '%s\n' "PROVENANCE: comparison unavailable — prior or current snapshot was not observed (job=$job, at $at)"
     return 0
   fi
   if [ "$current" = "$after" ]; then
