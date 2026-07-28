@@ -8,6 +8,7 @@
 #   write_lock_acquire [job]               → returns 0 acquired/inherited | 11 live contention
 #   write_lock_set_job <job>               → records a known job id for the current owner
 #   write_lock_release                     → releases an acquired lock only after its lease ends
+#   provenance_check                       → manually compares the tree to the last completed snapshot
 #   companion_resolve                      → prints companion path, or returns 3
 #   companion_pin                          → prints model<TAB>debate-effort<TAB>impl-effort, or returns 3
 #   companion_start <C> <prompt> [write]   → prints job id, or returns 3 (fails closed without a pin)
@@ -211,6 +212,7 @@ write_lock_acquire() {
   local requested_job="${1:-unknown}" metadata recorded_token owner_pid owner_start
   local owner_job started_epoch current_start held now attempt token process_start
   local writers writers_rc digest_before log_path last prior_job prior_after observed_at
+  local stale_digest_before stale_digest_after stale_released_at
   MAESTRO_LOCK_ACQUIRED=0
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
   metadata="$MAESTRO_LOCK_DIR/metadata"
@@ -280,7 +282,9 @@ write_lock_acquire() {
     owner_start=$(write_lock_metadata_value "$metadata" process_start)
     owner_job=$(write_lock_metadata_value "$metadata" job_id)
     started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
+    stale_digest_before=$(write_lock_metadata_value "$metadata" digest_before)
     owner_job=${owner_job:-unknown}
+    stale_digest_before=${stale_digest_before:-unavailable}
     current_start=""
     if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
       current_start=$(ps -o lstart= -p "$owner_pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
@@ -320,6 +324,13 @@ write_lock_acquire() {
     if rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null &&
       rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
       progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job pid=${owner_pid:-unknown}"
+      stale_digest_after=$(repo_digest 2>/dev/null) || stale_digest_after=unavailable
+      stale_released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+      if log_path=$(provenance_log_path 2>/dev/null); then
+        printf '%s type=dispatch job=%s before=%s after=%s\n' \
+          "$stale_released_at" "$owner_job" "$stale_digest_before" "$stale_digest_after" \
+          >> "$log_path" 2>/dev/null || :
+      fi
       attempt=$((attempt + 1))
       continue
     fi
@@ -409,6 +420,47 @@ write_lock_release() {
       "$released_at" "$owner_job" "$digest_before" "$digest_after" >> "$log_path" 2>/dev/null || :
   fi
   MAESTRO_LOCK_ACQUIRED=0
+}
+
+# Operator-facing manual check; do not wire this into cleanup.
+provenance_check() {
+  local lock_path metadata log_path last current after job at
+  if lock_path=$(write_lock_path 2>/dev/null) &&
+    [ -d "$lock_path" ] && [ -r "$lock_path/metadata" ]; then
+    metadata="$lock_path/metadata"
+    job=$(write_lock_metadata_value "$metadata" job_id)
+    job=${job:-unknown}
+    printf '%s\n' "PROVENANCE: in flight — a write lease is held (job=$job), so the tree is mid-dispatch"
+    return 0
+  fi
+  if ! log_path=$(provenance_log_path 2>/dev/null) || [ ! -f "$log_path" ]; then
+    printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"
+    return 0
+  fi
+  last=$(grep -E '^[^ ]+ type=dispatch job=[^ ]+ before=[^ ]+ after=[^ ]+$' \
+    "$log_path" 2>/dev/null | tail -1)
+  if [ -z "$last" ]; then
+    printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"
+    return 0
+  fi
+
+  at=${last%% *}
+  job=${last#* job=}
+  job=${job%% *}
+  after=${last##* after=}
+  current=$(repo_digest 2>/dev/null) || current=unavailable
+  if [ "$after" = "unavailable" ] || [ "$current" = "unavailable" ]; then
+    printf '%s\n' "PROVENANCE: comparison unavailable — prior or current snapshot was not observed (job=$job, at $at)"
+    return 0
+  fi
+  if [ "$current" = "$after" ]; then
+    printf '%s\n' "PROVENANCE: tree matches the prior completed snapshot (job=$job, at $at)"
+    return 0
+  fi
+
+  # Best-effort diagnostic only, not an enforcement boundary or a dispatch verdict.
+  printf '%s\n' "PROVENANCE: BASELINE GAP — tree differs from the prior completed snapshot (prior_job=$job, expected=$after, observed=$current); author unknown"
+  return 1
 }
 
 companion_resolve() {
