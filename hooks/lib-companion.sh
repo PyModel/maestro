@@ -10,7 +10,7 @@
 #   write_lock_release                     → releases an acquired lock only after its lease ends
 #   provenance_check                       → prints the repository provenance status
 #   companion_resolve                      → prints companion path, or returns 3
-#   companion_pin                          → prints model<TAB>effort, or returns 3
+#   companion_pin                          → prints model<TAB>debate-effort<TAB>impl-effort, or returns 3
 #   companion_start <C> <prompt> [write]   → prints job id, or returns 3 (fails closed without a pin)
 #   companion_verify_pin <C> <job> <model> <effort> → returns 0 match | 4 mismatch
 #   companion_workspace_writers <C>        → prints job<TAB>write, or returns 4
@@ -26,6 +26,18 @@ progress_init() {
 }
 
 progress() { printf '%s\n' "$*" >&3; }
+
+# This is the companion wrapper's allowlist, not the Codex binary's. The wrapper
+# is narrower: Codex also accepts max and ultra when it reads effort from config.
+COMPANION_WRAPPER_REASONING_EFFORTS=(none minimal low medium high xhigh)
+
+companion_wrapper_accepts_effort() {
+  local candidate="$1" allowed
+  for allowed in "${COMPANION_WRAPPER_REASONING_EFFORTS[@]}"; do
+    [ "$candidate" = "$allowed" ] && return 0
+  done
+  return 1
+}
 
 repo_digest() {
   local inside worktrees digest
@@ -413,25 +425,48 @@ companion_resolve() {
 }
 
 companion_pin() {
-  local here selector pin
+  local here selector pin model efforts debate_effort impl_effort
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   selector="$here/codex-model-select.sh"
   if ! pin=$(bash "$selector" --pin 2>/dev/null); then
     echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <effort>" >&2
     return 3
   fi
-  printf '%s\n' "$pin"
+  case "$pin" in
+    *$'\t'*$'\t'*) ;;
+    *)
+      echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <effort>" >&2
+      return 3 ;;
+  esac
+  model=${pin%%$'\t'*}
+  efforts=${pin#*$'\t'}
+  debate_effort=${efforts%%$'\t'*}
+  impl_effort=${efforts#*$'\t'}
+  if [ -z "$model" ] || [ -z "$debate_effort" ] || [ -z "$impl_effort" ]; then
+    echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <effort>" >&2
+    return 3
+  fi
+  printf '%s\t%s\t%s\n' "$model" "$debate_effort" "$impl_effort"
 }
 
 companion_start() {
   local C="$1" PROMPT="$2" WRITE="${3:-}"
-  local PIN MODEL EFFORT
+  local PIN MODEL EFFORTS DEBATE_EFFORT IMPL_EFFORT
   PIN=$(companion_pin) || return 3
   MODEL=${PIN%%$'\t'*}
-  EFFORT=${PIN#*$'\t'}
+  EFFORTS=${PIN#*$'\t'}
+  DEBATE_EFFORT=${EFFORTS%%$'\t'*}
+  IMPL_EFFORT=${EFFORTS#*$'\t'}
   local -a args=(task --background)
   [ "$WRITE" = "write" ] && args+=(--write)
-  args+=(--model "$MODEL" --effort "$EFFORT")
+  args+=(--model "$MODEL")
+  if [ "$WRITE" = "write" ]; then
+    if companion_wrapper_accepts_effort "$IMPL_EFFORT"; then
+      args+=(--effort "$IMPL_EFFORT")
+    else
+      progress "CODEX: companion wrapper cannot express implementation effort=$IMPL_EFFORT; --effort omitted and config debate tier=$DEBATE_EFFORT governs this write dispatch"
+    fi
+  fi
   local START JOB
   START=$(node "$C" "${args[@]}" "$PROMPT" 2>&1)
   JOB=$(printf '%s' "$START" | grep -oE 'task-[a-z0-9]+-[a-z0-9]+' | head -1)
@@ -444,19 +479,39 @@ companion_start() {
 
 companion_verify_pin() {
   local C="$1" JOB="$2" EXPECTED_MODEL="$3" EXPECTED_EFFORT="$4"
-  local ST REQUEST MODEL_FIELD EFFORT_FIELD RECORDED_MODEL="null" RECORDED_EFFORT="null"
+  local ST REQUEST MODEL_FIELD EFFORT_FIELD WRITE_FIELD
+  local RECORDED_MODEL="null" RECORDED_EFFORT="null" RECORDED_WRITE=""
+  local PIN EFFORTS CONFIG_EFFORT IMPL_EFFORT
   ST=$(node "$C" status "$JOB" --json 2>/dev/null)
   REQUEST=$(printf '%s' "$ST" | tr '\n' ' ' | sed -n 's/.*"request"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p' | head -1)
   MODEL_FIELD=$(printf '%s' "$REQUEST" | grep -oE '"model"[[:space:]]*:[[:space:]]*(null|"[^"]*")' | head -1)
   EFFORT_FIELD=$(printf '%s' "$REQUEST" | grep -oE '"effort"[[:space:]]*:[[:space:]]*(null|"[^"]*")' | head -1)
+  WRITE_FIELD=$(printf '%s' "$REQUEST" | grep -oE '"write"[[:space:]]*:[[:space:]]*(true|false)' | head -1)
   if [ -n "$MODEL_FIELD" ]; then
     RECORDED_MODEL=$(printf '%s' "$MODEL_FIELD" | sed -E 's/^"model"[[:space:]]*:[[:space:]]*//; s/^"//; s/"$//')
   fi
   if [ -n "$EFFORT_FIELD" ]; then
     RECORDED_EFFORT=$(printf '%s' "$EFFORT_FIELD" | sed -E 's/^"effort"[[:space:]]*:[[:space:]]*//; s/^"//; s/"$//')
   fi
+  if [ -n "$WRITE_FIELD" ]; then
+    RECORDED_WRITE=$(printf '%s' "$WRITE_FIELD" | sed -E 's/^"write"[[:space:]]*:[[:space:]]*//')
+  fi
   if [ "$RECORDED_MODEL" = "$EXPECTED_MODEL" ] && [ "$RECORDED_EFFORT" = "$EXPECTED_EFFORT" ]; then
     return 0
+  fi
+  if [ "$RECORDED_MODEL" = "$EXPECTED_MODEL" ] &&
+    [ -n "$EFFORT_FIELD" ] && [ "$RECORDED_EFFORT" = "null" ] &&
+    PIN=$(companion_pin 2>/dev/null); then
+    EFFORTS=${PIN#*$'\t'}
+    CONFIG_EFFORT=${EFFORTS%%$'\t'*}
+    IMPL_EFFORT=${EFFORTS#*$'\t'}
+    if [ "$CONFIG_EFFORT" = "$EXPECTED_EFFORT" ]; then
+      case "$RECORDED_WRITE" in
+        false) return 0 ;;
+        true)
+          case "$IMPL_EFFORT" in max|ultra) return 0 ;; esac ;;
+      esac
+    fi
   fi
   echo "Codex pin verification warning for $JOB: requested model=$EXPECTED_MODEL effort=$EXPECTED_EFFORT; recorded model=$RECORDED_MODEL effort=$RECORDED_EFFORT" >&2
   return 4

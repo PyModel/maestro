@@ -164,6 +164,7 @@ PIN=$(companion_pin 2>/dev/null) || {
 }
 PIN_MODEL=${PIN%%$'\t'*}
 PIN_EFFORT=${PIN#*$'\t'}
+PIN_EFFORT=${PIN_EFFORT%%$'\t'*}
 
 # If the previous Claude turn never got a Codex reply (dispatch died, hang, job
 # failed), replace that orphaned turn instead of appending a duplicate.

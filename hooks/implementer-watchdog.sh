@@ -121,6 +121,9 @@ PIN=$(companion_pin 2>/dev/null) || {
 }
 PIN_MODEL=${PIN%%$'\t'*}
 PIN_EFFORT=${PIN#*$'\t'}
+PIN_DEBATE_EFFORT=${PIN_EFFORT%%$'\t'*}
+PIN_EFFORT=${PIN_EFFORT#*$'\t'}
+case "$PIN_EFFORT" in max|ultra) PIN_EFFORT="$PIN_DEBATE_EFFORT" ;; esac
 
 JOB=$(companion_start "$C" "$PROMPT" write) || {
   echo "WATCHDOG_ERROR: could not start Codex job (see above)." >&2
