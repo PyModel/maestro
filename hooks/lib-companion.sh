@@ -247,7 +247,7 @@ write_lock_acquire() {
       now=$(date +%s)
       digest_before=$(repo_digest 2>/dev/null) || digest_before=unavailable
       if log_path=$(provenance_log_path 2>/dev/null) && [ -f "$log_path" ]; then
-        last=$(grep -E '^[^ ]+ type=dispatch job=[^ ]+ before=[^ ]+ after=[^ ]+$' \
+        last=$(grep -E '^[^ ]+ type=(dispatch|orphan-adopted) job=[^ ]+ before=[^ ]+ after=[^ ]+$' \
           "$log_path" 2>/dev/null | tail -1)
         if [ -n "$last" ]; then
           prior_job=${last#* job=}
@@ -334,9 +334,16 @@ write_lock_acquire() {
       rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
       progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job pid=${owner_pid:-unknown}"
       stale_digest_after=$(repo_digest 2>/dev/null) || stale_digest_after=unavailable
+      if [ "$stale_digest_before" != "unavailable" ] &&
+        [ "$stale_digest_after" != "unavailable" ] &&
+        [ "$stale_digest_before" != "$stale_digest_after" ]; then
+        progress "PROVENANCE: ADOPTED UNOBSERVED INTERVAL — the tree changed while an orphaned lease was held (job=$owner_job, expected=$stale_digest_before, observed=$stale_digest_after); the interval was not observed and the author is unknown"
+      fi
       stale_released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
       if log_path=$(provenance_log_path 2>/dev/null); then
-        printf '%s type=dispatch job=%s before=%s after=%s\n' \
+        # The interval between the orphan's last write and this steal was never observed,
+        # so the after value is adopted, not witnessed.
+        printf '%s type=orphan-adopted job=%s before=%s after=%s\n' \
           "$stale_released_at" "$owner_job" "$stale_digest_before" "$stale_digest_after" \
           >> "$log_path" 2>/dev/null || :
       fi
@@ -446,7 +453,7 @@ provenance_check() {
     printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"
     return 0
   fi
-  last=$(grep -E '^[^ ]+ type=dispatch job=[^ ]+ before=[^ ]+ after=[^ ]+$' \
+  last=$(grep -E '^[^ ]+ type=(dispatch|orphan-adopted) job=[^ ]+ before=[^ ]+ after=[^ ]+$' \
     "$log_path" 2>/dev/null | tail -1)
   if [ -z "$last" ]; then
     printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"
