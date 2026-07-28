@@ -40,14 +40,15 @@ companion_wrapper_accepts_effort() {
 }
 
 repo_digest() {
-  local inside worktrees digest untracked untracked_digest
+  local inside worktrees digest material untracked untracked_digest
   inside=$(git rev-parse --is-inside-work-tree 2>/dev/null) || return 1
   [ "$inside" = "true" ] || return 1
   worktrees=$(git worktree list --porcelain 2>/dev/null) || return 1
   worktrees=$(printf '%s\n' "$worktrees" | sed -n 's/^worktree //p' | LC_ALL=C sort) || return 1
   [ -n "$worktrees" ] || return 1
 
-  digest=$({
+  material=$(mktemp "${TMPDIR:-/tmp}/maestro-repo-digest.XXXXXX") || return 1
+  if ! (
     while IFS= read -r worktree; do
       [ -n "$worktree" ] || continue
       printf 'worktree=%s\nhead\n' "$worktree"
@@ -69,9 +70,17 @@ repo_digest() {
             # The entry may vanish after enumeration; preserve a degraded marker.
             printf 'contents=unavailable\n'
           fi
-        done
+        done || exit 1
     done <<< "$worktrees"
-  } | shasum | awk '{print $1}') || return 1
+  ) > "$material"; then
+    rm -f "$material"
+    return 1
+  fi
+  if ! digest=$(shasum < "$material" | awk '{print $1}'); then
+    rm -f "$material"
+    return 1
+  fi
+  rm -f "$material"
   [ -n "$digest" ] || return 1
   printf '%s\n' "$digest"
 }

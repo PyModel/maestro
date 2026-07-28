@@ -59,7 +59,11 @@ show() {
   read_pin M E
   read_impl_effort I
   echo "model=${M:-(not pinned — Codex default)}"
-  echo "effort=${E:-(not pinned — Codex default)}"
+  if [ -n "$E" ] && ! valid_effort "$E"; then
+    echo "effort=$E (invalid)"
+  else
+    echo "effort=${E:-(not pinned — Codex default)}"
+  fi
   echo "impl-effort=$I"
   if [ -f "$ASK_FLAG" ]; then echo "ask-on-start=on"; else echo "ask-on-start=off"; fi
 }
@@ -70,6 +74,10 @@ pin() {
   read_impl_effort I
   if [ -z "$M" ] || [ -z "$E" ]; then
     echo "SELECT_ERROR: Codex model and effort must both be pinned in the config.toml preamble" >&2
+    return 3
+  fi
+  if ! valid_effort "$E"; then
+    echo "SELECT_ERROR: invalid debate effort '$E' (expected: none | minimal | low | medium | high | xhigh | max | ultra)" >&2
     return 3
   fi
   if ! valid_effort "$I"; then
