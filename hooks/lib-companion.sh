@@ -40,7 +40,8 @@ companion_wrapper_accepts_effort() {
 }
 
 repo_digest() {
-  local inside worktrees digest material untracked untracked_digest
+  local inside worktrees digest material tracked untracked paths entries
+  local regular_paths hashes link_output link_rc path type mode contents worktree
   inside=$(git rev-parse --is-inside-work-tree 2>/dev/null) || return 1
   [ "$inside" = "true" ] || return 1
   worktrees=$(git worktree list --porcelain 2>/dev/null) || return 1
@@ -48,41 +49,112 @@ repo_digest() {
   [ -n "$worktrees" ] || return 1
 
   material=$(mktemp "${TMPDIR:-/tmp}/maestro-repo-digest.XXXXXX") || return 1
+  tracked="${material}.tracked"
+  untracked="${material}.untracked"
+  paths="${material}.paths"
+  entries="${material}.entries"
+  regular_paths="${material}.regular"
+  hashes="${material}.hashes"
   if ! (
     while IFS= read -r worktree; do
       [ -n "$worktree" ] || continue
-      printf 'worktree=%s\nhead\n' "$worktree"
-      git -C "$worktree" rev-parse HEAD 2>/dev/null || exit 1
-      printf 'diff\n'
-      git -C "$worktree" diff HEAD --binary -- 2>/dev/null || exit 1
-      printf 'status\n'
-      git -C "$worktree" status --porcelain 2>/dev/null || exit 1
-      printf 'untracked\n'
+      : > "$tracked" || exit 1
+      : > "$untracked" || exit 1
+      : > "$paths" || exit 1
+      : > "$entries" || exit 1
+      : > "$regular_paths" || exit 1
+      : > "$hashes" || exit 1
+      git -C "$worktree" ls-files -z > "$tracked" 2>/dev/null || exit 1
       # Ignored paths are out of observation scope, not "not source": hashing them has
       # unbounded cost (for example node_modules and build outputs).
-      git -C "$worktree" ls-files --others --exclude-standard -z 2>/dev/null |
-        LC_ALL=C sort -z |
-        while IFS= read -r -d '' untracked; do
-          printf 'path\0%s\0' "$untracked"
-          if untracked_digest=$(git -C "$worktree" hash-object -- "$untracked" 2>/dev/null); then
-            printf 'contents=%s\n' "$untracked_digest"
+      git -C "$worktree" ls-files --others --exclude-standard -z \
+        > "$untracked" 2>/dev/null || exit 1
+      LC_ALL=C sort -zu "$tracked" "$untracked" > "$paths" || exit 1
+
+      while IFS= read -r -d '' path; do
+        if [ -L "$worktree/$path" ]; then
+          type='link'
+          mode=120000
+          link_output=$(
+            readlink "$worktree/$path" 2>/dev/null
+            link_rc=$?
+            printf '\001%s' "$link_rc"
+          )
+          link_rc=${link_output##*$'\001'}
+          if [ "$link_rc" -eq 0 ]; then
+            contents=${link_output%$'\001'*}
+            contents=${contents%$'\n'}
           else
             # The entry may vanish after enumeration; preserve a degraded marker.
-            printf 'contents=unavailable\n'
+            contents=unavailable
           fi
-        done || exit 1
+        elif [ -f "$worktree/$path" ]; then
+          type='file'
+          if [ -x "$worktree/$path" ]; then mode=100755; else mode=100644; fi
+          contents=
+          printf '%s\0' "$path" >> "$regular_paths"
+        elif [ -e "$worktree/$path" ]; then
+          type=other
+          mode=other
+          contents=unavailable
+        else
+          type=absent
+          mode=absent
+          contents=absent
+        fi
+        printf '%s\0%s\0%s\0%s\0' "$path" "$type" "$mode" "$contents" >> "$entries"
+      done < "$paths" || exit 1
+
+      if [ -s "$regular_paths" ]; then
+        # xargs is serial: it preserves the sorted NUL-delimited path order, and
+        # hash-object emits exactly one output line per argument in argument order.
+        if ! xargs -0 git -C "$worktree" hash-object -- \
+          < "$regular_paths" > "$hashes" 2>/dev/null; then
+          # A path can vanish after enumeration. Re-run only this degraded case
+          # individually so the unavailable marker stays paired with that path.
+          : > "$hashes"
+          while IFS= read -r -d '' path; do
+            if contents=$(git -C "$worktree" hash-object -- "$path" 2>/dev/null); then
+              printf '%s\n' "$contents"
+            else
+              printf 'unavailable\n'
+            fi
+          done < "$regular_paths" > "$hashes" || exit 1
+        fi
+      fi
+
+      printf 'worktree\0%s\0' "$worktree"
+      exec 8< "$hashes" || exit 1
+      while IFS= read -r -d '' path &&
+        IFS= read -r -d '' type &&
+        IFS= read -r -d '' mode &&
+        IFS= read -r -d '' contents; do
+        if [ "$type" = "file" ]; then
+          IFS= read -r contents <&8 || contents=unavailable
+        fi
+        printf 'path\0%s\0type\0%s\0mode\0%s\0contents\0%s\0' \
+          "$path" "$type" "$mode" "$contents"
+      done < "$entries" || exit 1
+      exec 8<&-
     done <<< "$worktrees"
   ) > "$material"; then
-    rm -f "$material"
+    rm -f "$material" "$tracked" "$untracked" "$paths" "$entries" "$regular_paths" "$hashes"
     return 1
   fi
   if ! digest=$(shasum < "$material" | awk '{print $1}'); then
-    rm -f "$material"
+    rm -f "$material" "$tracked" "$untracked" "$paths" "$entries" "$regular_paths" "$hashes"
     return 1
   fi
-  rm -f "$material"
+  rm -f "$material" "$tracked" "$untracked" "$paths" "$entries" "$regular_paths" "$hashes"
   [ -n "$digest" ] || return 1
-  printf '%s\n' "$digest"
+  printf 'tree-v2:%s\n' "$digest"
+}
+
+repo_digest_is_observed() {
+  case "$1" in
+    tree-v2:*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 write_lock_path() {
@@ -253,8 +325,8 @@ write_lock_acquire() {
           prior_job=${last#* job=}
           prior_job=${prior_job%% *}
           prior_after=${last##* after=}
-          if [ "$prior_after" != "unavailable" ] &&
-            [ "$digest_before" != "unavailable" ] &&
+          if repo_digest_is_observed "$prior_after" &&
+            repo_digest_is_observed "$digest_before" &&
             [ "$prior_after" != "$digest_before" ]; then
             observed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
             progress "PROVENANCE: BASELINE GAP — tree at acquisition differs from the prior completed snapshot (prior_job=$prior_job, expected=$prior_after, observed=$digest_before); author unknown"
@@ -334,8 +406,8 @@ write_lock_acquire() {
       rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
       progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job pid=${owner_pid:-unknown}"
       stale_digest_after=$(repo_digest 2>/dev/null) || stale_digest_after=unavailable
-      if [ "$stale_digest_before" != "unavailable" ] &&
-        [ "$stale_digest_after" != "unavailable" ] &&
+      if repo_digest_is_observed "$stale_digest_before" &&
+        repo_digest_is_observed "$stale_digest_after" &&
         [ "$stale_digest_before" != "$stale_digest_after" ]; then
         progress "PROVENANCE: ADOPTED UNOBSERVED INTERVAL — the tree changed while an orphaned lease was held (job=$owner_job, expected=$stale_digest_before, observed=$stale_digest_after); the interval was not observed and the author is unknown"
       fi
@@ -465,8 +537,7 @@ provenance_check() {
   job=${job%% *}
   after=${last##* after=}
   current=$(repo_digest 2>/dev/null) || current=unavailable
-  if [ "$after" = "unavailable" ] || [ "$current" = "unavailable" ]; then
-    printf '%s\n' "PROVENANCE: comparison unavailable — prior or current snapshot was not observed (job=$job, at $at)"
+  if ! repo_digest_is_observed "$after" || ! repo_digest_is_observed "$current"; then
     return 0
   fi
   if [ "$current" = "$after" ]; then
