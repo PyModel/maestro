@@ -4,9 +4,11 @@
 #
 #   progress_init                          → keeps inherited FD 3, or opens it to caller stdout
 #   progress <message>                     → writes one progress line to FD 3
+#   repo_digest                            → prints a repository-wide state digest, or returns non-zero
 #   write_lock_acquire [job]               → returns 0 acquired/inherited | 11 live contention
 #   write_lock_set_job <job>               → records a known job id for the current owner
 #   write_lock_release                     → releases an acquired lock only after its lease ends
+#   provenance_check                       → prints the repository provenance status
 #   companion_resolve                      → prints companion path, or returns 3
 #   companion_pin                          → prints model<TAB>effort, or returns 3
 #   companion_start <C> <prompt> [write]   → prints job id, or returns 3 (fails closed without a pin)
@@ -25,6 +27,29 @@ progress_init() {
 
 progress() { printf '%s\n' "$*" >&3; }
 
+repo_digest() {
+  local inside worktrees digest
+  inside=$(git rev-parse --is-inside-work-tree 2>/dev/null) || return 1
+  [ "$inside" = "true" ] || return 1
+  worktrees=$(git worktree list --porcelain 2>/dev/null) || return 1
+  worktrees=$(printf '%s\n' "$worktrees" | sed -n 's/^worktree //p' | LC_ALL=C sort) || return 1
+  [ -n "$worktrees" ] || return 1
+
+  digest=$({
+    while IFS= read -r worktree; do
+      [ -n "$worktree" ] || continue
+      printf 'worktree=%s\nhead\n' "$worktree"
+      git -C "$worktree" rev-parse HEAD 2>/dev/null || exit 1
+      printf 'diff\n'
+      git -C "$worktree" diff HEAD --binary -- 2>/dev/null || exit 1
+      printf 'status\n'
+      git -C "$worktree" status --porcelain 2>/dev/null || exit 1
+    done <<< "$worktrees"
+  } | shasum | awk '{print $1}') || return 1
+  [ -n "$digest" ] || return 1
+  printf '%s\n' "$digest"
+}
+
 write_lock_path() {
   local workspace git_dir
   workspace=$(pwd -P)
@@ -38,6 +63,19 @@ write_lock_path() {
   else
     printf '%s/.maestro-write.lock' "$workspace"
   fi
+}
+
+provenance_log_path() {
+  local lock_path
+  lock_path=$(write_lock_path) || return 1
+  case "$lock_path" in
+    */maestro-write.lock)
+      printf '%s/maestro-provenance.log' "${lock_path%/maestro-write.lock}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 write_lock_metadata_value() {
@@ -147,7 +185,7 @@ write_lock_workspace_writers() {
 write_lock_acquire() {
   local requested_job="${1:-unknown}" metadata recorded_token owner_pid owner_start
   local owner_job started_epoch current_start held now attempt token process_start
-  local writers writers_rc
+  local writers writers_rc digest_before
   MAESTRO_LOCK_ACQUIRED=0
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
   metadata="$MAESTRO_LOCK_DIR/metadata"
@@ -171,9 +209,10 @@ write_lock_acquire() {
         return 3
       fi
       now=$(date +%s)
-      if ! printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nstarted_at=%s\nstarted_epoch=%s\n' \
+      digest_before=$(repo_digest 2>/dev/null) || digest_before=unavailable
+      if ! printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
         "$token" "$$" "$process_start" "$requested_job" \
-        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$now" > "$metadata"; then
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$now" "$digest_before" > "$metadata"; then
         rm -f "$metadata" 2>/dev/null || :
         rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
         return 3
@@ -261,6 +300,7 @@ write_lock_acquire() {
 
 write_lock_set_job() {
   local job="$1" metadata next_metadata recorded_token owner_pid owner_start started_at started_epoch
+  local digest_before
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || {
     [ -n "${MAESTRO_LOCK_TOKEN:-}" ] || return 0
   }
@@ -272,9 +312,12 @@ write_lock_set_job() {
   owner_start=$(write_lock_metadata_value "$metadata" process_start)
   started_at=$(write_lock_metadata_value "$metadata" started_at)
   started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
+  digest_before=$(write_lock_metadata_value "$metadata" digest_before)
+  digest_before=${digest_before:-unavailable}
   next_metadata="${MAESTRO_LOCK_DIR}/metadata.new"
-  if printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nstarted_at=%s\nstarted_epoch=%s\n' \
-    "$recorded_token" "$owner_pid" "$owner_start" "$job" "$started_at" "$started_epoch" > "$next_metadata"; then
+  if printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
+    "$recorded_token" "$owner_pid" "$owner_start" "$job" "$started_at" "$started_epoch" \
+    "$digest_before" > "$next_metadata"; then
     mv -f "$next_metadata" "$metadata"
   else
     rm -f "$next_metadata" 2>/dev/null || :
@@ -284,6 +327,7 @@ write_lock_set_job() {
 
 write_lock_release() {
   local metadata recorded_token owner_job writers writers_rc
+  local digest_before digest_after log_path released_at
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || return 0
   metadata="${MAESTRO_LOCK_DIR:-}/metadata"
   [ -n "${MAESTRO_LOCK_DIR:-}" ] && [ -f "$metadata" ] || return 0
@@ -308,9 +352,55 @@ write_lock_release() {
     return 0
   fi
 
+  digest_before=$(write_lock_metadata_value "$metadata" digest_before)
+  digest_before=${digest_before:-unavailable}
+  digest_after=$(repo_digest 2>/dev/null) || digest_after=unavailable
+  released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null || return 0
   rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
+  if log_path=$(provenance_log_path 2>/dev/null); then
+    # Best-effort diagnostic only, not an enforcement boundary: repository writers can rewrite this log.
+    printf '%s job=%s before=%s after=%s\n' \
+      "$released_at" "$owner_job" "$digest_before" "$digest_after" >> "$log_path" 2>/dev/null || :
+  fi
   MAESTRO_LOCK_ACQUIRED=0
+}
+
+provenance_check() {
+  local lock_path metadata log_path last current after job at
+  if lock_path=$(write_lock_path 2>/dev/null) &&
+    [ -d "$lock_path" ] && [ -r "$lock_path/metadata" ]; then
+    metadata="$lock_path/metadata"
+    job=$(write_lock_metadata_value "$metadata" job_id)
+    job=${job:-unknown}
+    # Accept the known false negative from a stale lease until the next dispatch resolves it:
+    # this is a diagnostic, not an enforcement boundary, so do not add liveness checks here.
+    printf '%s\n' "PROVENANCE: in flight — a write lease is held (job=$job), so the tree is mid-dispatch"
+    return 0
+  fi
+  if ! log_path=$(provenance_log_path 2>/dev/null) || [ ! -f "$log_path" ]; then
+    printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"
+    return 0
+  fi
+  last=$(grep -E '^[^ ]+ job=[^ ]+ before=[^ ]+ after=[^ ]+$' "$log_path" 2>/dev/null | tail -1)
+  if [ -z "$last" ]; then
+    printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"
+    return 0
+  fi
+
+  current=$(repo_digest 2>/dev/null) || current=unavailable
+  after=${last##* after=}
+  if [ "$current" = "$after" ]; then
+    printf '%s\n' "PROVENANCE: clean — tree matches the last dispatch"
+    return 0
+  fi
+
+  at=${last%% *}
+  job=${last#* job=}
+  job=${job%% *}
+  # Best-effort diagnostic only, not an enforcement boundary or a dispatch verdict.
+  printf '%s\n' "PROVENANCE: UNATTRIBUTED CHANGE — the tree differs from the state the last dispatch left (job=$job, at $at)"
+  return 1
 }
 
 companion_resolve() {
