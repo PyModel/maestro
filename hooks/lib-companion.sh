@@ -605,12 +605,25 @@ companion_pin() {
 
 companion_start() {
   local C="$1" PROMPT="$2" WRITE="${3:-}"
-  local PIN MODEL EFFORTS DEBATE_EFFORT IMPL_EFFORT
+  local PIN MODEL EFFORTS DEBATE_EFFORT IMPL_EFFORT HELP
   PIN=$(companion_pin) || return 3
   MODEL=${PIN%%$'\t'*}
   EFFORTS=${PIN#*$'\t'}
   DEBATE_EFFORT=${EFFORTS%%$'\t'*}
   IMPL_EFFORT=${EFFORTS#*$'\t'}
+  if [ "$WRITE" = "write" ]; then
+    # Compatibility probe, not an authorization check: only a help text that
+    # describes `task` WITHOUT --write proves drift. Anything inconclusive
+    # (empty, error, no synopsis) must not block a dispatch.
+    HELP=$(node "$C" --help 2>&1) || HELP=""
+    case "$HELP" in
+      *--write*) ;;
+      *task*)
+        echo "companion at $C describes its task subcommand without --write — the plugin may have renamed the flag (README: Plugin flag drift). Refusing to dispatch a write job blind; update Maestro or pin the previous plugin version." >&2
+        return 3 ;;
+      *) ;;
+    esac
+  fi
   local -a args=(task --background)
   [ "$WRITE" = "write" ] && args+=(--write)
   args+=(--model "$MODEL")

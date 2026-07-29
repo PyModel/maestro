@@ -184,7 +184,7 @@ Stated plainly, because a tool that overstates its guarantees is worse than one 
 - **Provenance detection reports, it never attributes.** Each write-lease acquisition digests the materialized tree and compares it to the snapshot the previous dispatch left. A mismatch names an interval — never a writer. Ignored paths are out of observation scope on cost grounds, and the log lives inside the repository it watches. It catches accidental convention failures and unnoticed agent writes. It is not an adversarial control.
 - **Same-vendor review.** The orchestrator reviews its own plan's execution.
 - **Model pin depends on config being honored.** If your companion version overrides the model with its own flags, the pin won't take — check `codex-model-select.sh --show` against one dispatch's behavior.
-- **Plugin flag drift.** The watchdog passes `--write` to the companion's `task` subcommand. If your plugin version renamed it, that's one variable at the top of the script.
+- **Plugin flag drift.** Write dispatches preflight the companion's global `--help` and refuse only when it describes `task` without `--write`; inconclusive help (empty, error, or no synopsis) proceeds rather than blocking work.
 - **Windows.** The watchdog is a bash script — run Claude Code from Git Bash or WSL.
 - **Codex on Plus.** The implementer model is whatever your ChatGPT plan's Codex can reach.
 
