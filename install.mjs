@@ -42,10 +42,20 @@ function atomicCopy(src, dest) {
 }
 
 // --- 1. Prerequisite: the codex-plugin-cc companion must exist ---
+function compareVersionsDesc(a, b) {
+  const pa = a.split('.'), pb = b.split('.');
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = Number(pa[i] ?? 0), nb = Number(pb[i] ?? 0);
+    if (Number.isNaN(na) || Number.isNaN(nb)) return String(pb[i]).localeCompare(String(pa[i]));
+    if (na !== nb) return nb - na;
+  }
+  return 0;
+}
+
 function findCompanion() {
   const base = path.join(CLAUDE, 'plugins', 'cache', 'openai-codex', 'codex');
   if (!fs.existsSync(base)) return null;
-  const versions = fs.readdirSync(base).sort().reverse();
+  const versions = fs.readdirSync(base).sort(compareVersionsDesc);
   for (const v of versions) {
     const p = path.join(base, v, 'scripts', 'codex-companion.mjs');
     if (fs.existsSync(p)) return p;
@@ -81,7 +91,10 @@ const HOOK_FILES = [
   'lib-companion.sh', 'codex-model-select.sh', 'codex-mcp-check.sh',
 ];
 for (const f of HOOK_FILES) {
-  atomicCopy(path.join(REPO, 'hooks', f), path.join(HOOKS, f));
+  const src = path.join(REPO, 'hooks', f);
+  const dest = path.join(HOOKS, f);
+  if (fs.existsSync(dest) && !fs.readFileSync(dest).equals(fs.readFileSync(src))) backup(dest);
+  atomicCopy(src, dest);
 }
 for (const f of ['implementer-watchdog.sh', 'implementer-loop.sh', 'discussion-loop.sh', 'codex-model-select.sh', 'codex-mcp-check.sh']) {
   try { fs.chmodSync(path.join(HOOKS, f), 0o755); } catch {}

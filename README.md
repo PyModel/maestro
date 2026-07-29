@@ -156,7 +156,7 @@ node install.mjs
 
 Or hand the repo to Claude Code and say: *"run `node install.mjs` in this repo."*
 
-The installer is idempotent — re-running it changes nothing. It backs up `settings.json`, `config.toml`, and any rule file it would overwrite (`.maestro.bak`), merges its hooks without touching your existing ones, and offers to disable Codex web search.
+The installer is idempotent — re-running it changes nothing. It backs up `settings.json`, `config.toml`, and any hook or rule file it would overwrite (`.maestro.bak`), merges its hooks without touching your existing ones, and offers to disable Codex web search.
 
 <details>
 <summary><b>Optional: the workflow rule</b></summary>
