@@ -6,6 +6,7 @@ PASS=0
 FAIL=0
 
 for suite in \
+  gate.sh \
   lease.sh \
   shared-git-dir.sh \
   detection.sh \

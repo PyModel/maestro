@@ -180,7 +180,7 @@ Removes the hooks, strips only its own entries from `settings.json`, and leaves 
 
 Stated plainly, because a tool that overstates its guarantees is worse than one that has fewer.
 
-- **The gate is a guardrail, not a boundary.** It is registered for `Edit|Write|MultiEdit` only. `Bash`, MCP tools, and `Workflow`/`Agent` are *not* matched, so a redirect or `sed -i` reaches the tree untouched. The orchestrator not writing source is a discipline it keeps, not a control that keeps it.
+- **The gate is a guardrail, not a boundary.** It is registered for `Edit|Write|MultiEdit` only. `Bash`, MCP tools, and `Workflow`/`Agent` are *not* matched, so a redirect or `sed -i` reaches the tree untouched. Unknown file types are gated by default through a non-code allowlist, the hook fails closed on malformed payloads, and subagents never inherit "edit it yourself". The orchestrator not writing source is a discipline it keeps, not a control that keeps it.
 - **Provenance detection reports, it never attributes.** Each write-lease acquisition digests the materialized tree and compares it to the snapshot the previous dispatch left. A mismatch names an interval — never a writer. Ignored paths are out of observation scope on cost grounds, and the log lives inside the repository it watches. It catches accidental convention failures and unnoticed agent writes. It is not an adversarial control.
 - **Same-vendor review.** The orchestrator reviews its own plan's execution.
 - **Model pin depends on config being honored.** If your companion version overrides the model with its own flags, the pin won't take — check `codex-model-select.sh --show` against one dispatch's behavior.
