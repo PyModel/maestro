@@ -4,7 +4,8 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIB="$ROOT/hooks/lib-companion.sh"
-FAKE=/tmp/fake-companion.mjs
+FAKE="$ROOT/tests/fixtures/fake-companion.mjs"
+[ -f "$FAKE" ] || { echo "VERIFY FAIL: missing fixture $FAKE"; exit 1; }
 TEST_ROOT=$(mktemp -d /tmp/maestro-planf-green.XXXXXXXX)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 

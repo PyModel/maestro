@@ -10,7 +10,21 @@ bash -n "$LIB" || { echo "VERIFY FAIL: syntax lib"; exit 1; }
 bash -n "$LOOP" || { echo "VERIFY FAIL: syntax loop"; exit 1; }
 
 D=$(mktemp -d /tmp/planN.XXXXXX); trap 'rm -rf "$D"' EXIT
-export PATH=/tmp/maestro-shim:$PATH
+FIXTURE="$ROOT/tests/fixtures/fake-companion.mjs"
+[ -f "$FIXTURE" ] || { echo "VERIFY FAIL: missing fixture $FIXTURE"; exit 1; }
+# Resolve the real node BEFORE PATH is shimmed, and embed the absolute path:
+# the shim is itself named `node`, so calling `node` from inside it would recurse.
+REAL_NODE=$(node -p 'process.execPath')
+mkdir -p "$D/shim"
+cat > "$D/shim/node" <<EOF
+#!/usr/bin/env bash
+# lib-companion invokes: node <resolved-companion-path> <subcommand> …
+# Drop the resolved path and run the fixture in its place.
+shift
+exec "$REAL_NODE" "$FIXTURE" "\$@"
+EOF
+chmod +x "$D/shim/node"
+export PATH="$D/shim:$PATH"
 export MAESTRO_TEST_RESULT="RESULT: DONE"
 printf '{\n  "running": [],\n  "latestFinished": null\n}\n' > "$D/status.json"
 export MAESTRO_TEST_STATUS="$D/status.json"
