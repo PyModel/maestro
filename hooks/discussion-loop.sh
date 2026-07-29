@@ -12,7 +12,8 @@
 # Usage:
 #   discussion-loop.sh --new "<topic>" [slug]              start a fresh transcript
 #   discussion-loop.sh --turn <turn-file> [slug] [max_idle_sec] [poll_sec]
-# Transcript: /tmp/maestro-discussion-<slug>.md   (default slug: main)
+# Transcript: ~/.maestro/discussions/<workspace-key>-<slug>.md
+#             (default slug: main)
 #
 # Termination (enforced): after MAESTRO_MAX_ROUNDS Claude turns (default 6) the
 # script refuses another turn — converge with a stated assumption or ESCALATE.
@@ -59,12 +60,28 @@ MODE="${1:-}"
 
 valid_slug() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
 
+transcript_path() {
+  local root key
+  # Anchor to the repo root so subdirectories share one workspace transcript.
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || root=$PWD
+  key=$(printf '%s' "$root" | tr -c 'A-Za-z0-9' '-')
+  DISCUSS_DIR="$HOME/.maestro/discussions"
+  mkdir -p "$DISCUSS_DIR"
+  T="$DISCUSS_DIR/${key}-${SLUG}.md"
+
+  # Best-effort migration keeps an in-flight discussion intact.
+  OLD_T="/tmp/maestro-discussion-${SLUG}.md"
+  if [ -f "$OLD_T" ] && [ ! -f "$T" ]; then
+    mv "$OLD_T" "$T" 2>/dev/null || :
+  fi
+}
+
 if [ "$MODE" = "--new" ]; then
   [ $# -ge 2 ] || { echo "DISCUSSION_ERROR: topic required after --new" >&2; maestro_finish "FAILED" 3; }
   TOPIC="$2"
   SLUG="${3:-main}"
   valid_slug "$SLUG" || { echo "DISCUSSION_ERROR: slug may only contain [a-zA-Z0-9_-]" >&2; maestro_finish "FAILED" 3; }
-  T="/tmp/maestro-discussion-${SLUG}.md"
+  transcript_path
   if [ -f "$T" ]; then
     echo "DISCUSSION_ERROR: transcript already exists: $T (pick another slug or remove it)" >&2
     maestro_finish "FAILED" 3
@@ -88,9 +105,9 @@ POLL="${5:-20}"
 MAX_ROUNDS="${MAESTRO_MAX_ROUNDS:-6}"
 RETRIES="${MAESTRO_DISCUSSION_RETRIES:-2}"
 RETRY_SLEEP="${MAESTRO_RETRY_SLEEP:-5}"
-T="/tmp/maestro-discussion-${SLUG}.md"
 
 valid_slug "$SLUG" || { echo "DISCUSSION_ERROR: slug may only contain [a-zA-Z0-9_-]" >&2; maestro_finish "FAILED" 3; }
+transcript_path
 if [ ! -f "$T" ]; then
   echo "DISCUSSION_ERROR: no transcript at $T — start one with --new \"<topic>\" ${SLUG}" >&2
   maestro_finish "FAILED" 3

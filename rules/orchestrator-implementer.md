@@ -55,7 +55,7 @@ bash ~/.claude/hooks/discussion-loop.sh --new "<topic>" <slug>
 bash ~/.claude/hooks/discussion-loop.sh --turn <your-turn-file> <slug>
 ```
 
-You drive, like a user would. Write your turn to a temp file — your position, your strongest evidence, actual diffs and failing output when relevant — the script appends it to the transcript at `/tmp/maestro-discussion-<slug>.md`, and Codex replies with a `STANCE: AGREE / PUSHBACK / ALTERNATIVE / REFRAME` line. Debate mode is **read-only**: nobody edits code while the design is still being argued. Codex shares no memory between calls — the transcript *is* the memory, so quote, never paraphrase.
+You drive, like a user would. Write your turn to a temp file — your position, your strongest evidence, actual diffs and failing output when relevant — the script appends it to the transcript at `~/.maestro/discussions/<workspace>-<slug>.md`, and Codex replies with a `STANCE: AGREE / PUSHBACK / ALTERNATIVE / REFRAME` line. Debate mode is **read-only**: nobody edits code while the design is still being argued. Codex shares no memory between calls — the transcript *is* the memory, so quote, never paraphrase.
 
 **Protocol:**
 
