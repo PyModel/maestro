@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
-LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hooks/lib-companion.sh"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LIB="$ROOT/hooks/lib-companion.sh"
 bash -n "$LIB" || { echo "VERIFY FAIL: syntax"; exit 1; }
 
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
@@ -24,5 +25,6 @@ echo "cross-worktree acquire rc=$RC"
 N=$(mktemp -d); F=$(cd "$N" && bash -c "set -uo pipefail; . '$LIB'; write_lock_path"); rm -rf "$N"
 case "$F" in */.maestro-write.lock) ;; *) echo "VERIFY FAIL: non-git fallback = $F"; exit 1;; esac
 
-bash /tmp/planf-green.sh 2>&1 | tail -1 | grep -q '13 passed, 0 failed' || { echo "VERIFY FAIL: lease suite regressed"; exit 1; }
+[ -f "$ROOT/tests/lease.sh" ] || { echo "VERIFY FAIL: missing $ROOT/tests/lease.sh"; exit 1; }
+bash "$ROOT/tests/lease.sh" 2>&1 | tail -1 | grep -q '13 passed, 0 failed' || { echo "VERIFY FAIL: lease suite regressed"; exit 1; }
 echo "VERIFY PASS: shared lease path, cross-worktree contention=11, fallback intact, 13/13 lease suite"
