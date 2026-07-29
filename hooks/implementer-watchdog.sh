@@ -98,6 +98,19 @@ CONTRACT='
     RESULT: NEEDS_ANSWERS
     QUESTIONS:
     1. <question — what you found, what you need decided, and what each answer implies>
+- Exception, and the ONLY one: if the plan states a default or a scope grant that covers
+  the ambiguity, apply it and keep going. Record the line
+    DEFAULT_APPLIED: <what you applied> — <the plan text that granted it>
+  in your report. This is not a result state and never replaces the RESULT line; it is a
+  disclosure for the reviewer. If the plan does not cover it, STOP as above — a default you
+  invented is a guess, not a grant.
+- Whenever you stop with NEEDS_ANSWERS or BLOCKED, the job ends and your thread is gone.
+  Everything the next run needs must be written down. End with a capsule:
+    CONTINUATION:
+    - Completed: <steps finished, and the files they touched>
+    - Evidence: <the exact failing output or constraint that stopped you>
+    - Next: <the immediate next step for each possible answer>
+  Write it for a fresh implementer with no memory of this run, because that is who reads it.
 - Run the plan'"'"'s verification commands yourself and paste their ACTUAL output and exit
   codes. A claim without output is not verification.
 - End every run with exactly ONE result line, then the evidence:
@@ -106,8 +119,12 @@ CONTRACT='
     RESULT: BLOCKED         — missing access/credentials or a destructive step; name the blocker
     RESULT: FAILED          — verification failed; paste the failing output
 - Report the list of files you created or modified. Never silently leave stray files.
-- Keep the final report under ~400 words plus the verification output. Your reader is
-  another model reviewing your diff, not a human reading a report.'
+- Keep the final report under ~400 words, plus the verification output and any `CONTINUATION:`
+  capsule. Your reader is another model reviewing your diff, not a human reading a report.
+- Write the laziest thing that works: reuse what the repo already has, prefer the standard
+  library and native features over new code, and never add an abstraction, dependency, or
+  config knob the plan did not ask for. Shortest working diff wins. Mark a deliberate
+  shortcut with a `ponytail:` comment naming its ceiling.'
 PROMPT="${PROMPT}${CONTRACT}"
 
 C=$(companion_resolve) || {

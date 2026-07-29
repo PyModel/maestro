@@ -40,6 +40,13 @@ Project conventions, things not to touch, and **facts you researched** so the im
 - Interfaces that must not change — output prefixes, exit codes, function signatures other code parses.
 - Prohibitions on speculative work: no config flags, no log-level systems, no abstraction for a single call site.
 
+Pre-state these grants in every plan:
+
+- **Scope grants** — name the adjacent files the implementer may touch without asking, and the condition that permits each one. Half of this channel's questions have been "may I also edit X"; answering it here avoids the round-trip.
+- **Bounded defaults** — for every foreseeable judgment call, state the default to apply and require a `DEFAULT_APPLIED:` disclosure naming the grant.
+
+Ask for the laziest implementation that satisfies the objective: no speculative abstraction, and no new dependency when the repository or standard library already suffices.
+
 ### 5. Verification
 The exact commands, and **what passing looks like** for each. A verification step whose output nobody defined is decoration.
 

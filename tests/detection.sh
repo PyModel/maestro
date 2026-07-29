@@ -87,7 +87,7 @@ for O in "$O2" "$O3" "$O4"; do
 done
 
 # ---- 7. regressions
-bash "$ROOT/tests/lease.sh" 2>&1 | tail -1 | grep -q '13 passed, 0 failed' || { echo "VERIFY FAIL(7): lease suite"; exit 1; }
+bash "$ROOT/tests/lease.sh" 2>&1 | tail -1 | grep -qE '[1-9][0-9]* passed, 0 failed' || { echo "VERIFY FAIL(7): lease suite"; exit 1; }
 bash "$ROOT/tests/shared-git-dir.sh" 2>&1 | tail -1 | grep -q 'VERIFY PASS' || { echo "VERIFY FAIL(7): planJ"; exit 1; }
 
 echo "VERIFY PASS: gap detected at acquisition (tracked + untracked content), reported before dispatch, no tautological clean, no false gap, ignored out of scope, sentinel intact"

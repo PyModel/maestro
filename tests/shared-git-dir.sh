@@ -26,5 +26,5 @@ N=$(mktemp -d); F=$(cd "$N" && bash -c "set -uo pipefail; . '$LIB'; write_lock_p
 case "$F" in */.maestro-write.lock) ;; *) echo "VERIFY FAIL: non-git fallback = $F"; exit 1;; esac
 
 [ -f "$ROOT/tests/lease.sh" ] || { echo "VERIFY FAIL: missing $ROOT/tests/lease.sh"; exit 1; }
-bash "$ROOT/tests/lease.sh" 2>&1 | tail -1 | grep -q '13 passed, 0 failed' || { echo "VERIFY FAIL: lease suite regressed"; exit 1; }
-echo "VERIFY PASS: shared lease path, cross-worktree contention=11, fallback intact, 13/13 lease suite"
+bash "$ROOT/tests/lease.sh" 2>&1 | tail -1 | grep -qE '[1-9][0-9]* passed, 0 failed' || { echo "VERIFY FAIL: lease suite regressed"; exit 1; }
+echo "VERIFY PASS: shared lease path, cross-worktree contention=11, fallback intact, lease suite green"

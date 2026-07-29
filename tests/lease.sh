@@ -15,6 +15,14 @@ bad()  { printf 'FAIL  %s — %s\n' "$1" "$2"; FAIL=$((FAIL+1)); }
 
 ws() { local d="$TEST_ROOT/$1"; mkdir -p "$d"; printf '%s' "$d"; }
 
+without_ps_path() {  # dir
+  local bin="$1/no-ps"
+  mkdir -p "$bin"
+  printf '#!/bin/sh\nexit 1\n' > "$bin/ps"
+  chmod +x "$bin/ps"
+  printf '%s:%s' "$bin" "$PATH"
+}
+
 status_running_job() { printf '{\n  "running": [\n    {\n      "id": "%s",\n      "write": %s\n    }\n  ],\n  "latestFinished": null\n}\n' "$1" "$2"; }
 status_empty()       { printf '{\n  "running": [],\n  "latestFinished": null\n}\n'; }
 
@@ -192,8 +200,40 @@ kill_dispatcher_case() (  # $1=dir  $2=job_id_recorded  $3=running_job_id
 t10a() { kill_dispatcher_case "$(ws kill_before)" unknown task-other0000-bbbbbb; }
 t10b() { kill_dispatcher_case "$(ws kill_after)" task-fake0000-aaaaaa task-fake0000-aaaaaa; }
 
+# ---------------------------------------------------------------- step 11
+# Missing ps must not prevent acquisition; metadata records the recovery gap.
+t11() (
+  local dir rc; dir=$(ws no_ps_acquire)
+  cd "$dir"; . "$LIB"; progress_init
+  PATH=$(without_ps_path "$dir"); export PATH
+  write_lock_acquire task-no-ps000-aaaaaa >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ] || { echo "rc=$rc want 0"; return 1; }
+  grep -qx 'process_start=unavailable' "$dir/.maestro-write.lock/metadata" ||
+    { echo "process_start=unavailable not recorded"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 12
+# A live owner with unconfirmable identity must block rather than be stolen.
+t12() (
+  local dir owner_pid rc; dir=$(ws no_ps_contention)
+  status_empty > "$dir/status.json"
+  sleep 30 & owner_pid=$!
+  trap 'kill "$owner_pid" 2>/dev/null || :; wait "$owner_pid" 2>/dev/null || :' EXIT
+  mkdir -p "$dir/.maestro-write.lock"
+  printf 'token=old\npid=%s\nprocess_start=unavailable\njob_id=task-live0000-aaaaaa\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\n' \
+    "$owner_pid" > "$dir/.maestro-write.lock/metadata"
+  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  export MAESTRO_TEST_STATUS="$dir/status.json"
+  PATH=$(without_ps_path "$dir"); export PATH
+  write_lock_acquire task-new00000-cccccc >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ -d "$dir/.maestro-write.lock" ] || { echo "live owner's lock was broken"; return 1; }
+  return 0
+)
+
 printf '=== Plan F green-phase verification ===\n'
-for t in t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b; do
+for t in t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12; do
   msg=$($t 2>&1) && ok "$t" || bad "$t" "${msg:-no detail}"
 done
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

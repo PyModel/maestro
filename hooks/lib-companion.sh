@@ -309,7 +309,8 @@ write_lock_workspace_writers() {
 
 write_lock_acquire() {
   local requested_job="${1:-unknown}" metadata recorded_token owner_pid owner_start
-  local owner_job started_epoch current_start held now attempt token process_start
+  local owner_job started_epoch current_start held now attempt token process_start owner_alive
+  local identity_note
   local writers writers_rc digest_before log_path last prior_job prior_after observed_at
   local stale_digest_before stale_digest_after stale_released_at
   MAESTRO_LOCK_ACQUIRED=0
@@ -329,10 +330,11 @@ write_lock_acquire() {
     if mkdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
       token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
       process_start=$(ps -o lstart= -p "$$" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+      # ponytail: mkdir gives mutual exclusion; ps only sharpens stale-owner recovery.
+      # Without it, record the gap and let the contention path fail closed instead.
       if [ -z "$process_start" ]; then
-        rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
-        progress "MAESTRO_LOCK: could not determine process start identity for pid=$$"
-        return 3
+        process_start=unavailable
+        progress "MAESTRO_LOCK: process start identity unavailable for pid=$$; lease recorded without it (stale-owner recovery will fail closed)"
       fi
       now=$(date +%s)
       digest_before=$(repo_digest 2>/dev/null) || digest_before=unavailable
@@ -384,12 +386,20 @@ write_lock_acquire() {
     stale_digest_before=$(write_lock_metadata_value "$metadata" digest_before)
     owner_job=${owner_job:-unknown}
     stale_digest_before=${stale_digest_before:-unavailable}
+    owner_alive=0
     current_start=""
     if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
+      owner_alive=1
       current_start=$(ps -o lstart= -p "$owner_pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     fi
 
-    if [ -n "$current_start" ] && [ "$current_start" = "$owner_start" ]; then
+    if [ "$owner_alive" -eq 1 ] &&
+      { [ -z "$current_start" ] || [ -z "$owner_start" ] ||
+        [ "$owner_start" = unavailable ] || [ "$current_start" = "$owner_start" ]; }; then
+      identity_note=""
+      if [ -z "$current_start" ] || [ -z "$owner_start" ] || [ "$owner_start" = unavailable ]; then
+        identity_note=" (identity unconfirmed; failing closed)"
+      fi
       case "$started_epoch" in
         ''|*[!0-9]*) held="unknown" ;;
         *)
@@ -399,7 +409,7 @@ write_lock_acquire() {
           held="${held}s"
           ;;
       esac
-      progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)"
+      progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)${identity_note}"
       return 11
     fi
 
