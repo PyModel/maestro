@@ -38,6 +38,7 @@ Run `node install.mjs`, restart Claude Code in your project terminal, then ask C
 
 <div align="center">
   <img src="public/running.png" alt="Maestro dispatching a plan to Codex and monitoring the implementer loop" width="100%">
+  <img src="public/session.png" alt="Maestro relaying Codex questions and tracking verified implementation progress" width="100%">
 </div>
 
 ---
