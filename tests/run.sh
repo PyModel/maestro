@@ -7,6 +7,7 @@ FAIL=0
 
 for suite in \
   gate.sh \
+  preflight.sh \
   lease.sh \
   shared-git-dir.sh \
   detection.sh \
