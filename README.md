@@ -32,6 +32,16 @@ cd maestro && node install.mjs
 
 ---
 
+## Maestro in action
+
+Run `node install.mjs`, restart Claude Code in your project terminal, then ask Claude directly to use Codex for the task. That's it — no Maestro skill or slash command is needed.
+
+<div align="center">
+  <img src="public/running.png" alt="Maestro dispatching a plan to Codex and monitoring the implementer loop" width="100%">
+</div>
+
+---
+
 ## Why
 
 Some teams trust Claude's judgment more than its patience, and Codex's typing more than its plans. Maestro is for that split: the model you want making decisions (Opus 5 / Fable 5) holds the plan and the final review; the model you want grinding through edits holds the pen.
