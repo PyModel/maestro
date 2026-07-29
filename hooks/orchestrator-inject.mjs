@@ -6,6 +6,10 @@
 // "how much does X cost" — trains the loop to tune it out, so silence on unrelated
 // prompts is what gives the directive its weight.
 import fs from 'node:fs';
+import {
+  NONCODE_EXTENSIONS,
+  directiveOpensGate,
+} from './maestro-policy.mjs';
 let payload = {};
 try { payload = JSON.parse(fs.readFileSync(0, 'utf8')); } catch {}
 const sid = payload.session_id || 'default';
@@ -14,8 +18,7 @@ const flag = `/tmp/maestro-direct-${sid}.flag`;
 
 // Explicit user override: "edit it yourself" / "don't delegate" → Claude may write
 // source directly for this task. This is the only thing that opens the gate.
-const DIRECT = /(edit it yourself|do it yourself|write it yourself|don'?t delegate|no codex|skip codex|yourself this time|kendin yap|sen yap|sen d[üu]zenle)/i;
-if (DIRECT.test(prompt)) {
+if (directiveOpensGate(prompt)) {
   try { fs.writeFileSync(flag, '1'); } catch {}
 } else {
   // Only a SHORT standalone ack counts as continuation. "Okay, now fix this other
@@ -47,8 +50,12 @@ const onDemand = /delegate to codex|codex implement|have codex|ask codex|codex'?
 
 // Otherwise: does this prompt plausibly end in a source-code change? Config,
 // markdown and questions deliberately miss — those Claude handles directly.
+const fileTokens = prompt.match(/[\w./-]*\.[A-Za-z][A-Za-z0-9_]{0,11}\b/g) || [];
+const hasCodeFile = fileTokens.some((token) => {
+  const extension = token.slice(token.lastIndexOf('.') + 1).toLowerCase();
+  return !NONCODE_EXTENSIONS.has(extension);
+});
 const CODE_SIGNAL = new RegExp([
-  '\\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|rb|php|java|kt|swift|c|h|cpp|hpp|cc|vue|svelte|sql|sh)\\b',
   '/(code-review|apple-design|improve|quality-code|software-architecture-design|systematic-debugging)\\b',
   '\\b(implement|refactor|debug|crash|failing|regression|endpoint|schema|migration|architecture)\\b',
   '\\b(fix|bug|api|component|function|query|deploy|optimi[sz]e|design|build|add feature)\\b',
@@ -56,7 +63,7 @@ const CODE_SIGNAL = new RegExp([
   '(hata|düzelt|mimari|tasarla|tasarım|özellik|fonksiyon|bileşen|sorgu|entegre|kodla|geliştir|çalışmıyor|patlıyor|bozuldu)',
 ].join('|'), 'i');
 
-if (!onDemand && !CODE_SIGNAL.test(prompt)) process.exit(0);
+if (!onDemand && !hasCodeFile && !CODE_SIGNAL.test(prompt)) process.exit(0);
 
 process.stdout.write(
   'ORCHESTRATOR/IMPLEMENTER LOOP — this prompt carries a code/design signal.\n' +

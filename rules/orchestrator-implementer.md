@@ -109,7 +109,7 @@ Never silently patch Codex's work yourself — fixes go back through the impleme
 
 ## Gate
 
-A PreToolUse hook blocks your Edit/Write/MultiEdit on real source files (`.ts .tsx .js .py .go .rs …`) for the whole task. Never gated: `~/.claude`, `~/.codex`, `/tmp`, `~/Desktop`, and any non-code file — plan files, notes, and config are always yours to write. The gate opens only when the user explicitly says "edit it yourself" / "sen yap", and resets on the next task. Codex unreachable and the change is trivial → ask the user for direct-edit approval; don't route around the gate.
+A PreToolUse hook blocks your Edit/Write/MultiEdit for the whole task on everything except an explicit non-code allowlist (docs/config/data) and the listed harness/scratch paths. It fails closed on unreadable hook payloads and never honors the direct-edit override inside subagents. Never gated: `~/.claude`, `~/.codex`, `/tmp`, `~/Desktop`, and any non-code file — plan files, notes, and config are always yours to write. The gate opens only when the user explicitly says "edit it yourself" / "sen yap", and resets on the next task. Codex unreachable and the change is trivial → ask the user for direct-edit approval; don't route around the gate.
 
 **What the gate is, exactly — do not overstate it.**
 
@@ -117,9 +117,9 @@ A PreToolUse hook blocks your Edit/Write/MultiEdit on real source files (`.ts .t
 
 The hook is registered for `Edit|Write|MultiEdit` only. `Bash`, MCP tools, and `Workflow`/`Agent` are *not* matched, so a redirect, `sed -i`, or a write-capable MCP call reaches the tree untouched. The rule above is a discipline you keep, not a control that keeps you. Never tell the user "the gate blocks this" as evidence a change is safe — say what actually ran and what you verified.
 
-One known hole, still real today:
+One hole, now version-conditional:
 
-- The direct-edit override keys off `session_id`, which subagents share (`agent_id` is what distinguishes them). One "edit it yourself" therefore opens the gate for every agent in a fan-out.
+- Fixed on Claude Code versions whose subagent PreToolUse payloads carry `agent_id`/`agent_type`: the gate refuses the override when either is present. On older versions that omit the fields, the original hole remains — there is no cross-version schema guarantee.
 
 Fixed: the lease used to resolve via `git rev-parse --git-dir`, which is per-worktree, so N linked worktrees held N independent leases. It now anchors to `--git-common-dir` and serializes repository-wide.
 

@@ -76,7 +76,7 @@ if (withWorkflow && !hasRalphLoop()) {
 fs.mkdirSync(HOOKS, { recursive: true });
 fs.mkdirSync(RULES, { recursive: true });
 const HOOK_FILES = [
-  'orchestrator-inject.mjs', 'orchestrator-gate.mjs', 'session-start.mjs',
+  'orchestrator-inject.mjs', 'orchestrator-gate.mjs', 'maestro-policy.mjs', 'session-start.mjs',
   'implementer-watchdog.sh', 'implementer-loop.sh', 'discussion-loop.sh',
   'lib-companion.sh', 'codex-model-select.sh', 'codex-mcp-check.sh',
 ];
