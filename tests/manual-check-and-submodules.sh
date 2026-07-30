@@ -21,7 +21,7 @@ echo "== 2. submodule working-tree content is observed, and stays commit-invaria
 git init -q "$D/dep"; ( cd "$D/dep" && git config user.email p@p && git config user.name p \
   && printf 'v1\n' > f.txt && git add -A && git commit -q -m v1 \
   && printf 'v2\n' > f.txt && git add -A && git commit -q -m v2 )
-git init -q "$D/s"; cd "$D/s"; git config user.email p@p; git config user.name p
+git init -q "$D/s"; cd "$D/s" || exit 1; git config user.email p@p; git config user.name p
 printf 'a\n' > s.sh; git add -A; git commit -q -m init
 git -c protocol.file.allow=always submodule add -q "$D/dep" dep 2>/dev/null || {
   echo "SKIP(2): this git refuses local submodules"; echo "VERIFY PASS (case 2 skipped)"; exit 0; }
