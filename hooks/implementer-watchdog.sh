@@ -23,7 +23,8 @@
 # stderr so callers never parse prose for the verdict.
 #
 # Exit codes: 0 = DONE result printed | 10 = NEEDS_ANSWERS result printed
-#             11 = BLOCKED result printed or write lock held | 124 = hung, cancelled
+#             11 = BLOCKED result printed or write lock held | 124 = read-only timeout
+#             125 = write cancellation poisoned the lease
 #             3 = could not start | 4 = job failed or result missing
 set -uo pipefail
 
@@ -174,8 +175,18 @@ case "$rc" in
       FAILED) maestro_finish "FAILED" 4 ;;
     esac ;;
   124)
-    progress "WATCHDOG_HUNG: job $JOB stalled for ${MAX_IDLE}s (no log growth); cancelled. Re-dispatch with a narrower plan or ask the user."
+    progress "WATCHDOG_HUNG: job $JOB was cancelled; no retry was started."
     maestro_finish "HUNG" 124 ;;
+  125)
+    reason=${MAESTRO_CANCEL_REASON:-unknown}
+    if [ "${MAESTRO_CANCEL_REQUESTED:-1}" -eq 0 ]; then
+      progress "WATCHDOG_POISONED: job $JOB was not cancelled because poison metadata could not be staged and may still be running; the write lease is retained and this run is over."
+    else
+      progress "WATCHDOG_POISONED: job $JOB was cancelled ($reason) and turn quiescence could not be confirmed; the write lease is retained and this run is over."
+    fi
+    progress "WATCHDOG_POISONED: recover only after no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
+    printf 'RESULT: BLOCKED\n'
+    maestro_finish "POISONED" 125 ;;
   6)
     echo "WATCHDOG_FAILED: companion status unreachable; job $JOB state unknown. Check the tree before re-dispatching." >&2
     maestro_finish "FAILED" 4 ;;

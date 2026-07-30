@@ -9,6 +9,7 @@ for suite in \
   gate.sh \
   preflight.sh \
   lease.sh \
+  liveness.sh \
   shared-git-dir.sh \
   detection.sh \
   orphan-lifecycle.sh \

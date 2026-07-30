@@ -74,8 +74,10 @@ The loop never ends in prose. Every run finishes on a machine-readable state:
 |:---:|---|---|---|
 | `0` | **VERIFIED_DONE** | Plan executed *and* the verify command passed locally | Review the diff — a claim is not proof |
 | `10` | **NEEDS_ANSWERS** | Codex hit real ambiguity and stopped instead of guessing | Answer the `QUESTIONS:` block, re-run |
-| `11` | **BLOCKED** | Missing access, a destructive step, or lease contention | Surface it; never improvise around it |
+| `11` | **BLOCKED** | Missing access, a destructive step, lease contention, or an unconfirmed cancelled writer | Surface it; never improvise around it |
 | `12` | **STUCK** | Hit the iteration cap without verification | Read the attempts log, re-plan — don't just raise the cap |
+
+Every dispatch has an absolute deadline (`MAESTRO_MAX_DISPATCH_SEC`, default 1200 seconds), while the local verifier has its own process-group deadline (`MAESTRO_VERIFY_TIMEOUT_SEC`, default 900 seconds). Cancellation occurs within one poll interval after the dispatch deadline, not exactly at it. Cancelling a write job cannot prove its brokered turn stopped, so Maestro retains and poisons the lease, ends the loop as `BLOCKED`, and does not re-dispatch. Once no Codex job is writing, recover with `bash hooks/implementer-loop.sh --clear-lease` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`). Read-only discussions hold no write lease and are never poisoned.
 
 ## Components
 
@@ -86,9 +88,9 @@ Installed under `~/.claude`, plus one shared library they source.
 | **`session-start.mjs`** | Opens each session with the Codex model + effort picker. Resumed sessions get a status line instead of a re-ask. |
 | **`codex-model-select.sh`** | Pins `model` and reasoning effort in `~/.codex/config.toml` — TOML-safe, backed up, idempotent. Debate and implementation get separate tiers. |
 | **`codex-mcp-check.sh`** | Shows exactly which MCP servers your background Codex jobs inherit, env keys masked. |
-| **`implementer-loop.sh`** | The autonomous heart: dispatch → parse `RESULT` → re-verify **locally** → feed failure evidence back in. Bounded by `--max-iters`. |
+| **`implementer-loop.sh`** | The autonomous heart: dispatch → parse `RESULT` → re-verify **locally** → feed failure evidence back in. Bounded by `--max-iters` and a verifier deadline. |
 | **`discussion-loop.sh`** | The bidirectional debate channel. Read-only — nobody edits code mid-argument. |
-| **`implementer-watchdog.sh`** | Single dispatch with `--write`, cancels a job that stalls for 5 minutes. |
+| **`implementer-watchdog.sh`** | Single dispatch with `--write`; idle or absolute cancellation poisons and retains its write lease. |
 | **`orchestrator-inject.mjs`** | Resets the direct-edit flag per task; states the loop only when the prompt carries a code/design signal. |
 | **`orchestrator-gate.mjs`** | Blocks the orchestrator's `Edit`/`Write`/`MultiEdit` on source files. |
 | **`lib-companion.sh`** | Shared library: the write lease, provenance detection, companion resolution. |
@@ -182,6 +184,7 @@ Stated plainly, because a tool that overstates its guarantees is worse than one 
 
 - **The gate is a guardrail, not a boundary.** It is registered for `Edit|Write|MultiEdit` only. `Bash`, MCP tools, and `Workflow`/`Agent` are *not* matched, so a redirect or `sed -i` reaches the tree untouched. Unknown file types are gated by default through a non-code allowlist, the hook fails closed on malformed payloads, and subagents never inherit "edit it yourself". The orchestrator not writing source is a discipline it keeps, not a control that keeps it.
 - **Provenance detection reports, it never attributes.** Each write-lease acquisition digests the materialized tree and compares it to the snapshot the previous dispatch left. A mismatch names an interval — never a writer. Ignored paths are out of observation scope on cost grounds, and the log lives inside the repository it watches. It catches accidental convention failures and unnoticed agent writes. It is not an adversarial control.
+- **Cancellation terminality is upstream.** The companion does not expose the brokered turn's terminal event to Maestro's shell. A cancelled write may therefore leave unreported edits, so Maestro stops and retains the lease instead of guessing that the turn is quiescent.
 - **Same-vendor review.** The orchestrator reviews its own plan's execution.
 - **Model pin depends on config being honored.** If your companion version overrides the model with its own flags, the pin won't take — check `codex-model-select.sh --show` against one dispatch's behavior.
 - **Plugin flag drift.** Write dispatches preflight the companion's global `--help` and refuse only when it describes `task` without `--write`; inconclusive help (empty, error, or no synopsis) proceeds rather than blocking work.

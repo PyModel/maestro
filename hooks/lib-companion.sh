@@ -6,7 +6,9 @@
 #   progress <message>                     → writes one progress line to FD 3
 #   repo_digest                            → prints a repository-wide state digest, or returns non-zero
 #   write_lock_acquire [job]               → returns 0 acquired/inherited | 11 live contention
+#   write_lock_is_owner                    → returns 0 for the acquirer or its inherited token
 #   write_lock_set_job <job>               → records a known job id for the current owner
+#   write_lock_poison <job> <reason>        → stages unconfirmed-quiescence metadata
 #   write_lock_release                     → releases an acquired lock only after its lease ends
 #   provenance_check                       → manually compares the tree to the last completed snapshot
 #   companion_resolve                      → prints companion path, or returns 3
@@ -14,7 +16,8 @@
 #   companion_start <C> <prompt> [write]   → prints job id, or returns 3 (fails closed without a pin)
 #   companion_verify_pin <C> <job> <model> <effort> → returns 0 match | 4 mismatch
 #   companion_workspace_writers <C>        → prints job<TAB>write, or returns 4
-#   companion_poll  <C> <job> <idle> <sec> → returns 0 done | 4 failed | 124 hung | 6 status-lost
+#   companion_poll  <C> <job> <idle> <sec> → returns 0 done | 4 failed | 124 read-only timeout
+#                                             | 125 write timeout | 6 status-lost
 #   companion_result <C> <job>             → prints result (retried), or returns 4
 #
 # Error-handling contract: a companion that cannot answer `status` 4 times in a row
@@ -208,6 +211,18 @@ write_lock_metadata_value() {
   sed -n "s/^${field}=//p" "$metadata" 2>/dev/null | head -1
 }
 
+write_lock_is_owner() {
+  local metadata recorded_token
+  [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || {
+    [ -n "${MAESTRO_LOCK_TOKEN:-}" ] || return 1
+  }
+  metadata="${MAESTRO_LOCK_DIR:-$(write_lock_path)}/metadata"
+  [ -f "$metadata" ] || return 1
+  recorded_token=$(write_lock_metadata_value "$metadata" token)
+  [ -n "${MAESTRO_LOCK_TOKEN:-}" ] &&
+    [ "$recorded_token" = "$MAESTRO_LOCK_TOKEN" ]
+}
+
 companion_workspace_writers() {
   local C="$1" status parsed rc
   if ! status=$(node "$C" status --all --json 2>/dev/null); then
@@ -310,12 +325,26 @@ write_lock_workspace_writers() {
 write_lock_acquire() {
   local requested_job="${1:-unknown}" metadata recorded_token owner_pid owner_start
   local owner_job started_epoch current_start held now attempt token process_start owner_alive
-  local identity_note
+  local identity_note quiescence unconfirmed_job unconfirmed_reason poison_metadata
   local writers writers_rc digest_before log_path last prior_job prior_after observed_at
   local stale_digest_before stale_digest_after stale_released_at
   MAESTRO_LOCK_ACQUIRED=0
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
   metadata="$MAESTRO_LOCK_DIR/metadata"
+
+  poison_metadata="$metadata"
+  quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
+  if [ "$quiescence" != "unconfirmed" ] &&
+    [ -e "$MAESTRO_LOCK_DIR/metadata.new" ]; then
+    poison_metadata="$MAESTRO_LOCK_DIR/metadata.new"
+    quiescence=unconfirmed
+  fi
+  if [ "$quiescence" = "unconfirmed" ]; then
+    unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
+    unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
+    progress "MAESTRO_LOCK: write dispatch blocked; quiescence is unconfirmed for job=${unconfirmed_job:-unknown} reason=${unconfirmed_reason:-unknown} (lock: $MAESTRO_LOCK_DIR). Clear it once no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
+    return 11
+  fi
 
   if [ -n "${MAESTRO_LOCK_TOKEN:-}" ] && [ -f "$metadata" ]; then
     recorded_token=$(write_lock_metadata_value "$metadata" token)
@@ -430,6 +459,22 @@ write_lock_acquire() {
       return 11
     fi
 
+    # Cancellation stages poison before the job disappears from the writers list.
+    # Recheck after liveness so that transition cannot be erased as stale.
+    poison_metadata="$metadata"
+    quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
+    if [ "$quiescence" != "unconfirmed" ] &&
+      [ -e "$MAESTRO_LOCK_DIR/metadata.new" ]; then
+      poison_metadata="$MAESTRO_LOCK_DIR/metadata.new"
+      quiescence=unconfirmed
+    fi
+    if [ "$quiescence" = "unconfirmed" ]; then
+      unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
+      unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
+      progress "MAESTRO_LOCK: write dispatch blocked; quiescence is unconfirmed for job=${unconfirmed_job:-unknown} reason=${unconfirmed_reason:-unknown} (lock: $MAESTRO_LOCK_DIR). Clear it once no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
+      return 11
+    fi
+
     if rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null &&
       rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
       progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job pid=${owner_pid:-unknown}"
@@ -495,8 +540,35 @@ write_lock_set_job() {
   fi
 }
 
+write_lock_poison() {
+  local job="$1" reason="$2" metadata next_metadata recorded_token owner_pid owner_start
+  local owner_job started_at started_epoch digest_before
+  write_lock_is_owner || return 3
+  metadata="${MAESTRO_LOCK_DIR:-$(write_lock_path)}/metadata"
+  [ -f "$metadata" ] || return 3
+  recorded_token=$(write_lock_metadata_value "$metadata" token)
+  [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || return 3
+  owner_pid=$(write_lock_metadata_value "$metadata" pid)
+  owner_start=$(write_lock_metadata_value "$metadata" process_start)
+  owner_job=$(write_lock_metadata_value "$metadata" job_id)
+  started_at=$(write_lock_metadata_value "$metadata" started_at)
+  started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
+  digest_before=$(write_lock_metadata_value "$metadata" digest_before)
+  digest_before=${digest_before:-unavailable}
+  next_metadata="${MAESTRO_LOCK_DIR}/metadata.new"
+  if printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\nquiescence=unconfirmed\nunconfirmed_job=%s\nunconfirmed_reason=%s\n' \
+    "$recorded_token" "$owner_pid" "$owner_start" "$owner_job" "$started_at" \
+    "$started_epoch" "$digest_before" "$job" "$reason" > "$next_metadata"; then
+    return 0
+  else
+    rm -f "$next_metadata" 2>/dev/null || :
+    return 3
+  fi
+}
+
 write_lock_release() {
-  local metadata recorded_token owner_job writers writers_rc
+  local metadata recorded_token owner_job writers writers_rc quiescence
+  local unconfirmed_job unconfirmed_reason poison_metadata
   local digest_before digest_after log_path released_at
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || return 0
   metadata="${MAESTRO_LOCK_DIR:-}/metadata"
@@ -505,6 +577,23 @@ write_lock_release() {
   [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || return 0
   owner_job=$(write_lock_metadata_value "$metadata" job_id)
   owner_job=${owner_job:-unknown}
+  poison_metadata="$metadata"
+  quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
+  if [ "$quiescence" != "unconfirmed" ] &&
+    [ -e "$MAESTRO_LOCK_DIR/metadata.new" ]; then
+    poison_metadata="$MAESTRO_LOCK_DIR/metadata.new"
+    quiescence=unconfirmed
+  fi
+  if [ "$quiescence" = "unconfirmed" ]; then
+    unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
+    unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
+    progress "MAESTRO_LOCK: write lease retained because quiescence was never confirmed (job=${unconfirmed_job:-$owner_job} reason=${unconfirmed_reason:-unknown}, lock: $MAESTRO_LOCK_DIR)"
+    return 0
+  fi
+  if [ "${MAESTRO_LOCK_RETAIN:-0}" -eq 1 ]; then
+    progress "MAESTRO_LOCK: write lease retained because cancellation poison could not be persisted (job=$owner_job, lock: $MAESTRO_LOCK_DIR)"
+    return 0
+  fi
 
   writers=$(write_lock_workspace_writers)
   writers_rc=$?
@@ -526,6 +615,20 @@ write_lock_release() {
   digest_before=${digest_before:-unavailable}
   digest_after=$(repo_digest 2>/dev/null) || digest_after=unavailable
   released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  # The inherited watchdog can poison while this process checks job liveness.
+  poison_metadata="$metadata"
+  quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
+  if [ "$quiescence" != "unconfirmed" ] &&
+    [ -e "$MAESTRO_LOCK_DIR/metadata.new" ]; then
+    poison_metadata="$MAESTRO_LOCK_DIR/metadata.new"
+    quiescence=unconfirmed
+  fi
+  if [ "$quiescence" = "unconfirmed" ]; then
+    unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
+    unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
+    progress "MAESTRO_LOCK: write lease retained because quiescence was never confirmed (job=${unconfirmed_job:-$owner_job} reason=${unconfirmed_reason:-unknown}, lock: $MAESTRO_LOCK_DIR)"
+    return 0
+  fi
   rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null || return 0
   rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
   if log_path=$(provenance_log_path 2>/dev/null); then
@@ -694,13 +797,57 @@ companion_verify_pin() {
   return 4
 }
 
+companion_cancel_job() { # C JOB REASON → 124 read-only, 125 write-mode
+  local C="$1" JOB="$2" REASON="$3" ST pid log write_mode=0
+  ST=$(node "$C" status "$JOB" --json 2>/dev/null) || ST=""
+  pid=$(printf '%s\n' "$ST" |
+    grep -oE '"pid"[[:space:]]*:[[:space:]]*(null|[0-9]+)' |
+    head -1 |
+    sed -E 's/^"pid"[[:space:]]*:[[:space:]]*//')
+  log=$(printf '%s' "$ST" |
+    sed -n 's/.*"logFile"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+    head -1)
+  [ "$pid" = "null" ] && pid=""
+  MAESTRO_CANCEL_REASON="$REASON"
+  MAESTRO_CANCEL_REQUESTED=0
+  if write_lock_is_owner; then
+    write_mode=1
+    MAESTRO_LOCK_RETAIN=1
+    if ! write_lock_poison "$JOB" "$REASON"; then
+      progress "MAESTRO_LOCK: could not stage cancellation poison for job=$JOB reason=$REASON; the job was not cancelled and may still be running (log: ${log:-unknown}, lock: ${MAESTRO_LOCK_DIR:-unknown}). Recover only after no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
+      return 125
+    fi
+  fi
+  node "$C" cancel "$JOB" >/dev/null 2>&1
+  MAESTRO_CANCEL_REQUESTED=1
+  progress "MAESTRO_POLL: cancelled reason=$REASON job=$JOB pid=${pid:-unknown} log=${log:-unknown}"
+  if [ "$write_mode" -eq 1 ]; then
+    if ! mv -f "$MAESTRO_LOCK_DIR/metadata.new" "$MAESTRO_LOCK_DIR/metadata"; then
+      progress "MAESTRO_LOCK: poison metadata rename failed; retaining $MAESTRO_LOCK_DIR/metadata.new as the fail-closed marker"
+    fi
+    return 125
+  fi
+  return 124
+}
+
 companion_poll() {
   local C="$1" JOB="$2" MAX_IDLE="$3" POLL="$4"
-  local LOG="" last_size=-1 idle=0 sfails=0
+  local LOG="" last_size=-1 idle=0 sfails=0 MAX_TOTAL invalid=0 poll_started total
   local last_phase="__MAESTRO_UNSET__" last_preview="" quiet=0 keepalive_size=0
   local ST state size phase elapsed preview preview_emit preview_json emitted line growth
+  MAX_TOTAL="${MAESTRO_MAX_DISPATCH_SEC-1200}"
+  case "$MAX_TOTAL" in
+    ''|*[!0-9]*) invalid=1 ;;
+    *) [ "$MAX_TOTAL" -ge 1 ] 2>/dev/null || invalid=1 ;;
+  esac
+  if [ "$invalid" -eq 1 ]; then
+    progress "MAESTRO_POLL: ignoring invalid MAESTRO_MAX_DISPATCH_SEC=$MAX_TOTAL; using 1200s"
+    MAX_TOTAL=1200
+  fi
+  poll_started=$(date +%s)
   while :; do
     sleep "$POLL"
+    total=$(( $(date +%s) - poll_started ))
     ST=$(node "$C" status "$JOB" --json 2>/dev/null)
     if [ -z "$ST" ]; then
       sfails=$((sfails + 1))
@@ -799,10 +946,13 @@ companion_poll() {
       idle=$((idle + POLL))
     fi
 
+    if [ "$total" -ge "$MAX_TOTAL" ]; then
+      companion_cancel_job "$C" "$JOB" deadline
+      return $?
+    fi
     if [ "$idle" -ge "$MAX_IDLE" ]; then
-      node "$C" cancel "$JOB" >/dev/null 2>&1
-      printf 'job %s stalled for %ss (no log growth); cancelled' "$JOB" "$MAX_IDLE" >&2
-      return 124
+      companion_cancel_job "$C" "$JOB" idle
+      return $?
     fi
   done
 }
