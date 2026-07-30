@@ -5,6 +5,7 @@ LIB="$ROOT/hooks/lib-companion.sh"
 bash -n "$LIB" || { echo "VERIFY FAIL: syntax"; exit 1; }
 
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+export MAESTRO_LOCK_WAIT_SEC=0
 git init -q "$D/repo" && (cd "$D/repo" && git commit -q --allow-empty -m init && git worktree add -q ../wt -b probe) 2>/dev/null
 A=$(cd "$D/repo" && bash -c "set -uo pipefail; . '$LIB'; write_lock_path")
 B=$(cd "$D/wt"   && bash -c "set -uo pipefail; . '$LIB'; write_lock_path")

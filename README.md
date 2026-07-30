@@ -77,6 +77,8 @@ The loop never ends in prose. Every run finishes on a machine-readable state:
 | `11` | **BLOCKED** | Missing access, a destructive step, lease contention, or an unconfirmed cancelled writer | Surface it; never improvise around it |
 | `12` | **STUCK** | Hit the iteration cap without verification | Read the attempts log, re-plan — don't just raise the cap |
 
+Write contention waits without arrival ordering only while the current lease has a confirmed release path. `MAESTRO_LOCK_WAIT_SEC` caps the wait (default 300 seconds; `0` disables it), and `MAESTRO_LOCK_WAIT_POLL_SEC` controls polling (default 5 seconds, minimum 1); invalid values disable waiting.
+
 Every dispatch has an absolute deadline (`MAESTRO_MAX_DISPATCH_SEC`, default 1200 seconds), while the local verifier has its own process-group deadline (`MAESTRO_VERIFY_TIMEOUT_SEC`, default 900 seconds). Cancellation occurs within one poll interval after the dispatch deadline, not exactly at it. Cancelling a write job cannot prove its brokered turn stopped, so Maestro retains and poisons the lease, ends the loop as `BLOCKED`, and does not re-dispatch. Once no Codex job is writing, recover with `bash hooks/implementer-loop.sh --clear-lease` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`). Read-only discussions hold no write lease and are never poisoned.
 
 On every SessionStart source, the hook appends a validated `MAESTRO_SESSION_ID` export to `$CLAUDE_ENV_FILE`. The value is attribution only: the token, PID/process-start identity, and companion job liveness remain the ownership checks. A missing or invalid value is recorded as `unknown`; the session appears in lease metadata, contention/poison messages, and provenance records.
