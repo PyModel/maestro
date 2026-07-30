@@ -81,6 +81,24 @@ Codex shares none of your conversation context. Every dispatch carries five part
 
 A plan you can't finish writing means the decision isn't formed yet — form it, or ask the user the open question *before* dispatching. A vague plan gets you a confident wrong implementation, applied to disk.
 
+### Designing the Verification section
+
+Every dispatch is killed at `MAESTRO_MAX_DISPATCH_SEC` (default 1200s), and a write-mode kill retains and poisons the lease — so an over-budget verification list does not merely fail, it wedges the repository and costs a recovery round. This has now cost two rounds on two different delicate changes, both times because verification cost was never connected to the deadline that kills it.
+
+**Name only fast leaf checks. The loop's `--verify` owns the comprehensive suite.** It runs *after* the dispatch, locally, on your side of the deadline — so a full suite listed in-dispatch is paid for twice, and the second payment is the one that cancels.
+
+**Banning a slow suite by name does not ban it.** Suites call suites, and a ban on the wrapper leaves every caller reachable. Measured in this repo: `run.sh:27` runs `detection.sh`, and `detection.sh:90` runs `lease.sh`. A plan that forbade `run.sh` was satisfied, to the letter, by a dispatch that spent nineteen minutes in `detection.sh` — which is the same work by another name. Before writing the Verification section, expand the call graph of every gate you name or forbid, and budget its **cold transitive** cost, not the leaf's.
+
+Do not attempt to fix this with a token budget or a timing table in the plan. Timings drift, and awareness was never the missing ingredient — the implementer knew the suite was slow and ran it anyway, for defensible reasons, because nothing said *only*. The categorical scope cap belongs in the implementer contract, not in each plan.
+
+Three more recurring costs, from the implementer's side of the boundary:
+
+- **Label each gate's venue.** Say whether a check runs in a sandbox-safe repository copy or needs something orchestrator-owned — `/bin/ps`, Docker, a listener, a live install, or a proof against the *installed* copy rather than the repo file. An unlabelled gate gets attempted in the wrong venue and returns `NEEDS_ANSWERS`.
+- **State the expected RED explicitly.** Give the exit code and the output that means "correctly failing" for any test-first step, or a passing-by-accident run reads as success.
+- **Grant every test and fixture path the verification touches.** A file-scope contract that omits the fixture the named test loads is correctly refused, and that refusal costs a round. (See also `[[plan-scope-grants-prevent-stuck]]`.)
+
+**Codex has no DNS.** Its sandbox cannot reach the network, and its built-in web search is disabled. You have network, so every external fact — library versions, API shapes, current docs — is researched by you *before* dispatching and embedded in the plan. Its configured MCP tools remain available for version-sensitive lookups, capped and stall-prone; a plan that needs no lookups cannot stall on one.
+
 ## The result protocol
 
 Every background run ends with `MAESTRO_FINAL: <SCOPE> <STATE> rc=<n>`. Parse the **last matching** line anchored at `^MAESTRO_FINAL:` from the background task's output file — not the last physical line — and treat that state as authoritative alongside the exit code.

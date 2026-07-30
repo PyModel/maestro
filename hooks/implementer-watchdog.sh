@@ -113,7 +113,13 @@ CONTRACT='
     - Next: <the immediate next step for each possible answer>
   Write it for a fresh implementer with no memory of this run, because that is who reads it.
 - Run the plan'"'"'s verification commands yourself and paste their ACTUAL output and exit
-  codes. A claim without output is not verification.
+  codes. Run only the commands the plan'"'"'s Verification section names. Do not run additional
+  wrapper, regression, or full suites, even when one seems prudent, and even when a suite you
+  already ran turned red; fix the cause and re-run the named command. The caller'"'"'s --verify owns
+  comprehensive verification and runs it after this dispatch, so a full suite here spends a
+  deadline that is not yours to spend and gets the run cancelled. If a named command is not
+  sufficient to prove the work, say so in the report and use the QUESTIONS channel; do not
+  substitute a broader suite on your own initiative. A claim without output is not verification.
 - End every run with exactly ONE result line, then the evidence:
     RESULT: DONE            — plan fully executed, verification output pasted below
     RESULT: NEEDS_ANSWERS   — followed by a QUESTIONS: block (numbered)
