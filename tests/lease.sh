@@ -9,6 +9,8 @@ FAKE="$ROOT/tests/fixtures/fake-companion.mjs"
 TEST_ROOT=$(mktemp -d /tmp/maestro-planf-green.XXXXXXXX)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
+export MAESTRO_LOCK_WAIT_SEC=0
+
 PASS=0; FAIL=0
 ok()   { printf 'PASS  %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf 'FAIL  %s — %s\n' "$1" "$2"; FAIL=$((FAIL+1)); }
@@ -19,6 +21,14 @@ without_ps_path() {  # dir
   local bin="$1/no-ps"
   mkdir -p "$bin"
   printf '#!/bin/sh\nexit 1\n' > "$bin/ps"
+  chmod +x "$bin/ps"
+  printf '%s:%s' "$bin" "$PATH"
+}
+
+confirmed_ps_path() {  # dir
+  local bin="$1/confirmed-ps"
+  mkdir -p "$bin"
+  printf '#!/bin/sh\nprintf "Mon Jan  1 00:00:00 2026\\n"\n' > "$bin/ps"
   chmod +x "$bin/ps"
   printf '%s:%s' "$bin" "$PATH"
 }
@@ -310,8 +320,188 @@ t17() (
   return 0
 )
 
+# ---------------------------------------------------------------- step 18
+# A live owner with confirmed process identity waits until the bounded cap.
+t18() (
+  local dir out rc started elapsed; dir=$(ws wait_live_confirmed)
+  cd "$dir"; . "$LIB"; progress_init
+  export MAESTRO_SESSION_ID=session-wait_live
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  write_lock_acquire task-wait-live-aaaaaa >/dev/null 2>&1 || return 1
+  unset MAESTRO_LOCK_TOKEN
+  export MAESTRO_LOCK_WAIT_SEC=2 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  started=$(date +%s)
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ "$elapsed" -ge 2 ] || { echo "elapsed=${elapsed}s want at least 2s"; return 1; }
+  printf '%s\n' "$out" |
+    grep -q 'waiting for the write lease held by job=task-wait-live-aaaaaa session=session-wait_live' ||
+    { echo "wait attribution missing: $out"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 19
+# A zero cap preserves immediate contention and emits no waiting progress.
+t19() (
+  local dir out rc started elapsed; dir=$(ws wait_disabled)
+  cd "$dir"; . "$LIB"; progress_init
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  write_lock_acquire task-wait-off-aaaaaa >/dev/null 2>&1 || return 1
+  unset MAESTRO_LOCK_TOKEN
+  export MAESTRO_LOCK_WAIT_SEC=0 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  started=$(date +%s)
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  # date +%s is whole seconds, so a boundary crossing inflates any measurement by 1.
+  # -le 1 absorbs that artifact; the "no waiting" invariant is proven exactly by the
+  # absence of a wait message below, since every tick prints before it sleeps.
+  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want under 1s"; return 1; }
+  if printf '%s\n' "$out" | grep -q 'waiting for the write lease'; then
+    echo "zero cap waited: $out"
+    return 1
+  fi
+  return 0
+)
+
+# ---------------------------------------------------------------- step 20
+# A live owner with unconfirmed process identity is never queueable.
+t20() (
+  local dir owner_pid out rc started elapsed; dir=$(ws wait_identity_unconfirmed)
+  sleep 30 & owner_pid=$!
+  trap 'kill "$owner_pid" 2>/dev/null || :; wait "$owner_pid" 2>/dev/null || :' EXIT
+  mkdir -p "$dir/.maestro-write.lock"
+  printf 'token=old\npid=%s\nprocess_start=unavailable\njob_id=task-unconfirmed-aaaaaa\nsession_id=session-unconfirmed\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
+    "$owner_pid" "$(date +%s)" > "$dir/.maestro-write.lock/metadata"
+  cd "$dir"; . "$LIB"; progress_init
+  export MAESTRO_LOCK_WAIT_SEC=2 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  started=$(date +%s)
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want under 1s"; return 1; }
+  if printf '%s\n' "$out" | grep -q 'waiting for the write lease'; then
+    echo "identity-unconfirmed owner waited: $out"
+    return 1
+  fi
+  return 0
+)
+
+# ---------------------------------------------------------------- step 21
+# Poison is human-clearable state, so it must remain an immediate block.
+t21() (
+  local dir out rc started elapsed; dir=$(ws wait_poisoned)
+  cd "$dir"; . "$LIB"; progress_init
+  write_lock_acquire task-poisoned-aaaaaa >/dev/null 2>&1 || return 1
+  write_lock_poison task-poisoned-aaaaaa timeout >/dev/null 2>&1 || return 1
+  unset MAESTRO_LOCK_TOKEN
+  export MAESTRO_LOCK_WAIT_SEC=2 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  started=$(date +%s)
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want under 1s"; return 1; }
+  if printf '%s\n' "$out" | grep -q 'waiting for the write lease'; then
+    echo "poisoned lease waited: $out"
+    return 1
+  fi
+  printf '%s\n' "$out" | grep -q -- '--clear-lease' ||
+    { echo "clear-lease recovery missing: $out"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 22
+# Undeterminable companion liveness is fail-closed, never queueable.
+t22() (
+  local dir out rc started elapsed; dir=$(ws wait_liveness_unknown)
+  dead_lock "$dir" task-status-fails-aaaaaa
+  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  unset MAESTRO_TEST_STATUS
+  export MAESTRO_LOCK_WAIT_SEC=2 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  started=$(date +%s)
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want under 1s"; return 1; }
+  if printf '%s\n' "$out" | grep -q 'waiting for the write lease'; then
+    echo "unknown liveness waited: $out"
+    return 1
+  fi
+  return 0
+)
+
+# ---------------------------------------------------------------- step 23
+# Reclassification sees poison staged while a caller is already waiting.
+t23() (
+  local dir out rc owner_token poison_pid poison_rc started elapsed; dir=$(ws wait_poison_preempts)
+  cd "$dir"; . "$LIB"; progress_init
+  export MAESTRO_SESSION_ID=session-poison_preempts
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  write_lock_acquire task-poison-preempts-aaaaaa >/dev/null 2>&1 || return 1
+  owner_token=$MAESTRO_LOCK_TOKEN
+  unset MAESTRO_LOCK_TOKEN
+  export MAESTRO_LOCK_WAIT_SEC=10 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  (
+    MAESTRO_LOCK_TOKEN="$owner_token"
+    MAESTRO_LOCK_ACQUIRED=1
+    sleep 2
+    write_lock_poison task-poison-preempts-aaaaaa timeout
+  ) &
+  poison_pid=$!
+  started=$(date +%s)
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  wait "$poison_pid"; poison_rc=$?
+  [ "$poison_rc" -eq 0 ] || { echo "poison staging rc=$poison_rc"; return 1; }
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ "$elapsed" -lt 5 ] || { echo "elapsed=${elapsed}s poison did not preempt wait"; return 1; }
+  printf '%s\n' "$out" | grep -q 'waiting for the write lease' ||
+    { echo "no wait occurred before poison: $out"; return 1; }
+  printf '%s\n' "$out" | tail -1 | grep -q 'quiescence is unconfirmed.*--clear-lease' ||
+    { echo "final poison recovery message missing: $out"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 24
+# An invalid cap warns and fails fast instead of falling back to five minutes.
+t24() (
+  local dir out rc started elapsed; dir=$(ws wait_invalid_cap)
+  cd "$dir"; . "$LIB"; progress_init
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  write_lock_acquire task-invalid-cap-aaaaaa >/dev/null 2>&1 || return 1
+  unset MAESTRO_LOCK_TOKEN
+  export MAESTRO_LOCK_WAIT_SEC=abc MAESTRO_LOCK_WAIT_POLL_SEC=1
+  started=$(date +%s)
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want under 1s"; return 1; }
+  printf '%s\n' "$out" | grep -q 'invalid MAESTRO_LOCK_WAIT_SEC=abc' ||
+    { echo "invalid cap warning missing: $out"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 25
+# Waiting does not reset the two-attempt stale-break budget.
+t25() (
+  local dir out rc breaks; dir=$(ws wait_stale_budget)
+  status_empty > "$dir/status.json"
+  dead_lock "$dir" task-stale-budget-aaaaaa
+  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  export MAESTRO_TEST_STATUS="$dir/status.json"
+  export MAESTRO_LOCK_WAIT_SEC=2 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  out=$(write_lock_acquire task-new-after-stale-aaaaaa 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || { echo "rc=$rc want 0"; return 1; }
+  breaks=$(printf '%s\n' "$out" | grep -c 'broke stale write lock')
+  [ "$breaks" -ge 1 ] || { echo "stale lock was not broken: $out"; return 1; }
+  [ "$breaks" -le 2 ] || { echo "stale lock broke $breaks times: $out"; return 1; }
+  return 0
+)
+
 printf '=== Plan F green-phase verification ===\n'
-for t in t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t16 t17; do
+for t in t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t16 t17 \
+  t18 t19 t20 t21 t22 t23 t24 t25; do
   msg=$($t 2>&1) && ok "$t" || bad "$t" "${msg:-no detail}"
 done
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

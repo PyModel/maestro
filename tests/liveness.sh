@@ -74,6 +74,7 @@ printf 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\n' > "$TEST_HOME/
 printf 'high\n' > "$TEST_HOME/.codex/maestro-impl-effort"
 printf 'Objective: exercise liveness.\n' > "$TEST_ROOT/plan.md"
 TEST_PATH="$SHIM:$PATH"
+export MAESTRO_LOCK_WAIT_SEC=0
 
 t1_deadline_growing_log() {
   local repo state pid started elapsed

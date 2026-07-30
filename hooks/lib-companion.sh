@@ -225,6 +225,38 @@ write_lock_session_id() {   # prints a validated session id, or unknown
   esac
 }
 
+# Bounded, unordered wait for a queueable lease. Returns 0 when the caller should
+# re-classify and retry, 1 when it should stop waiting and block.
+# ponytail: no ticket files, so no arrival order and nothing to reap — the cap
+# bounds starvation. Add FIFO only if starvation is actually reproduced.
+write_lock_wait_tick() {   # deadline job session lock_dir
+  local deadline="$1" job="$2" session="$3" lock_dir="$4" now
+  [ "$deadline" -gt 0 ] 2>/dev/null || return 1
+  now=$(date +%s)
+  [ "$now" -lt "$deadline" ] || return 1
+  progress "MAESTRO_LOCK: waiting for the write lease held by job=$job session=$session — $((deadline - now))s left before blocking (lock: $lock_dir); arrival order is not guaranteed"
+  sleep "$MAESTRO_LOCK_WAIT_POLL_SEC"
+  return 0
+}
+
+write_lock_poison_gate() {   # lock_dir metadata → 11 when poisoned (after printing), else 0
+  local lock_dir="$1" metadata="$2"
+  local poison_metadata quiescence unconfirmed_job unconfirmed_reason owner_session
+  poison_metadata="$metadata"
+  quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
+  if [ "$quiescence" != "unconfirmed" ] && [ -e "$lock_dir/metadata.new" ]; then
+    poison_metadata="$lock_dir/metadata.new"
+    quiescence=unconfirmed
+  fi
+  [ "$quiescence" = "unconfirmed" ] || return 0
+  unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
+  unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
+  owner_session=$(write_lock_metadata_value "$poison_metadata" session_id)
+  owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
+  progress "MAESTRO_LOCK: write dispatch blocked; quiescence is unconfirmed for job=${unconfirmed_job:-unknown} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown} (lock: $lock_dir). Clear it once no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
+  return 11
+}
+
 write_lock_is_owner() {
   local metadata recorded_token
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || {
@@ -339,28 +371,43 @@ write_lock_workspace_writers() {
 write_lock_acquire() {
   local requested_job="${1:-unknown}" metadata recorded_token owner_pid owner_start
   local owner_job started_epoch current_start held now attempt token process_start owner_alive
-  local identity_note quiescence unconfirmed_job unconfirmed_reason poison_metadata owner_session
+  local identity_note owner_session
   local writers writers_rc digest_before log_path last prior_job prior_after observed_at
   local stale_digest_before stale_digest_after stale_released_at session_id
+  local wait_cap wait_poll wait_deadline initializing_grace
   MAESTRO_LOCK_ACQUIRED=0
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
   metadata="$MAESTRO_LOCK_DIR/metadata"
 
-  poison_metadata="$metadata"
-  quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
-  if [ "$quiescence" != "unconfirmed" ] &&
-    [ -e "$MAESTRO_LOCK_DIR/metadata.new" ]; then
-    poison_metadata="$MAESTRO_LOCK_DIR/metadata.new"
-    quiescence=unconfirmed
-  fi
-  if [ "$quiescence" = "unconfirmed" ]; then
-    unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
-    unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-    owner_session=$(write_lock_metadata_value "$poison_metadata" session_id)
-    owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
-    progress "MAESTRO_LOCK: write dispatch blocked; quiescence is unconfirmed for job=${unconfirmed_job:-unknown} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown} (lock: $MAESTRO_LOCK_DIR). Clear it once no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
-    return 11
-  fi
+  wait_cap=${MAESTRO_LOCK_WAIT_SEC:-300}
+  wait_poll=${MAESTRO_LOCK_WAIT_POLL_SEC:-5}
+  # A typo must fail fast: a 300-second fallback would turn bad input into a five-minute stall.
+  case "$wait_cap" in
+    *[!0-9]*)
+      progress "MAESTRO_LOCK: invalid MAESTRO_LOCK_WAIT_SEC=$wait_cap; waiting disabled"
+      wait_cap=0
+      ;;
+    *) wait_cap=$((10#$wait_cap)) ;;
+  esac
+  case "$wait_poll" in
+    *[!0-9]*)
+      progress "MAESTRO_LOCK: invalid MAESTRO_LOCK_WAIT_POLL_SEC=$wait_poll; waiting disabled"
+      wait_cap=0
+      wait_poll=1
+      ;;
+    *)
+      if [ "$wait_poll" -lt 1 ]; then
+        progress "MAESTRO_LOCK: invalid MAESTRO_LOCK_WAIT_POLL_SEC=$wait_poll; waiting disabled"
+        wait_cap=0
+        wait_poll=1
+      else
+        wait_poll=$((10#$wait_poll))
+      fi
+      ;;
+  esac
+  MAESTRO_LOCK_WAIT_POLL_SEC=$wait_poll
+
+  write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata" || return 11
 
   if [ -n "${MAESTRO_LOCK_TOKEN:-}" ] && [ -f "$metadata" ]; then
     recorded_token=$(write_lock_metadata_value "$metadata" token)
@@ -370,8 +417,11 @@ write_lock_acquire() {
     fi
   fi
 
+  initializing_grace=0
+  if [ "$wait_cap" -gt 0 ]; then wait_deadline=$(( $(date +%s) + wait_cap )); else wait_deadline=0; fi
   attempt=0
   while [ "$attempt" -lt 2 ]; do
+    write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata" || return 11
     if mkdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
       token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
       process_start=$(ps -o lstart= -p "$$" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
@@ -421,6 +471,11 @@ write_lock_acquire() {
     fi
 
     if [ ! -f "$metadata" ]; then
+      if [ "$wait_cap" -gt 0 ] && [ "$initializing_grace" -lt 3 ]; then
+        initializing_grace=$((initializing_grace + 1))
+        sleep 1
+        continue
+      fi
       progress "MAESTRO_LOCK: write dispatch blocked by an initializing owner (job=unknown session=unknown pid=unknown held=unknown, lock: $MAESTRO_LOCK_DIR)"
       return 11
     fi
@@ -457,6 +512,11 @@ write_lock_acquire() {
           held="${held}s"
           ;;
       esac
+      if [ -z "$identity_note" ]; then
+        if write_lock_wait_tick "$wait_deadline" "$owner_job" "${owner_session:-unknown}" "$MAESTRO_LOCK_DIR"; then
+          continue
+        fi
+      fi
       progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)${identity_note}"
       return 11
     fi
@@ -470,31 +530,23 @@ write_lock_acquire() {
 
     if [ "$owner_job" != "unknown" ]; then
       if printf '%s\n' "$writers" | awk -v job="$owner_job" '$1 == job { found = 1 } END { exit !found }'; then
+        if write_lock_wait_tick "$wait_deadline" "$owner_job" "${owner_session:-unknown}" "$MAESTRO_LOCK_DIR"; then
+          continue
+        fi
         progress "MAESTRO_LOCK: write dispatch blocked; lease retained because orphaned job=$owner_job session=${owner_session:-unknown} is still running (lock: $MAESTRO_LOCK_DIR)"
         return 11
       fi
     elif printf '%s\n' "$writers" | awk '$2 == "true" { found = 1 } END { exit !found }'; then
+      if write_lock_wait_tick "$wait_deadline" "$owner_job" "${owner_session:-unknown}" "$MAESTRO_LOCK_DIR"; then
+        continue
+      fi
       progress "MAESTRO_LOCK: write dispatch blocked; lease retained because an unidentified write-capable job is still running (session=${owner_session:-unknown}, lock: $MAESTRO_LOCK_DIR)"
       return 11
     fi
 
     # Cancellation stages poison before the job disappears from the writers list.
     # Recheck after liveness so that transition cannot be erased as stale.
-    poison_metadata="$metadata"
-    quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
-    if [ "$quiescence" != "unconfirmed" ] &&
-      [ -e "$MAESTRO_LOCK_DIR/metadata.new" ]; then
-      poison_metadata="$MAESTRO_LOCK_DIR/metadata.new"
-      quiescence=unconfirmed
-    fi
-    if [ "$quiescence" = "unconfirmed" ]; then
-      unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
-      unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-      owner_session=$(write_lock_metadata_value "$poison_metadata" session_id)
-      owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
-      progress "MAESTRO_LOCK: write dispatch blocked; quiescence is unconfirmed for job=${unconfirmed_job:-unknown} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown} (lock: $MAESTRO_LOCK_DIR). Clear it once no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
-      return 11
-    fi
+    write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata" || return 11
 
     if rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null &&
       rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
