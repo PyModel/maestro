@@ -46,7 +46,7 @@ dead_lock() {  # dir job_id
 # Live dispatcher must block WITHOUT querying the companion.
 t2() (
   local dir log rc; dir=$(ws live); log="$dir/calls.log"; : > "$log"
-  cd "$dir"
+  cd "$dir" || exit 1
   . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_CALL_LOG="$log" MAESTRO_TEST_STATUS="$dir/none.json"
   write_lock_acquire task-live0000-aaaaaa >/dev/null   # this shell owns it, pid alive
@@ -63,7 +63,7 @@ t3() (
   local dir rc; dir=$(ws known_running)
   status_running_job task-fake0000-aaaaaa true > "$dir/status.json"
   dead_lock "$dir" task-fake0000-aaaaaa
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   local out; out=$(write_lock_acquire 2>&1 >/dev/null); rc=$?
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
@@ -76,7 +76,7 @@ t4() (
   local dir rc; dir=$(ws known_absent)
   status_empty > "$dir/status.json"
   dead_lock "$dir" task-fake0000-aaaaaa
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   write_lock_acquire task-new00000-cccccc >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 0 ] || { echo "rc=$rc want 0"; return 1; }
@@ -89,7 +89,7 @@ t5() (
   local dir rc; dir=$(ws unknown_writer)
   status_running_job task-other0000-bbbbbb true > "$dir/status.json"
   dead_lock "$dir" unknown
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   write_lock_acquire >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
@@ -103,7 +103,7 @@ t5b() (
   local dir rc; dir=$(ws unknown_reader)
   status_running_job task-other0000-bbbbbb false > "$dir/status.json"
   dead_lock "$dir" unknown
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   write_lock_acquire >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 0 ] || { echo "rc=$rc want 0 (read-only job must not hold a write lease)"; return 1; }
@@ -115,7 +115,7 @@ t6() (
   local dir rc; dir=$(ws unknown_empty)
   status_empty > "$dir/status.json"
   dead_lock "$dir" unknown
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   write_lock_acquire >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 0 ] || { echo "rc=$rc want 0"; return 1; }
@@ -127,7 +127,7 @@ t7() (
   local dir rc; dir=$(ws broken)
   printf 'BROKEN\n' > "$dir/status.json"
   dead_lock "$dir" task-fake0000-aaaaaa
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   write_lock_acquire >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
@@ -140,7 +140,7 @@ t7() (
 t7b() (
   local dir rc; dir=$(ws unreachable)
   dead_lock "$dir" task-fake0000-aaaaaa
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   unset MAESTRO_TEST_STATUS   # stub exits 1 with no status file
   write_lock_acquire >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
@@ -152,7 +152,7 @@ t7b() (
 t8() (
   local dir; dir=$(ws release_live)
   status_running_job task-fake0000-aaaaaa true > "$dir/status.json"
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   write_lock_acquire task-fake0000-aaaaaa >/dev/null 2>&1
   write_lock_release >/dev/null 2>&1
@@ -164,7 +164,7 @@ t8() (
 t9() (
   local dir; dir=$(ws release_terminal)
   status_empty > "$dir/status.json"
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   write_lock_acquire task-fake0000-aaaaaa >/dev/null 2>&1
   write_lock_release >/dev/null 2>&1
@@ -176,7 +176,7 @@ t9() (
 t9b() (
   local dir; dir=$(ws release_broken)
   printf 'BROKEN\n' > "$dir/status.json"
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   write_lock_acquire task-fake0000-aaaaaa >/dev/null 2>&1
   write_lock_release >/dev/null 2>&1
@@ -199,7 +199,7 @@ kill_dispatcher_case() (  # $1=dir  $2=job_id_recorded  $3=running_job_id
   ' _ "$dir" "$LIB" "$FAKE" "$2" >/dev/null 2>&1
   [ -d "$dir/.maestro-write.lock" ] || { echo "lock vanished when dispatcher was hard-killed"; return 1; }
   # a new dispatcher now contends
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   unset MAESTRO_LOCK_TOKEN
   write_lock_acquire >/dev/null 2>&1; rc=$?
@@ -214,7 +214,7 @@ t10b() { kill_dispatcher_case "$(ws kill_after)" task-fake0000-aaaaaa task-fake0
 # Missing ps must not prevent acquisition; metadata records the recovery gap.
 t11() (
   local dir rc; dir=$(ws no_ps_acquire)
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   PATH=$(without_ps_path "$dir"); export PATH
   write_lock_acquire task-no-ps000-aaaaaa >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 0 ] || { echo "rc=$rc want 0"; return 1; }
@@ -233,7 +233,7 @@ t12() (
   mkdir -p "$dir/.maestro-write.lock"
   printf 'token=old\npid=%s\nprocess_start=unavailable\njob_id=task-live0000-aaaaaa\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\n' \
     "$owner_pid" > "$dir/.maestro-write.lock/metadata"
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   PATH=$(without_ps_path "$dir"); export PATH
   write_lock_acquire task-new00000-cccccc >/dev/null 2>&1; rc=$?
@@ -246,7 +246,7 @@ t12() (
 # A valid session id is recorded and identifies the live owner on contention.
 t13() (
   local dir out rc; dir=$(ws session_valid)
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   export MAESTRO_SESSION_ID=session-valid_13
   write_lock_acquire task-live0000-aaaaaa >/dev/null 2>&1
   grep -qx 'session_id=session-valid_13' "$dir/.maestro-write.lock/metadata" ||
@@ -263,7 +263,7 @@ t13() (
 # Invalid environment input is replaced, never copied into metadata.
 t14() (
   local dir metadata; dir=$(ws session_invalid)
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   export MAESTRO_SESSION_ID='bad id; rm -rf /'
   write_lock_acquire task-invalid0-aaaaaa >/dev/null 2>&1
   metadata="$dir/.maestro-write.lock/metadata"
@@ -280,7 +280,7 @@ t14() (
 # Publishing a job rewrites metadata without losing the recorded session.
 t15() (
   local dir; dir=$(ws session_set_job)
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   export MAESTRO_SESSION_ID=session-set_job
   write_lock_acquire >/dev/null 2>&1
   write_lock_set_job task-published-aaaaaa
@@ -295,7 +295,7 @@ t16() (
   local dir log; dir=$(ws session_dispatch)
   git -C "$dir" init -q
   status_empty > "$dir/status.json"
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_SESSION_ID=session-dispatch
   export MAESTRO_TEST_STATUS="$dir/status.json"
   write_lock_acquire task-session0-aaaaaa >/dev/null 2>&1
@@ -313,7 +313,7 @@ t17() (
   git -C "$dir" init -q
   log="$dir/.git/maestro-provenance.log"
   printf '2026-01-01T00:00:00Z type=dispatch job=legacy-job before=tree-v2:old after=tree-v2:old\n' > "$log"
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   write_lock_acquire task-new00000-cccccc >/dev/null 2>&1
   grep -q ' type=gap prior_job=legacy-job ' "$log" ||
     { echo "legacy provenance was not recognized as a baseline"; return 1; }
@@ -324,7 +324,7 @@ t17() (
 # A live owner with confirmed process identity waits until the bounded cap.
 t18() (
   local dir out rc started elapsed; dir=$(ws wait_live_confirmed)
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   export MAESTRO_SESSION_ID=session-wait_live
   PATH=$(confirmed_ps_path "$dir"); export PATH
   write_lock_acquire task-wait-live-aaaaaa >/dev/null 2>&1 || return 1
@@ -345,7 +345,7 @@ t18() (
 # A zero cap preserves immediate contention and emits no waiting progress.
 t19() (
   local dir out rc started elapsed; dir=$(ws wait_disabled)
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   PATH=$(confirmed_ps_path "$dir"); export PATH
   write_lock_acquire task-wait-off-aaaaaa >/dev/null 2>&1 || return 1
   unset MAESTRO_LOCK_TOKEN
@@ -357,7 +357,7 @@ t19() (
   # date +%s is whole seconds, so a boundary crossing inflates any measurement by 1.
   # -le 1 absorbs that artifact; the "no waiting" invariant is proven exactly by the
   # absence of a wait message below, since every tick prints before it sleeps.
-  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want under 1s"; return 1; }
+  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want at most 1s"; return 1; }
   if printf '%s\n' "$out" | grep -q 'waiting for the write lease'; then
     echo "zero cap waited: $out"
     return 1
@@ -374,13 +374,13 @@ t20() (
   mkdir -p "$dir/.maestro-write.lock"
   printf 'token=old\npid=%s\nprocess_start=unavailable\njob_id=task-unconfirmed-aaaaaa\nsession_id=session-unconfirmed\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
     "$owner_pid" "$(date +%s)" > "$dir/.maestro-write.lock/metadata"
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   export MAESTRO_LOCK_WAIT_SEC=2 MAESTRO_LOCK_WAIT_POLL_SEC=1
   started=$(date +%s)
   out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
   elapsed=$(( $(date +%s) - started ))
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
-  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want under 1s"; return 1; }
+  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want at most 1s"; return 1; }
   if printf '%s\n' "$out" | grep -q 'waiting for the write lease'; then
     echo "identity-unconfirmed owner waited: $out"
     return 1
@@ -392,7 +392,7 @@ t20() (
 # Poison is human-clearable state, so it must remain an immediate block.
 t21() (
   local dir out rc started elapsed; dir=$(ws wait_poisoned)
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   write_lock_acquire task-poisoned-aaaaaa >/dev/null 2>&1 || return 1
   write_lock_poison task-poisoned-aaaaaa timeout >/dev/null 2>&1 || return 1
   unset MAESTRO_LOCK_TOKEN
@@ -401,7 +401,7 @@ t21() (
   out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
   elapsed=$(( $(date +%s) - started ))
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
-  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want under 1s"; return 1; }
+  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want at most 1s"; return 1; }
   if printf '%s\n' "$out" | grep -q 'waiting for the write lease'; then
     echo "poisoned lease waited: $out"
     return 1
@@ -416,14 +416,14 @@ t21() (
 t22() (
   local dir out rc started elapsed; dir=$(ws wait_liveness_unknown)
   dead_lock "$dir" task-status-fails-aaaaaa
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   unset MAESTRO_TEST_STATUS
   export MAESTRO_LOCK_WAIT_SEC=2 MAESTRO_LOCK_WAIT_POLL_SEC=1
   started=$(date +%s)
   out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
   elapsed=$(( $(date +%s) - started ))
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
-  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want under 1s"; return 1; }
+  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want at most 1s"; return 1; }
   if printf '%s\n' "$out" | grep -q 'waiting for the write lease'; then
     echo "unknown liveness waited: $out"
     return 1
@@ -435,7 +435,7 @@ t22() (
 # Reclassification sees poison staged while a caller is already waiting.
 t23() (
   local dir out rc owner_token poison_pid poison_rc started elapsed; dir=$(ws wait_poison_preempts)
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   export MAESTRO_SESSION_ID=session-poison_preempts
   PATH=$(confirmed_ps_path "$dir"); export PATH
   write_lock_acquire task-poison-preempts-aaaaaa >/dev/null 2>&1 || return 1
@@ -467,7 +467,7 @@ t23() (
 # An invalid cap warns and fails fast instead of falling back to five minutes.
 t24() (
   local dir out rc started elapsed; dir=$(ws wait_invalid_cap)
-  cd "$dir"; . "$LIB"; progress_init
+  cd "$dir" || exit 1; . "$LIB"; progress_init
   PATH=$(confirmed_ps_path "$dir"); export PATH
   write_lock_acquire task-invalid-cap-aaaaaa >/dev/null 2>&1 || return 1
   unset MAESTRO_LOCK_TOKEN
@@ -476,7 +476,7 @@ t24() (
   out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
   elapsed=$(( $(date +%s) - started ))
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
-  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want under 1s"; return 1; }
+  [ "$elapsed" -le 1 ] || { echo "elapsed=${elapsed}s want at most 1s"; return 1; }
   printf '%s\n' "$out" | grep -q 'invalid MAESTRO_LOCK_WAIT_SEC=abc' ||
     { echo "invalid cap warning missing: $out"; return 1; }
   return 0
@@ -488,7 +488,7 @@ t25() (
   local dir out rc breaks; dir=$(ws wait_stale_budget)
   status_empty > "$dir/status.json"
   dead_lock "$dir" task-stale-budget-aaaaaa
-  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   export MAESTRO_LOCK_WAIT_SEC=2 MAESTRO_LOCK_WAIT_POLL_SEC=1
   out=$(write_lock_acquire task-new-after-stale-aaaaaa 3>&1 >/dev/null 2>&1); rc=$?
@@ -499,9 +499,92 @@ t25() (
   return 0
 )
 
+# ---------------------------------------------------------------- step 26
+# Malformed metadata is unconfirmed identity, never proof that the owner is dead.
+t26() (
+  local dir lock out rc; dir=$(ws malformed_metadata)
+  lock="$dir/.maestro-write.lock"
+  mkdir -p "$lock"
+  : > "$lock/metadata"
+  status_empty > "$dir/status.json"
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  export MAESTRO_TEST_STATUS="$dir/status.json"
+  out=$(write_lock_acquire task-malformed-aaaaaa 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ -d "$lock" ] && [ ! -s "$lock/metadata" ] ||
+    { echo "malformed owner lock was replaced"; return 1; }
+  printf '%s\n' "$out" | grep -q 'metadata is malformed.*owner cannot be identified.*failing closed' ||
+    { echo "malformed metadata diagnostic missing: $out"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 27
+# Identity is published before the digest runs and remains releasable afterward.
+t27() (
+  local dir metadata identity_before initial_identity current_identity token owner_pid rc
+  dir=$(ws identity_before_digest)
+  status_empty > "$dir/status.json"
+  cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  export MAESTRO_TEST_STATUS="$dir/status.json"
+  metadata="$dir/.maestro-write.lock/metadata"
+  identity_before="$dir/identity-before-digest"
+  repo_digest() {
+    local recorded_token recorded_pid
+    [ -f "$metadata" ] || return 1
+    recorded_token=$(write_lock_metadata_value "$metadata" token)
+    recorded_pid=$(write_lock_metadata_value "$metadata" pid)
+    [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] &&
+      [ -n "${MAESTRO_LOCK_TOKEN:-}" ] &&
+      [ "$recorded_token" = "$MAESTRO_LOCK_TOKEN" ] &&
+      [ "$recorded_pid" = "$$" ] || return 1
+    sed -n '1,7p' "$metadata" > "$identity_before" || return 1
+    printf 'tree-v2:identity-published\n'
+  }
+  write_lock_acquire task-published-first-aaaaaa >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ] || { echo "rc=$rc want 0"; return 1; }
+  [ -f "$metadata" ] || { echo "metadata was not published"; return 1; }
+  token=$(write_lock_metadata_value "$metadata" token)
+  owner_pid=$(write_lock_metadata_value "$metadata" pid)
+  [ -n "$token" ] && [ "$token" = "$MAESTRO_LOCK_TOKEN" ] ||
+    { echo "published token does not identify the owner"; return 1; }
+  initial_identity=$(sed -n '1,7p' "$identity_before")
+  current_identity=$(sed -n '1,7p' "$metadata")
+  [ "$initial_identity" = "$current_identity" ] ||
+    { echo "owner identity changed during digest publication"; return 1; }
+  case "$owner_pid" in
+    ''|*[!0-9]*) echo "published pid is not numeric: $owner_pid"; return 1 ;;
+  esac
+  [ "$owner_pid" = "$$" ] || { echo "pid=$owner_pid want $$"; return 1; }
+  grep -qx 'digest_before=tree-v2:identity-published' "$metadata" ||
+    { echo "digest ran before identity publication"; return 1; }
+  write_lock_release >/dev/null 2>&1
+  [ ! -d "$dir/.maestro-write.lock" ] ||
+    { echo "published owner could not release its lease"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 28
+# Absent metadata remains the distinct initializing-owner state.
+t28() (
+  local dir lock out rc; dir=$(ws absent_metadata)
+  lock="$dir/.maestro-write.lock"
+  mkdir -p "$lock"
+  cd "$dir" || exit 1; . "$LIB"; progress_init
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ -d "$lock" ] || { echo "initializing owner lock was removed"; return 1; }
+  printf '%s\n' "$out" | grep -q 'blocked by an initializing owner' ||
+    { echo "initializing-owner diagnostic missing: $out"; return 1; }
+  if printf '%s\n' "$out" | grep -q 'metadata is malformed'; then
+    echo "absent metadata was reported as malformed: $out"
+    return 1
+  fi
+  return 0
+)
+
 printf '=== Plan F green-phase verification ===\n'
 for t in t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t16 t17 \
-  t18 t19 t20 t21 t22 t23 t24 t25; do
+  t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28; do
   msg=$($t 2>&1) && ok "$t" || bad "$t" "${msg:-no detail}"
 done
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

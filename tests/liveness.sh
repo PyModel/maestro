@@ -435,6 +435,7 @@ t5_poison_blocks_acquire() {
 t6_clear_lease_works_and_refuses() {
   local repo="$TEST_ROOT/deadline-repo" state="$TEST_ROOT/clear-state"
   local refuse_repo metadata pid
+  local wedge_repo wedge_lock healthy_repo healthy_lock healthy_pid
   mkdir -p "$state"
   status_empty > "$state/empty.json"
   set -m
@@ -474,6 +475,53 @@ t6_clear_lease_works_and_refuses() {
     { echo "refusal omitted running writer"; return 1; }
   [ -d "$refuse_repo/.git/maestro-write.lock" ] ||
     { echo "refused lock was removed"; return 1; }
+
+  wedge_repo=$(new_repo clear-wedge-repo)
+  wedge_lock="$wedge_repo/.git/maestro-write.lock"
+  mkdir -p "$wedge_lock"
+  set -m
+  (
+    cd "$wedge_repo" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" MAESTRO_TEST_STATUS="$state/empty.json" \
+        bash "$LOOP" --clear-lease
+  ) > "$state/wedge-output" 2>&1 &
+  pid=$!
+  set +m
+  wait_bounded "$pid" 4
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "wedge clear hung"; return 1; }
+  [ "$WAIT_RC" -eq 0 ] || { echo "wedge clear rc=$WAIT_RC want 0"; return 1; }
+  [ ! -d "$wedge_lock" ] || { echo "metadata-less wedge survived clear"; return 1; }
+  grep -q 'structurally invalid orphan' "$state/wedge-output" &&
+    grep -Fq "$wedge_lock" "$state/wedge-output" ||
+    { echo "wedge clear output omitted what was removed"; return 1; }
+
+  healthy_repo=$(new_repo clear-healthy-repo)
+  healthy_lock="$healthy_repo/.git/maestro-write.lock"
+  healthy_pid=$$
+  mkdir -p "$healthy_lock"
+  printf 'token=healthy-token\npid=%s\nprocess_start=unavailable\njob_id=task-healthy-owner\nsession_id=sess-healthy-owner\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' \
+    "$healthy_pid" > "$healthy_lock/metadata"
+  set -m
+  (
+    cd "$healthy_repo" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" MAESTRO_TEST_STATUS="$state/empty.json" \
+        bash "$LOOP" --clear-lease
+  ) > "$state/healthy-output" 2>&1 &
+  pid=$!
+  set +m
+  wait_bounded "$pid" 4
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "healthy clear hung"; return 1; }
+  [ "$WAIT_RC" -eq 11 ] || { echo "healthy clear rc=$WAIT_RC want 11"; return 1; }
+  [ -d "$healthy_lock" ] || { echo "healthy lock was removed"; return 1; }
+  grep -q 'job=task-healthy-owner' "$state/healthy-output" &&
+    grep -q 'session=sess-healthy-owner' "$state/healthy-output" &&
+    grep -q "pid=$healthy_pid" "$state/healthy-output" &&
+    grep -q 'healthy' "$state/healthy-output" ||
+    { echo "healthy refusal omitted owner details"; return 1; }
+  if grep -q 'CLEARED' "$state/healthy-output"; then
+    echo "healthy refusal claimed CLEARED"
+    return 1
+  fi
 }
 
 t7_read_only_deadline_no_lease() {

@@ -93,23 +93,51 @@ if [ "$CLEAR_LEASE" -eq 1 ]; then
     echo "LOOP_ERROR: could not resolve the write lock path" >&2
     maestro_finish "FAILED" 3
   }
-  metadata="$lock_path/metadata"
-  staged_metadata="$lock_path/metadata.new"
-  poison_metadata="$metadata"
-  quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
-  if [ "$quiescence" != "unconfirmed" ] &&
-    [ -e "$staged_metadata" ]; then
-    poison_metadata="$staged_metadata"
-    quiescence=unconfirmed
-  fi
-  if [ ! -d "$lock_path" ] || [ "$quiescence" != "unconfirmed" ]; then
-    progress "MAESTRO_LOCK: no poisoned write lease to clear at $lock_path session=unknown"
+  if [ ! -d "$lock_path" ]; then
+    progress "MAESTRO_LOCK: there is no write lease to clear at $lock_path"
     maestro_finish "CLEARED" 0
   fi
-  poisoned_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
-  poisoned_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-  poisoned_session=$(write_lock_metadata_value "$poison_metadata" session_id)
-  poisoned_session=$(MAESTRO_SESSION_ID="${poisoned_session:-}" write_lock_session_id)
+
+  metadata="$lock_path/metadata"
+  staged_metadata="$lock_path/metadata.new"
+  orphan=0
+  if [ ! -e "$metadata" ] && [ ! -e "$staged_metadata" ]; then
+    orphan=1
+    poisoned_job=unknown
+    poisoned_reason=missing-metadata
+    poisoned_session=unknown
+  else
+    poison_metadata="$metadata"
+    quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
+    if [ "$quiescence" != "unconfirmed" ] &&
+      [ -e "$staged_metadata" ]; then
+      poison_metadata="$staged_metadata"
+      quiescence=unconfirmed
+    fi
+    if [ "$quiescence" != "unconfirmed" ]; then
+      owner_token=$(write_lock_metadata_value "$metadata" token)
+      owner_job=$(write_lock_metadata_value "$metadata" job_id)
+      owner_job=${owner_job:-unknown}
+      owner_session=$(write_lock_metadata_value "$metadata" session_id)
+      owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
+      owner_pid=$(write_lock_metadata_value "$metadata" pid)
+      malformed=0
+      case "$owner_pid" in
+        ''|*[!0-9]*) malformed=1 ;;
+      esac
+      if [ -z "$owner_token" ] || [ "$malformed" -eq 1 ]; then
+        progress "MAESTRO_LOCK: refusing to clear — write lease metadata is malformed; owner cannot be identified; failing closed (lock: $lock_path)"
+      else
+        progress "MAESTRO_LOCK: refusing to clear — write lease is healthy and not this command's to clear (job=$owner_job session=${owner_session:-unknown} pid=$owner_pid, lock: $lock_path)"
+      fi
+      maestro_finish "BLOCKED" 11
+    fi
+    poisoned_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
+    poisoned_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
+    poisoned_session=$(write_lock_metadata_value "$poison_metadata" session_id)
+    poisoned_session=$(MAESTRO_SESSION_ID="${poisoned_session:-}" write_lock_session_id)
+  fi
+
   writers=$(write_lock_workspace_writers)
   writers_rc=$?
   running_job=""
@@ -121,16 +149,26 @@ if [ "$CLEAR_LEASE" -eq 1 ]; then
     progress "MAESTRO_LOCK: refusing to clear — a write-capable job is still running (${running_job:-unknown}) session=${poisoned_session:-unknown}"
     maestro_finish "BLOCKED" 11
   fi
-  if [ -e "$staged_metadata" ]; then
+
+  if [ "$orphan" -eq 1 ]; then
+    progress "MAESTRO_LOCK: clearing structurally invalid orphan write lease (lock: $lock_path, removing: every entry under $lock_path, then $lock_path)"
+    if ! find "$lock_path" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null ||
+      ! rmdir "$lock_path" 2>/dev/null; then
+      progress "MAESTRO_LOCK: failed to clear structurally invalid orphan write lease at $lock_path"
+      maestro_finish "BLOCKED" 11
+    fi
+  elif [ -e "$staged_metadata" ]; then
     progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path, removing: $staged_metadata)"
   else
     progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path)"
   fi
-  if ! rm -f "$metadata" 2>/dev/null ||
-    ! rm -rf "$staged_metadata" 2>/dev/null ||
-    ! rmdir "$lock_path" 2>/dev/null; then
-    progress "MAESTRO_LOCK: failed to clear poisoned write lease at $lock_path session=${poisoned_session:-unknown}"
-    maestro_finish "BLOCKED" 11
+  if [ "$orphan" -eq 0 ]; then
+    if ! rm -f "$metadata" 2>/dev/null ||
+      ! rm -rf "$staged_metadata" 2>/dev/null ||
+      ! rmdir "$lock_path" 2>/dev/null; then
+      progress "MAESTRO_LOCK: failed to clear poisoned write lease at $lock_path session=${poisoned_session:-unknown}"
+      maestro_finish "BLOCKED" 11
+    fi
   fi
   maestro_finish "CLEARED" 0
 fi

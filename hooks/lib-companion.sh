@@ -171,6 +171,62 @@ repo_digest() {
   printf 'tree-v2:%s\n' "$digest"
 }
 
+repo_digest_bounded() {
+  local timeout invalid scratch output pid elapsed timed_out grace rc result=""
+  timeout=${MAESTRO_DIGEST_TIMEOUT_SEC-120}
+  invalid=0
+  case "$timeout" in
+    ''|*[!0-9]*) invalid=1 ;;
+    *) [ "$timeout" -ge 1 ] 2>/dev/null || invalid=1 ;;
+  esac
+  if [ "$invalid" -eq 1 ]; then
+    progress "MAESTRO_DIGEST: ignoring invalid MAESTRO_DIGEST_TIMEOUT_SEC=$timeout; using 120s"
+    timeout=120
+  fi
+
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/maestro-repo-digest-call.XXXXXX") || return 1
+  output="$scratch/output"
+  set -m
+  (
+    TMPDIR="$scratch"
+    export TMPDIR
+    repo_digest > "$output"
+  ) &
+  pid=$!
+  set +m
+
+  elapsed=0
+  timed_out=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$elapsed" -ge "$timeout" ]; then
+      timed_out=1
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if [ "$timed_out" -eq 1 ]; then
+    kill -TERM -"$pid" 2>/dev/null || :
+    grace=0
+    while kill -0 -"$pid" 2>/dev/null && [ "$grace" -lt 5 ]; do
+      sleep 1
+      grace=$((grace + 1))
+    done
+    kill -KILL -"$pid" 2>/dev/null || :
+  fi
+  wait "$pid" 2>/dev/null
+  rc=$?
+  if [ "$timed_out" -eq 1 ]; then
+    progress "MAESTRO_DIGEST: repository digest timed out after ${timeout}s"
+    rc=1
+  elif [ "$rc" -eq 0 ]; then
+    result=$(cat "$output") || rc=1
+  fi
+  rm -rf "$scratch" || rc=1
+  [ "$rc" -eq 0 ] || return 1
+  printf '%s\n' "$result"
+}
+
 repo_digest_is_observed() {
   case "$1" in
     tree-v2:*) return 0 ;;
@@ -209,6 +265,17 @@ provenance_log_path() {
 write_lock_metadata_value() {
   local metadata="$1" field="$2"
   sed -n "s/^${field}=//p" "$metadata" 2>/dev/null | head -1
+}
+
+write_lock_publish_metadata() {   # lock_dir token record
+  local lock_dir="$1" token="$2" record="$3" metadata temp
+  metadata="$lock_dir/metadata"
+  temp="$lock_dir/metadata.tmp.$token"
+  if printf '%s\n' "$record" > "$temp" && mv -f "$temp" "$metadata"; then
+    return 0
+  fi
+  rm -f "$temp" 2>/dev/null || :
+  return 1
 }
 
 write_lock_session_id() {   # prints a validated session id, or unknown
@@ -371,9 +438,10 @@ write_lock_workspace_writers() {
 write_lock_acquire() {
   local requested_job="${1:-unknown}" metadata recorded_token owner_pid owner_start
   local owner_job started_epoch current_start held now attempt token process_start owner_alive
-  local identity_note owner_session
+  local identity_note owner_session malformed_metadata
   local writers writers_rc digest_before log_path last prior_job prior_after observed_at
-  local stale_digest_before stale_digest_after stale_released_at session_id
+  local stale_digest_before stale_digest_after stale_released_at session_id started_at
+  local metadata_record
   local wait_cap wait_poll wait_deadline initializing_grace
   MAESTRO_LOCK_ACQUIRED=0
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
@@ -431,9 +499,29 @@ write_lock_acquire() {
         process_start=unavailable
         progress "MAESTRO_LOCK: process start identity unavailable for pid=$$; lease recorded without it (stale-owner recovery will fail closed)"
       fi
-      now=$(date +%s)
-      digest_before=$(repo_digest 2>/dev/null) || digest_before=unavailable
       session_id=$(write_lock_session_id)
+      now=$(date +%s)
+      started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+      metadata_record=$(printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=unavailable' \
+        "$token" "$$" "$process_start" "$requested_job" "${session_id:-unknown}" \
+        "$started_at" "$now")
+      if ! write_lock_publish_metadata "$MAESTRO_LOCK_DIR" "$token" "$metadata_record"; then
+        rm -f "$metadata" 2>/dev/null || :
+        rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
+        return 3
+      fi
+      MAESTRO_LOCK_TOKEN="$token"
+      MAESTRO_LOCK_ACQUIRED=1
+      export MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR
+
+      digest_before=$(repo_digest_bounded 2>/dev/null) || digest_before=unavailable
+      metadata_record=$(printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s' \
+        "$token" "$$" "$process_start" "$requested_job" "${session_id:-unknown}" \
+        "$started_at" "$now" "$digest_before")
+      if ! write_lock_publish_metadata "$MAESTRO_LOCK_DIR" "$token" "$metadata_record"; then
+        progress "MAESTRO_LOCK: repository digest could not be recorded; lease retains digest_before=unavailable (lock: $MAESTRO_LOCK_DIR)"
+      fi
+
       if log_path=$(provenance_log_path 2>/dev/null) && [ -f "$log_path" ]; then
         last=$(grep -E '^[^ ]+ type=(dispatch|orphan-adopted) job=[^ ]+( session=[^ ]+)? before=[^ ]+ after=[^ ]+$' \
           "$log_path" 2>/dev/null | tail -1)
@@ -452,16 +540,6 @@ write_lock_acquire() {
           fi
         fi
       fi
-      if ! printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
-        "$token" "$$" "$process_start" "$requested_job" "${session_id:-unknown}" \
-        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$now" "$digest_before" > "$metadata"; then
-        rm -f "$metadata" 2>/dev/null || :
-        rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
-        return 3
-      fi
-      MAESTRO_LOCK_TOKEN="$token"
-      MAESTRO_LOCK_ACQUIRED=1
-      export MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR
       return 0
     fi
 
@@ -480,6 +558,7 @@ write_lock_acquire() {
       return 11
     fi
 
+    recorded_token=$(write_lock_metadata_value "$metadata" token)
     owner_pid=$(write_lock_metadata_value "$metadata" pid)
     owner_start=$(write_lock_metadata_value "$metadata" process_start)
     owner_job=$(write_lock_metadata_value "$metadata" job_id)
@@ -487,6 +566,14 @@ write_lock_acquire() {
     owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
     started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
     stale_digest_before=$(write_lock_metadata_value "$metadata" digest_before)
+    malformed_metadata=0
+    case "$owner_pid" in
+      ''|*[!0-9]*) malformed_metadata=1 ;;
+    esac
+    if [ -z "$recorded_token" ] || [ "$malformed_metadata" -eq 1 ]; then
+      progress "MAESTRO_LOCK: write lease metadata is malformed; owner cannot be identified; failing closed (lock: $MAESTRO_LOCK_DIR)"
+      return 11
+    fi
     owner_job=${owner_job:-unknown}
     stale_digest_before=${stale_digest_before:-unavailable}
     owner_alive=0
@@ -551,7 +638,7 @@ write_lock_acquire() {
     if rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null &&
       rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
       progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown}"
-      stale_digest_after=$(repo_digest 2>/dev/null) || stale_digest_after=unavailable
+      stale_digest_after=$(repo_digest_bounded 2>/dev/null) || stale_digest_after=unavailable
       if repo_digest_is_observed "$stale_digest_before" &&
         repo_digest_is_observed "$stale_digest_after" &&
         [ "$stale_digest_before" != "$stale_digest_after" ]; then
@@ -695,7 +782,7 @@ write_lock_release() {
 
   digest_before=$(write_lock_metadata_value "$metadata" digest_before)
   digest_before=${digest_before:-unavailable}
-  digest_after=$(repo_digest 2>/dev/null) || digest_after=unavailable
+  digest_after=$(repo_digest_bounded 2>/dev/null) || digest_after=unavailable
   released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   # The inherited watchdog can poison while this process checks job liveness.
   poison_metadata="$metadata"
