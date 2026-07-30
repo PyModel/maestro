@@ -435,7 +435,7 @@ t5_poison_blocks_acquire() {
 t6_clear_lease_works_and_refuses() {
   local repo="$TEST_ROOT/deadline-repo" state="$TEST_ROOT/clear-state"
   local refuse_repo metadata pid
-  local wedge_repo wedge_lock healthy_repo healthy_lock healthy_pid
+  local wedge_repo wedge_lock healthy_repo healthy_lock healthy_pid healthy_now
   mkdir -p "$state"
   status_empty > "$state/empty.json"
   set -m
@@ -498,9 +498,10 @@ t6_clear_lease_works_and_refuses() {
   healthy_repo=$(new_repo clear-healthy-repo)
   healthy_lock="$healthy_repo/.git/maestro-write.lock"
   healthy_pid=$$
+  healthy_now=$(date +%s)
   mkdir -p "$healthy_lock"
-  printf 'token=healthy-token\npid=%s\nprocess_start=unavailable\njob_id=task-healthy-owner\nsession_id=sess-healthy-owner\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' \
-    "$healthy_pid" > "$healthy_lock/metadata"
+  printf 'token=healthy-token\npid=%s\nprocess_start=unavailable\njob_id=task-healthy-owner\nsession_id=sess-healthy-owner\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
+    "$healthy_pid" "$healthy_now" > "$healthy_lock/metadata"
   set -m
   (
     cd "$healthy_repo" &&

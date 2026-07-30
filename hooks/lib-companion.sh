@@ -7,6 +7,8 @@
 #   repo_digest                            → prints a repository-wide state digest, or returns non-zero
 #   write_lock_acquire [job]               → returns 0 acquired/inherited | 11 live contention
 #   write_lock_is_owner                    → returns 0 for the acquirer or its inherited token
+#   write_lock_heartbeat_write              → atomically refreshes the current owner's heartbeat
+#   write_lock_heartbeat_epoch <dir> <token> → prints a matching heartbeat epoch
 #   write_lock_set_job <job>               → records a known job id for the current owner
 #   write_lock_poison <job> <reason>        → stages unconfirmed-quiescence metadata
 #   write_lock_release                     → releases an acquired lock only after its lease ends
@@ -203,6 +205,7 @@ repo_digest_bounded() {
       break
     fi
     sleep 1
+    write_lock_heartbeat_write
     elapsed=$((elapsed + 1))
   done
   if [ "$timed_out" -eq 1 ]; then
@@ -276,6 +279,75 @@ write_lock_publish_metadata() {   # lock_dir token record
   fi
   rm -f "$temp" 2>/dev/null || :
   return 1
+}
+
+write_lock_heartbeat_write() {
+  local interval invalid now last lock_dir heartbeat temp
+  write_lock_is_owner || return 0
+  interval=${MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC:-20}
+  invalid=0
+  case "$interval" in
+    *[!0-9]*) invalid=1 ;;
+    *) [ "$interval" -ge 1 ] 2>/dev/null || invalid=1 ;;
+  esac
+  if [ "$invalid" -eq 1 ]; then
+    progress "MAESTRO_LOCK: invalid MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC=$interval; using 20s"
+    interval=20
+    MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC=$interval
+  else
+    interval=$((10#$interval))
+  fi
+  now=$(date +%s) || return 1
+  last=${MAESTRO_LOCK_HEARTBEAT_LAST_WRITE_EPOCH:-0}
+  if [ "${MAESTRO_LOCK_HEARTBEAT_LAST_TOKEN:-}" = "${MAESTRO_LOCK_TOKEN:-}" ] &&
+    [ "$last" -ge 0 ] 2>/dev/null &&
+    [ "$((now - last))" -lt "$interval" ]; then
+    return 0
+  fi
+  lock_dir="${MAESTRO_LOCK_DIR:-$(write_lock_path)}"
+  heartbeat="$lock_dir/heartbeat"
+  temp="$lock_dir/heartbeat.tmp.$MAESTRO_LOCK_TOKEN"
+  if ! printf 'token=%s\nepoch=%s\n' "$MAESTRO_LOCK_TOKEN" "$now" > "$temp"; then
+    rm -f "$temp" 2>/dev/null || :
+    return 1
+  fi
+  if ! write_lock_is_owner; then
+    rm -f "$temp" 2>/dev/null || :
+    return 0
+  fi
+  if mv -f "$temp" "$heartbeat"; then
+    MAESTRO_LOCK_HEARTBEAT_LAST_WRITE_EPOCH=$now
+    MAESTRO_LOCK_HEARTBEAT_LAST_TOKEN=$MAESTRO_LOCK_TOKEN
+    return 0
+  fi
+  rm -f "$temp" 2>/dev/null || :
+  return 1
+}
+
+write_lock_heartbeat_epoch() {   # lock_dir token
+  local lock_dir="$1" token="$2" heartbeat recorded_token
+  heartbeat="$lock_dir/heartbeat"
+  [ -f "$heartbeat" ] || return 0
+  recorded_token=$(write_lock_metadata_value "$heartbeat" token)
+  [ "$recorded_token" = "$token" ] || return 0
+  write_lock_metadata_value "$heartbeat" epoch
+}
+
+write_lock_heartbeat_stale_sec() {
+  local stale invalid
+  stale=${MAESTRO_LOCK_HEARTBEAT_STALE_SEC:-90}
+  invalid=0
+  case "$stale" in
+    *[!0-9]*) invalid=1 ;;
+    *) [ "$stale" -ge 0 ] 2>/dev/null || invalid=1 ;;
+  esac
+  if [ "$invalid" -eq 1 ]; then
+    progress "MAESTRO_LOCK: invalid MAESTRO_LOCK_HEARTBEAT_STALE_SEC=$stale; using 90s"
+    stale=90
+  else
+    stale=$((10#$stale))
+  fi
+  printf '%s\n' "$stale"
 }
 
 write_lock_session_id() {   # prints a validated session id, or unknown
@@ -443,6 +515,7 @@ write_lock_acquire() {
   local stale_digest_before stale_digest_after stale_released_at session_id started_at
   local metadata_record
   local wait_cap wait_poll wait_deadline initializing_grace
+  local heartbeat_stale heartbeat_epoch heartbeat_effective heartbeat_age heartbeat_note
   MAESTRO_LOCK_ACQUIRED=0
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
   metadata="$MAESTRO_LOCK_DIR/metadata"
@@ -474,6 +547,7 @@ write_lock_acquire() {
       ;;
   esac
   MAESTRO_LOCK_WAIT_POLL_SEC=$wait_poll
+  heartbeat_stale=$(write_lock_heartbeat_stale_sec)
 
   write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata" || return 11
 
@@ -506,7 +580,7 @@ write_lock_acquire() {
         "$token" "$$" "$process_start" "$requested_job" "${session_id:-unknown}" \
         "$started_at" "$now")
       if ! write_lock_publish_metadata "$MAESTRO_LOCK_DIR" "$token" "$metadata_record"; then
-        rm -f "$metadata" 2>/dev/null || :
+        rm -f "$metadata" "$MAESTRO_LOCK_DIR/heartbeat" 2>/dev/null || :
         rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
         return 3
       fi
@@ -587,6 +661,7 @@ write_lock_acquire() {
       { [ -z "$current_start" ] || [ -z "$owner_start" ] ||
         [ "$owner_start" = unavailable ] || [ "$current_start" = "$owner_start" ]; }; then
       identity_note=""
+      heartbeat_note=""
       if [ -z "$current_start" ] || [ -z "$owner_start" ] || [ "$owner_start" = unavailable ]; then
         identity_note=" (identity unconfirmed; failing closed)"
       fi
@@ -597,6 +672,24 @@ write_lock_acquire() {
           held=$((now - started_epoch))
           [ "$held" -lt 0 ] && held=0
           held="${held}s"
+          if [ "$heartbeat_stale" -ne 0 ]; then
+            heartbeat_effective=$started_epoch
+            heartbeat_epoch=$(write_lock_heartbeat_epoch "$MAESTRO_LOCK_DIR" "$recorded_token")
+            case "$heartbeat_epoch" in
+              ''|*[!0-9]*) ;;
+              *)
+                [ "$heartbeat_epoch" -gt "$heartbeat_effective" ] &&
+                  heartbeat_effective=$heartbeat_epoch
+                ;;
+            esac
+            heartbeat_age=$((now - heartbeat_effective))
+            [ "$heartbeat_age" -lt 0 ] && heartbeat_age=0
+            if [ "$heartbeat_age" -gt "$heartbeat_stale" ]; then
+              heartbeat_note="; heartbeat is stale (last tick ${heartbeat_age}s ago, threshold ${heartbeat_stale}s) — the owner may be wedged. Recover only after confirming that process is done: kill it yourself, then bash hooks/implementer-loop.sh --clear-lease"
+            else
+              heartbeat_note="; heartbeat is fresh (last tick ${heartbeat_age}s ago)"
+            fi
+          fi
           ;;
       esac
       if [ -z "$identity_note" ]; then
@@ -604,7 +697,7 @@ write_lock_acquire() {
           continue
         fi
       fi
-      progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)${identity_note}"
+      progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)${identity_note}${heartbeat_note}"
       return 11
     fi
 
@@ -635,7 +728,8 @@ write_lock_acquire() {
     # Recheck after liveness so that transition cannot be erased as stale.
     write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata" || return 11
 
-    if rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null &&
+    if rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" \
+      "$MAESTRO_LOCK_DIR/heartbeat" 2>/dev/null &&
       rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
       progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown}"
       stale_digest_after=$(repo_digest_bounded 2>/dev/null) || stale_digest_after=unavailable
@@ -683,7 +777,10 @@ write_lock_set_job() {
   metadata="${MAESTRO_LOCK_DIR:-$(write_lock_path)}/metadata"
   [ -f "$metadata" ] || return 0
   recorded_token=$(write_lock_metadata_value "$metadata" token)
-  [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || return 0
+  [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || {
+    progress "MAESTRO_LOCK: this lease is no longer held by this process; job update skipped"
+    return 0
+  }
   owner_pid=$(write_lock_metadata_value "$metadata" pid)
   owner_start=$(write_lock_metadata_value "$metadata" process_start)
   started_at=$(write_lock_metadata_value "$metadata" started_at)
@@ -706,11 +803,17 @@ write_lock_set_job() {
 write_lock_poison() {
   local job="$1" reason="$2" metadata next_metadata recorded_token owner_pid owner_start
   local owner_job started_at started_epoch digest_before session_id
-  write_lock_is_owner || return 3
+  write_lock_is_owner || {
+    progress "MAESTRO_LOCK: this lease is no longer held by this process; poison not staged"
+    return 3
+  }
   metadata="${MAESTRO_LOCK_DIR:-$(write_lock_path)}/metadata"
   [ -f "$metadata" ] || return 3
   recorded_token=$(write_lock_metadata_value "$metadata" token)
-  [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || return 3
+  [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || {
+    progress "MAESTRO_LOCK: this lease is no longer held by this process; poison not staged"
+    return 3
+  }
   owner_pid=$(write_lock_metadata_value "$metadata" pid)
   owner_start=$(write_lock_metadata_value "$metadata" process_start)
   owner_job=$(write_lock_metadata_value "$metadata" job_id)
@@ -739,7 +842,10 @@ write_lock_release() {
   metadata="${MAESTRO_LOCK_DIR:-}/metadata"
   [ -n "${MAESTRO_LOCK_DIR:-}" ] && [ -f "$metadata" ] || return 0
   recorded_token=$(write_lock_metadata_value "$metadata" token)
-  [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || return 0
+  [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || {
+    progress "MAESTRO_LOCK: this lease is no longer held by this process; releasing nothing"
+    return 0
+  }
   owner_job=$(write_lock_metadata_value "$metadata" job_id)
   owner_job=${owner_job:-unknown}
   owner_session=$(write_lock_metadata_value "$metadata" session_id)
@@ -800,7 +906,8 @@ write_lock_release() {
     progress "MAESTRO_LOCK: write lease retained because quiescence was never confirmed (job=${unconfirmed_job:-$owner_job} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown}, lock: $MAESTRO_LOCK_DIR)"
     return 0
   fi
-  rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null || return 0
+  rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" \
+    "$MAESTRO_LOCK_DIR/heartbeat" 2>/dev/null || return 0
   rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
   if log_path=$(provenance_log_path 2>/dev/null); then
     # Best-effort diagnostic only, not an enforcement boundary: repository writers can rewrite this log.
@@ -1019,6 +1126,7 @@ companion_poll() {
   poll_started=$(date +%s)
   while :; do
     sleep "$POLL"
+    write_lock_heartbeat_write
     total=$(( $(date +%s) - poll_started ))
     ST=$(node "$C" status "$JOB" --json 2>/dev/null)
     if [ -z "$ST" ]; then

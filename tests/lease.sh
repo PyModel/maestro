@@ -4,6 +4,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIB="$ROOT/hooks/lib-companion.sh"
+LOOP="$ROOT/hooks/implementer-loop.sh"
 FAKE="$ROOT/tests/fixtures/fake-companion.mjs"
 [ -f "$FAKE" ] || { echo "VERIFY FAIL: missing fixture $FAKE"; exit 1; }
 TEST_ROOT=$(mktemp -d /tmp/maestro-planf-green.XXXXXXXX)
@@ -35,6 +36,25 @@ confirmed_ps_path() {  # dir
 
 status_running_job() { printf '{\n  "running": [\n    {\n      "id": "%s",\n      "write": %s\n    }\n  ],\n  "latestFinished": null\n}\n' "$1" "$2"; }
 status_empty()       { printf '{\n  "running": [],\n  "latestFinished": null\n}\n'; }
+
+run_clear_lease() {  # dir status stale_sec
+  local dir="$1" status="$2" stale_sec="$3" clear_home clear_shim companion
+  clear_home="$TEST_ROOT/clear-home"
+  clear_shim="$TEST_ROOT/clear-shim"
+  companion="$clear_home/.claude/plugins/cache/openai-codex/codex/test/scripts/codex-companion.mjs"
+  mkdir -p "$clear_shim" "$(dirname "$companion")" || return 1
+  ln -sf "$FAKE" "$companion" || return 1
+  printf '#!/usr/bin/env bash\nshift\nexport HOME=%q\nexport PATH=%q\nexec node %q "$@"\n' \
+    "$HOME" "$PATH" "$FAKE" > "$clear_shim/node" || return 1
+  chmod +x "$clear_shim/node" || return 1
+  (
+    cd "$dir" || exit 1
+    env HOME="$clear_home" PATH="$clear_shim:$PATH" \
+      MAESTRO_TEST_STATUS="$status" \
+      MAESTRO_LOCK_HEARTBEAT_STALE_SEC="$stale_sec" \
+      bash "$LOOP" --clear-lease
+  )
+}
 
 dead_lock() {  # dir job_id
   mkdir -p "$1/.maestro-write.lock"
@@ -582,9 +602,266 @@ t28() (
   return 0
 )
 
+# ---------------------------------------------------------------- step 29
+# A current owner's heartbeat is visible as fresh and never changes its token.
+t29() (
+  local dir lock heartbeat owner_token recorded_token out rc; dir=$(ws heartbeat_fresh)
+  cd "$dir" || exit 1; . "$LIB"; progress_init
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  export MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC=1
+  export MAESTRO_LOCK_HEARTBEAT_STALE_SEC=3
+  write_lock_workspace_writers() { return 0; }
+  write_lock_acquire task-heartbeat-fresh-aaaaaa >/dev/null 2>&1 || return 1
+  lock="$dir/.maestro-write.lock"
+  heartbeat="$lock/heartbeat"
+  owner_token=$MAESTRO_LOCK_TOKEN
+  write_lock_heartbeat_write || { echo "heartbeat write failed"; return 1; }
+  [ "$(wc -l < "$heartbeat")" -eq 2 ] ||
+    { echo "heartbeat did not contain exactly two lines"; return 1; }
+  grep -qx "token=$owner_token" "$heartbeat" ||
+    { echo "heartbeat token missing"; return 1; }
+  write_lock_heartbeat_epoch "$lock" "$owner_token" | grep -Eq '^[0-9]+$' ||
+    { echo "heartbeat epoch missing"; return 1; }
+  unset MAESTRO_LOCK_TOKEN
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  printf '%s\n' "$out" | grep -q 'heartbeat is fresh (last tick [0-9][0-9]*s ago)' ||
+    { echo "fresh heartbeat diagnostic missing: $out"; return 1; }
+  recorded_token=$(write_lock_metadata_value "$lock/metadata" token)
+  [ "$recorded_token" = "$owner_token" ] ||
+    { echo "owner token changed from $owner_token to $recorded_token"; return 1; }
+  MAESTRO_LOCK_TOKEN=$owner_token
+  MAESTRO_LOCK_ACQUIRED=1
+  write_lock_release >/dev/null 2>&1
+  [ ! -d "$lock" ] || { echo "heartbeat prevented normal release"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 30
+# A stopped owner becomes diagnostically stale, but the contender never reclaims it.
+t30() (
+  local dir lock stop owner_out owner_pid owner_token before out rc owner_rc
+  dir=$(ws heartbeat_stale_no_reclaim)
+  lock="$dir/.maestro-write.lock"
+  stop="$dir/stop-owner"
+  owner_out="$dir/owner.out"
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  bash -c '
+    cd "$1" || exit 1
+    . "$2"; progress_init
+    export MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC=1
+    write_lock_workspace_writers() { return 0; }
+    write_lock_acquire task-heartbeat-stale-aaaaaa >/dev/null 2>&1 || exit 1
+    write_lock_heartbeat_write || exit 1
+    printf "%s\n" "$MAESTRO_LOCK_TOKEN" > "$1/owner.token"
+    while [ ! -e "$3" ]; do
+      sleep 1
+      write_lock_heartbeat_write || exit 1
+    done
+    write_lock_is_owner || exit 2
+    printf "owner-still-owns\n"
+    write_lock_release || exit 3
+    [ ! -d "$4" ] || exit 4
+    printf "owner-released\n"
+  ' _ "$dir" "$LIB" "$stop" "$lock" > "$owner_out" 2>&1 &
+  owner_pid=$!
+  stale_owner_cleanup() {
+    [ -n "$owner_pid" ] || return 0
+    : > "$stop"
+    kill -CONT "$owner_pid" 2>/dev/null || :
+    wait "$owner_pid" 2>/dev/null || :
+  }
+  trap stale_owner_cleanup EXIT
+  for _ in 1 2 3 4 5; do
+    [ -s "$dir/owner.token" ] && [ -f "$lock/heartbeat" ] && break
+    sleep 1
+  done
+  [ -s "$dir/owner.token" ] && [ -f "$lock/heartbeat" ] ||
+    { echo "owner did not publish heartbeat"; return 1; }
+  owner_token=$(sed -n '1p' "$dir/owner.token")
+  before="$dir/metadata.before"
+  cp "$lock/metadata" "$before" || return 1
+  kill -STOP "$owner_pid" || return 1
+  sleep 3
+  cd "$dir" || exit 1; . "$LIB"; progress_init
+  export MAESTRO_LOCK_WAIT_SEC=1 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  export MAESTRO_LOCK_HEARTBEAT_STALE_SEC=1
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  printf '%s\n' "$out" | grep -q 'heartbeat is stale .*owner may be wedged' ||
+    { echo "stale heartbeat diagnostic missing: $out"; return 1; }
+  [ -d "$lock" ] || { echo "stale heartbeat was reclaimed"; return 1; }
+  cmp -s "$before" "$lock/metadata" ||
+    { echo "contender changed lease metadata"; return 1; }
+  [ "$(write_lock_metadata_value "$lock/metadata" token)" = "$owner_token" ] ||
+    { echo "contender changed lease token"; return 1; }
+  : > "$stop"
+  kill -CONT "$owner_pid" || return 1
+  wait "$owner_pid"; owner_rc=$?
+  owner_pid=""
+  [ "$owner_rc" -eq 0 ] || { echo "resumed owner rc=$owner_rc: $(cat "$owner_out")"; return 1; }
+  grep -qx 'owner-still-owns' "$owner_out" &&
+    grep -qx 'owner-released' "$owner_out" ||
+    { echo "resumed owner did not retain and release lease: $(cat "$owner_out")"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 31
+# Before the first tick, a young lease uses started_epoch as its freshness floor.
+t31() (
+  local dir lock owner_token out rc; dir=$(ws heartbeat_absent_young)
+  cd "$dir" || exit 1; . "$LIB"; progress_init
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  export MAESTRO_LOCK_HEARTBEAT_STALE_SEC=3
+  write_lock_workspace_writers() { return 0; }
+  write_lock_acquire task-heartbeat-young-aaaaaa >/dev/null 2>&1 || return 1
+  lock="$dir/.maestro-write.lock"
+  owner_token=$MAESTRO_LOCK_TOKEN
+  rm -f "$lock/heartbeat"
+  [ ! -e "$lock/heartbeat" ] || { echo "young lease unexpectedly ticked"; return 1; }
+  unset MAESTRO_LOCK_TOKEN
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  printf '%s\n' "$out" | grep -q 'heartbeat is fresh (last tick [0-9][0-9]*s ago)' ||
+    { echo "started_epoch freshness floor missing: $out"; return 1; }
+  MAESTRO_LOCK_TOKEN=$owner_token
+  MAESTRO_LOCK_ACQUIRED=1
+  write_lock_release >/dev/null 2>&1
+  return 0
+)
+
+# ---------------------------------------------------------------- step 32
+# A stale heartbeat never bypasses the write-capable-job gate.
+t32() (
+  local dir lock status out rc now; dir=$(ws clear_stale_writer)
+  lock="$dir/.maestro-write.lock"
+  status="$dir/status.json"
+  now=$(date +%s)
+  mkdir -p "$lock"
+  printf 'token=stale-writer\npid=%s\nprocess_start=old\njob_id=task-stale-writer\nsession_id=session-stale-writer\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
+    "$$" "$((now - 5))" > "$lock/metadata"
+  printf 'token=stale-writer\nepoch=%s\n' "$((now - 5))" > "$lock/heartbeat"
+  status_running_job task-running-writer true > "$status"
+  out=$(run_clear_lease "$dir" "$status" 1 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  grep -q 'refusing to clear.*write-capable job is still running.*task-running-writer' <<< "$out" ||
+    { echo "writer gate diagnostic missing: $out"; return 1; }
+  [ -d "$lock" ] && [ -f "$lock/metadata" ] && [ -f "$lock/heartbeat" ] ||
+    { echo "writer gate did not preserve stale lease"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 33
+# With no write-capable job, an operator may clear a stale-heartbeat lease.
+t33() (
+  local dir lock status out rc now; dir=$(ws clear_stale_empty)
+  lock="$dir/.maestro-write.lock"
+  status="$dir/status.json"
+  now=$(date +%s)
+  mkdir -p "$lock"
+  printf 'token=stale-empty\npid=%s\nprocess_start=old\njob_id=task-stale-empty\nsession_id=session-stale-empty\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
+    "$$" "$((now - 5))" > "$lock/metadata"
+  printf 'token=stale-empty\nepoch=%s\n' "$((now - 5))" > "$lock/heartbeat"
+  status_empty > "$status"
+  out=$(run_clear_lease "$dir" "$status" 1 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || { echo "rc=$rc want 0: $out"; return 1; }
+  grep -q 'clearing a write lease whose heartbeat went stale.*job=task-stale-empty.*session=session-stale-empty.*last_heartbeat=[0-9][0-9]*s ago' <<< "$out" ||
+    { echo "stale clear diagnostic missing: $out"; return 1; }
+  grep -q 'MAESTRO_FINAL: LOOP CLEARED rc=0' <<< "$out" ||
+    { echo "clear result missing: $out"; return 1; }
+  [ ! -d "$lock" ] && [ ! -e "$lock/metadata" ] && [ ! -e "$lock/heartbeat" ] ||
+    { echo "stale lease entries survived clear"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 34
+# A fresh heartbeat remains outside --clear-lease eligibility.
+t34() (
+  local dir lock status out rc now; dir=$(ws clear_fresh)
+  lock="$dir/.maestro-write.lock"
+  status="$dir/status.json"
+  now=$(date +%s)
+  mkdir -p "$lock"
+  printf 'token=fresh-clear\npid=%s\nprocess_start=current\njob_id=task-fresh-clear\nsession_id=session-fresh-clear\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
+    "$$" "$now" > "$lock/metadata"
+  printf 'token=fresh-clear\nepoch=%s\n' "$now" > "$lock/heartbeat"
+  status_empty > "$status"
+  out=$(run_clear_lease "$dir" "$status" 10 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  grep -q 'refusing to clear.*write lease is healthy.*heartbeat [0-9][0-9]*s old' <<< "$out" ||
+    { echo "fresh clear refusal omitted heartbeat age: $out"; return 1; }
+  [ -d "$lock" ] && [ -f "$lock/metadata" ] && [ -f "$lock/heartbeat" ] ||
+    { echo "fresh heartbeat lease was removed"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 35
+# A zero stale threshold restores the pre-heartbeat contention message.
+t35() (
+  local dir lock stop owner_pid out rc now; dir=$(ws heartbeat_reporting_disabled)
+  lock="$dir/.maestro-write.lock"
+  stop="$dir/stop-owner"
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  (
+    while [ ! -e "$stop" ]; do sleep 1; done
+  ) &
+  owner_pid=$!
+  disabled_owner_cleanup() {
+    [ -n "$owner_pid" ] || return 0
+    : > "$stop"
+    kill -CONT "$owner_pid" 2>/dev/null || :
+    wait "$owner_pid" 2>/dev/null || :
+  }
+  trap disabled_owner_cleanup EXIT
+  now=$(date +%s)
+  mkdir -p "$lock"
+  printf 'token=disabled\npid=%s\nprocess_start=Mon Jan  1 00:00:00 2026\njob_id=task-disabled\nsession_id=session-disabled\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
+    "$owner_pid" "$((now - 5))" > "$lock/metadata"
+  printf 'token=disabled\nepoch=%s\n' "$((now - 5))" > "$lock/heartbeat"
+  kill -STOP "$owner_pid" || return 1
+  cd "$dir" || exit 1; . "$LIB"; progress_init
+  export MAESTRO_LOCK_HEARTBEAT_STALE_SEC=0
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  if grep -Eq 'heartbeat is (fresh|stale)' <<< "$out"; then
+    echo "disabled heartbeat reporting changed message: $out"
+    return 1
+  fi
+  grep -q 'write dispatch blocked; held by job=task-disabled.*for [0-9][0-9]*s' <<< "$out" ||
+    { echo "pre-heartbeat contention message missing: $out"; return 1; }
+  : > "$stop"
+  kill -CONT "$owner_pid" || return 1
+  wait "$owner_pid" || return 1
+  owner_pid=""
+  return 0
+)
+
+# ---------------------------------------------------------------- step 36
+# Unknown lease age never becomes a heartbeat-staleness claim.
+t36() (
+  local dir lock out rc; dir=$(ws heartbeat_unknown_age)
+  lock="$dir/.maestro-write.lock"
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  mkdir -p "$lock"
+  printf 'token=unknown-age\npid=%s\nprocess_start=Mon Jan  1 00:00:00 2026\njob_id=task-unknown-age\nsession_id=session-unknown-age\nstarted_at=unknown\nstarted_epoch=not-a-number\ndigest_before=unavailable\n' \
+    "$$" > "$lock/metadata"
+  printf 'token=unknown-age\nepoch=1\n' > "$lock/heartbeat"
+  cd "$dir" || exit 1; . "$LIB"; progress_init
+  export MAESTRO_LOCK_HEARTBEAT_STALE_SEC=1
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  if grep -Eq 'heartbeat is (fresh|stale)' <<< "$out"; then
+    echo "unknown age was reported as heartbeat staleness: $out"
+    return 1
+  fi
+  grep -q 'for unknown' <<< "$out" ||
+    { echo "unknown held age missing: $out"; return 1; }
+  return 0
+)
+
 printf '=== Plan F green-phase verification ===\n'
 for t in t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t16 t17 \
-  t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28; do
+  t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 t29 t30 t31 t32 t33 t34 t35 t36; do
   msg=$($t 2>&1) && ok "$t" || bad "$t" "${msg:-no detail}"
 done
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

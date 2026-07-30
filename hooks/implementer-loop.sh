@@ -100,7 +100,9 @@ if [ "$CLEAR_LEASE" -eq 1 ]; then
 
   metadata="$lock_path/metadata"
   staged_metadata="$lock_path/metadata.new"
+  heartbeat="$lock_path/heartbeat"
   orphan=0
+  stale_heartbeat=0
   if [ ! -e "$metadata" ] && [ ! -e "$staged_metadata" ]; then
     orphan=1
     poisoned_job=unknown
@@ -121,21 +123,54 @@ if [ "$CLEAR_LEASE" -eq 1 ]; then
       owner_session=$(write_lock_metadata_value "$metadata" session_id)
       owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
       owner_pid=$(write_lock_metadata_value "$metadata" pid)
+      started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
       malformed=0
       case "$owner_pid" in
         ''|*[!0-9]*) malformed=1 ;;
       esac
       if [ -z "$owner_token" ] || [ "$malformed" -eq 1 ]; then
         progress "MAESTRO_LOCK: refusing to clear — write lease metadata is malformed; owner cannot be identified; failing closed (lock: $lock_path)"
-      else
-        progress "MAESTRO_LOCK: refusing to clear — write lease is healthy and not this command's to clear (job=$owner_job session=${owner_session:-unknown} pid=$owner_pid, lock: $lock_path)"
+        maestro_finish "BLOCKED" 11
       fi
-      maestro_finish "BLOCKED" 11
+      heartbeat_stale=$(write_lock_heartbeat_stale_sec)
+      heartbeat_note=""
+      case "$started_epoch" in
+        ''|*[!0-9]*) ;;
+        *)
+          if [ "$heartbeat_stale" -ne 0 ]; then
+            now=$(date +%s)
+            heartbeat_effective=$started_epoch
+            heartbeat_epoch=$(write_lock_heartbeat_epoch "$lock_path" "$owner_token")
+            case "$heartbeat_epoch" in
+              ''|*[!0-9]*) ;;
+              *)
+                [ "$heartbeat_epoch" -gt "$heartbeat_effective" ] &&
+                  heartbeat_effective=$heartbeat_epoch
+                ;;
+            esac
+            heartbeat_age=$((now - heartbeat_effective))
+            [ "$heartbeat_age" -lt 0 ] && heartbeat_age=0
+            if [ "$heartbeat_age" -gt "$heartbeat_stale" ]; then
+              stale_heartbeat=1
+            else
+              heartbeat_note="; heartbeat ${heartbeat_age}s old"
+            fi
+          fi
+          ;;
+      esac
+      if [ "$stale_heartbeat" -eq 0 ]; then
+        progress "MAESTRO_LOCK: refusing to clear — write lease is healthy and not this command's to clear (job=$owner_job session=${owner_session:-unknown} pid=$owner_pid, lock: $lock_path)${heartbeat_note}"
+        maestro_finish "BLOCKED" 11
+      fi
+      poisoned_job=$owner_job
+      poisoned_session=$owner_session
     fi
-    poisoned_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
-    poisoned_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-    poisoned_session=$(write_lock_metadata_value "$poison_metadata" session_id)
-    poisoned_session=$(MAESTRO_SESSION_ID="${poisoned_session:-}" write_lock_session_id)
+    if [ "$stale_heartbeat" -eq 0 ]; then
+      poisoned_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
+      poisoned_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
+      poisoned_session=$(write_lock_metadata_value "$poison_metadata" session_id)
+      poisoned_session=$(MAESTRO_SESSION_ID="${poisoned_session:-}" write_lock_session_id)
+    fi
   fi
 
   writers=$(write_lock_workspace_writers)
@@ -157,16 +192,22 @@ if [ "$CLEAR_LEASE" -eq 1 ]; then
       progress "MAESTRO_LOCK: failed to clear structurally invalid orphan write lease at $lock_path"
       maestro_finish "BLOCKED" 11
     fi
+  elif [ "$stale_heartbeat" -eq 1 ]; then
+    progress "MAESTRO_LOCK: clearing a write lease whose heartbeat went stale (job=$owner_job session=${owner_session:-unknown} last_heartbeat=${heartbeat_age}s ago, lock: $lock_path)"
   elif [ -e "$staged_metadata" ]; then
     progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path, removing: $staged_metadata)"
   else
     progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path)"
   fi
   if [ "$orphan" -eq 0 ]; then
-    if ! rm -f "$metadata" 2>/dev/null ||
+    if ! rm -f "$metadata" "$heartbeat" 2>/dev/null ||
       ! rm -rf "$staged_metadata" 2>/dev/null ||
       ! rmdir "$lock_path" 2>/dev/null; then
-      progress "MAESTRO_LOCK: failed to clear poisoned write lease at $lock_path session=${poisoned_session:-unknown}"
+      if [ "$stale_heartbeat" -eq 1 ]; then
+        progress "MAESTRO_LOCK: failed to clear stale-heartbeat write lease at $lock_path session=${owner_session:-unknown}"
+      else
+        progress "MAESTRO_LOCK: failed to clear poisoned write lease at $lock_path session=${poisoned_session:-unknown}"
+      fi
       maestro_finish "BLOCKED" 11
     fi
   fi
@@ -217,6 +258,10 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
 
   progress "LOOP: iteration $i/$MAX_ITERS — dispatching to Codex"
   : > "$ERRF"
+  if ! write_lock_is_owner; then
+    progress "LOOP_STATE: BLOCKED — this loop no longer holds the write lease; stopping before re-dispatching"
+    maestro_finish "BLOCKED" 11
+  fi
   OUT=$(bash "$WATCHDOG" --file "$DISPATCH" "$MAX_IDLE" "$POLL" 2>"$ERRF")
   rc=$?
   cat "$ERRF" >&2
@@ -271,6 +316,7 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
           break
         fi
         sleep 1
+        write_lock_heartbeat_write
       done
       if [ "$vtimed_out" -eq 1 ]; then
         kill -TERM -"$vpid" 2>/dev/null || :
@@ -284,6 +330,10 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
       wait "$vpid" 2>/dev/null
       vrc=$?
       set +m
+      if ! write_lock_is_owner; then
+        progress "LOOP_STATE: BLOCKED — this loop no longer holds the write lease; stopping before re-dispatching"
+        maestro_finish "BLOCKED" 11
+      fi
       VOUT=$(cat "$VOUTF")
       if [ "$vtimed_out" -eq 1 ]; then
         vrc=124
