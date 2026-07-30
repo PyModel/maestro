@@ -120,6 +120,11 @@ CONTRACT='
     RESULT: BLOCKED         — missing access/credentials or a destructive step; name the blocker
     RESULT: FAILED          — verification failed; paste the failing output
 - Report the list of files you created or modified. Never silently leave stray files.
+- Before your first edit, run `git status --short` and note what was already dirty. In this workflow
+  the tree is normally dirty (plan files, notes, untracked docs) — that is never a reason to stop and
+  never a gate. Preserve every pre-existing change: do not revert, stash, checkout, or commit work
+  you did not make, and keep prior edits to files you also touch. In your report, list the
+  pre-existing dirty paths you observed and confirm you left the out-of-scope ones untouched.
 - Keep the final report under ~400 words, plus the verification output and any `CONTINUATION:`
   capsule. Your reader is another model reviewing your diff, not a human reading a report.
 - Write the laziest thing that works: reuse what the repo already has, prefer the standard
