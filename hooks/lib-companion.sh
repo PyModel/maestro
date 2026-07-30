@@ -211,6 +211,20 @@ write_lock_metadata_value() {
   sed -n "s/^${field}=//p" "$metadata" 2>/dev/null | head -1
 }
 
+write_lock_session_id() {   # prints a validated session id, or unknown
+  local session_id="${MAESTRO_SESSION_ID:-}"
+  case "$session_id" in
+    ''|*[!A-Za-z0-9_-]*) printf 'unknown' ;;
+    *)
+      if [ "${#session_id}" -le 64 ]; then
+        printf '%s' "$session_id"
+      else
+        printf 'unknown'
+      fi
+      ;;
+  esac
+}
+
 write_lock_is_owner() {
   local metadata recorded_token
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || {
@@ -325,9 +339,9 @@ write_lock_workspace_writers() {
 write_lock_acquire() {
   local requested_job="${1:-unknown}" metadata recorded_token owner_pid owner_start
   local owner_job started_epoch current_start held now attempt token process_start owner_alive
-  local identity_note quiescence unconfirmed_job unconfirmed_reason poison_metadata
+  local identity_note quiescence unconfirmed_job unconfirmed_reason poison_metadata owner_session
   local writers writers_rc digest_before log_path last prior_job prior_after observed_at
-  local stale_digest_before stale_digest_after stale_released_at
+  local stale_digest_before stale_digest_after stale_released_at session_id
   MAESTRO_LOCK_ACQUIRED=0
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
   metadata="$MAESTRO_LOCK_DIR/metadata"
@@ -342,7 +356,9 @@ write_lock_acquire() {
   if [ "$quiescence" = "unconfirmed" ]; then
     unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
     unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-    progress "MAESTRO_LOCK: write dispatch blocked; quiescence is unconfirmed for job=${unconfirmed_job:-unknown} reason=${unconfirmed_reason:-unknown} (lock: $MAESTRO_LOCK_DIR). Clear it once no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
+    owner_session=$(write_lock_metadata_value "$poison_metadata" session_id)
+    owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
+    progress "MAESTRO_LOCK: write dispatch blocked; quiescence is unconfirmed for job=${unconfirmed_job:-unknown} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown} (lock: $MAESTRO_LOCK_DIR). Clear it once no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
     return 11
   fi
 
@@ -367,8 +383,9 @@ write_lock_acquire() {
       fi
       now=$(date +%s)
       digest_before=$(repo_digest 2>/dev/null) || digest_before=unavailable
+      session_id=$(write_lock_session_id)
       if log_path=$(provenance_log_path 2>/dev/null) && [ -f "$log_path" ]; then
-        last=$(grep -E '^[^ ]+ type=(dispatch|orphan-adopted) job=[^ ]+ before=[^ ]+ after=[^ ]+$' \
+        last=$(grep -E '^[^ ]+ type=(dispatch|orphan-adopted) job=[^ ]+( session=[^ ]+)? before=[^ ]+ after=[^ ]+$' \
           "$log_path" 2>/dev/null | tail -1)
         if [ -n "$last" ]; then
           prior_job=${last#* job=}
@@ -379,14 +396,14 @@ write_lock_acquire() {
             [ "$prior_after" != "$digest_before" ]; then
             observed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
             progress "PROVENANCE: BASELINE GAP — tree at acquisition differs from the prior completed snapshot (prior_job=$prior_job, expected=$prior_after, observed=$digest_before); author unknown"
-            printf '%s type=gap prior_job=%s expected=%s observed=%s\n' \
-              "$observed_at" "$prior_job" "$prior_after" "$digest_before" \
+            printf '%s type=gap prior_job=%s session=%s expected=%s observed=%s\n' \
+              "$observed_at" "$prior_job" "${session_id:-unknown}" "$prior_after" "$digest_before" \
               >> "$log_path" 2>/dev/null || :
           fi
         fi
       fi
-      if ! printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
-        "$token" "$$" "$process_start" "$requested_job" \
+      if ! printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
+        "$token" "$$" "$process_start" "$requested_job" "${session_id:-unknown}" \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$now" "$digest_before" > "$metadata"; then
         rm -f "$metadata" 2>/dev/null || :
         rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
@@ -404,13 +421,15 @@ write_lock_acquire() {
     fi
 
     if [ ! -f "$metadata" ]; then
-      progress "MAESTRO_LOCK: write dispatch blocked by an initializing owner (job=unknown pid=unknown held=unknown, lock: $MAESTRO_LOCK_DIR)"
+      progress "MAESTRO_LOCK: write dispatch blocked by an initializing owner (job=unknown session=unknown pid=unknown held=unknown, lock: $MAESTRO_LOCK_DIR)"
       return 11
     fi
 
     owner_pid=$(write_lock_metadata_value "$metadata" pid)
     owner_start=$(write_lock_metadata_value "$metadata" process_start)
     owner_job=$(write_lock_metadata_value "$metadata" job_id)
+    owner_session=$(write_lock_metadata_value "$metadata" session_id)
+    owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
     started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
     stale_digest_before=$(write_lock_metadata_value "$metadata" digest_before)
     owner_job=${owner_job:-unknown}
@@ -438,24 +457,24 @@ write_lock_acquire() {
           held="${held}s"
           ;;
       esac
-      progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)${identity_note}"
+      progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)${identity_note}"
       return 11
     fi
 
     writers=$(write_lock_workspace_writers)
     writers_rc=$?
     if [ "$writers_rc" -eq 4 ]; then
-      progress "MAESTRO_LOCK: dispatcher is gone but job liveness could not be determined; write lock retained (job=$owner_job pid=${owner_pid:-unknown}, lock: $MAESTRO_LOCK_DIR)"
+      progress "MAESTRO_LOCK: dispatcher is gone but job liveness could not be determined; write lock retained (job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown}, lock: $MAESTRO_LOCK_DIR)"
       return 11
     fi
 
     if [ "$owner_job" != "unknown" ]; then
       if printf '%s\n' "$writers" | awk -v job="$owner_job" '$1 == job { found = 1 } END { exit !found }'; then
-        progress "MAESTRO_LOCK: write dispatch blocked; lease retained because orphaned job=$owner_job is still running (lock: $MAESTRO_LOCK_DIR)"
+        progress "MAESTRO_LOCK: write dispatch blocked; lease retained because orphaned job=$owner_job session=${owner_session:-unknown} is still running (lock: $MAESTRO_LOCK_DIR)"
         return 11
       fi
     elif printf '%s\n' "$writers" | awk '$2 == "true" { found = 1 } END { exit !found }'; then
-      progress "MAESTRO_LOCK: write dispatch blocked; lease retained because an unidentified write-capable job is still running (lock: $MAESTRO_LOCK_DIR)"
+      progress "MAESTRO_LOCK: write dispatch blocked; lease retained because an unidentified write-capable job is still running (session=${owner_session:-unknown}, lock: $MAESTRO_LOCK_DIR)"
       return 11
     fi
 
@@ -471,13 +490,15 @@ write_lock_acquire() {
     if [ "$quiescence" = "unconfirmed" ]; then
       unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
       unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-      progress "MAESTRO_LOCK: write dispatch blocked; quiescence is unconfirmed for job=${unconfirmed_job:-unknown} reason=${unconfirmed_reason:-unknown} (lock: $MAESTRO_LOCK_DIR). Clear it once no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
+      owner_session=$(write_lock_metadata_value "$poison_metadata" session_id)
+      owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
+      progress "MAESTRO_LOCK: write dispatch blocked; quiescence is unconfirmed for job=${unconfirmed_job:-unknown} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown} (lock: $MAESTRO_LOCK_DIR). Clear it once no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
       return 11
     fi
 
     if rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null &&
       rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
-      progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job pid=${owner_pid:-unknown}"
+      progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown}"
       stale_digest_after=$(repo_digest 2>/dev/null) || stale_digest_after=unavailable
       if repo_digest_is_observed "$stale_digest_before" &&
         repo_digest_is_observed "$stale_digest_after" &&
@@ -488,8 +509,9 @@ write_lock_acquire() {
       if log_path=$(provenance_log_path 2>/dev/null); then
         # The interval between the orphan's last write and this steal was never observed,
         # so the after value is adopted, not witnessed.
-        printf '%s type=orphan-adopted job=%s before=%s after=%s\n' \
-          "$stale_released_at" "$owner_job" "$stale_digest_before" "$stale_digest_after" \
+        printf '%s type=orphan-adopted job=%s session=%s before=%s after=%s\n' \
+          "$stale_released_at" "$owner_job" "${owner_session:-unknown}" \
+          "$stale_digest_before" "$stale_digest_after" \
           >> "$log_path" 2>/dev/null || :
       fi
       attempt=$((attempt + 1))
@@ -505,17 +527,17 @@ write_lock_acquire() {
         held="${held}s"
         ;;
     esac
-    progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)"
+    progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)"
     return 11
   done
 
-  progress "MAESTRO_LOCK: write dispatch blocked by a competing acquirer (job=unknown pid=unknown held=unknown, lock: $MAESTRO_LOCK_DIR)"
+  progress "MAESTRO_LOCK: write dispatch blocked by a competing acquirer (job=unknown session=unknown pid=unknown held=unknown, lock: $MAESTRO_LOCK_DIR)"
   return 11
 }
 
 write_lock_set_job() {
   local job="$1" metadata next_metadata recorded_token owner_pid owner_start started_at started_epoch
-  local digest_before
+  local digest_before session_id
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || {
     [ -n "${MAESTRO_LOCK_TOKEN:-}" ] || return 0
   }
@@ -529,10 +551,12 @@ write_lock_set_job() {
   started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
   digest_before=$(write_lock_metadata_value "$metadata" digest_before)
   digest_before=${digest_before:-unavailable}
+  session_id=$(write_lock_metadata_value "$metadata" session_id)
+  session_id=$(MAESTRO_SESSION_ID="${session_id:-}" write_lock_session_id)
   next_metadata="${MAESTRO_LOCK_DIR}/metadata.new"
-  if printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
-    "$recorded_token" "$owner_pid" "$owner_start" "$job" "$started_at" "$started_epoch" \
-    "$digest_before" > "$next_metadata"; then
+  if printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
+    "$recorded_token" "$owner_pid" "$owner_start" "$job" "${session_id:-unknown}" \
+    "$started_at" "$started_epoch" "$digest_before" > "$next_metadata"; then
     mv -f "$next_metadata" "$metadata"
   else
     rm -f "$next_metadata" 2>/dev/null || :
@@ -542,7 +566,7 @@ write_lock_set_job() {
 
 write_lock_poison() {
   local job="$1" reason="$2" metadata next_metadata recorded_token owner_pid owner_start
-  local owner_job started_at started_epoch digest_before
+  local owner_job started_at started_epoch digest_before session_id
   write_lock_is_owner || return 3
   metadata="${MAESTRO_LOCK_DIR:-$(write_lock_path)}/metadata"
   [ -f "$metadata" ] || return 3
@@ -555,10 +579,12 @@ write_lock_poison() {
   started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
   digest_before=$(write_lock_metadata_value "$metadata" digest_before)
   digest_before=${digest_before:-unavailable}
+  session_id=$(write_lock_metadata_value "$metadata" session_id)
+  session_id=$(MAESTRO_SESSION_ID="${session_id:-}" write_lock_session_id)
   next_metadata="${MAESTRO_LOCK_DIR}/metadata.new"
-  if printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\nquiescence=unconfirmed\nunconfirmed_job=%s\nunconfirmed_reason=%s\n' \
-    "$recorded_token" "$owner_pid" "$owner_start" "$owner_job" "$started_at" \
-    "$started_epoch" "$digest_before" "$job" "$reason" > "$next_metadata"; then
+  if printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\nquiescence=unconfirmed\nunconfirmed_job=%s\nunconfirmed_reason=%s\n' \
+    "$recorded_token" "$owner_pid" "$owner_start" "$owner_job" "${session_id:-unknown}" \
+    "$started_at" "$started_epoch" "$digest_before" "$job" "$reason" > "$next_metadata"; then
     return 0
   else
     rm -f "$next_metadata" 2>/dev/null || :
@@ -567,7 +593,7 @@ write_lock_poison() {
 }
 
 write_lock_release() {
-  local metadata recorded_token owner_job writers writers_rc quiescence
+  local metadata recorded_token owner_job owner_session writers writers_rc quiescence
   local unconfirmed_job unconfirmed_reason poison_metadata
   local digest_before digest_after log_path released_at
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || return 0
@@ -577,6 +603,8 @@ write_lock_release() {
   [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || return 0
   owner_job=$(write_lock_metadata_value "$metadata" job_id)
   owner_job=${owner_job:-unknown}
+  owner_session=$(write_lock_metadata_value "$metadata" session_id)
+  owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
   poison_metadata="$metadata"
   quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
   if [ "$quiescence" != "unconfirmed" ] &&
@@ -587,27 +615,29 @@ write_lock_release() {
   if [ "$quiescence" = "unconfirmed" ]; then
     unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
     unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-    progress "MAESTRO_LOCK: write lease retained because quiescence was never confirmed (job=${unconfirmed_job:-$owner_job} reason=${unconfirmed_reason:-unknown}, lock: $MAESTRO_LOCK_DIR)"
+    owner_session=$(write_lock_metadata_value "$poison_metadata" session_id)
+    owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
+    progress "MAESTRO_LOCK: write lease retained because quiescence was never confirmed (job=${unconfirmed_job:-$owner_job} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown}, lock: $MAESTRO_LOCK_DIR)"
     return 0
   fi
   if [ "${MAESTRO_LOCK_RETAIN:-0}" -eq 1 ]; then
-    progress "MAESTRO_LOCK: write lease retained because cancellation poison could not be persisted (job=$owner_job, lock: $MAESTRO_LOCK_DIR)"
+    progress "MAESTRO_LOCK: write lease retained because cancellation poison could not be persisted (job=$owner_job session=${owner_session:-unknown}, lock: $MAESTRO_LOCK_DIR)"
     return 0
   fi
 
   writers=$(write_lock_workspace_writers)
   writers_rc=$?
   if [ "$writers_rc" -eq 4 ]; then
-    progress "MAESTRO_LOCK: job liveness could not be determined; write lease retained (job=$owner_job, lock: $MAESTRO_LOCK_DIR)"
+    progress "MAESTRO_LOCK: job liveness could not be determined; write lease retained (job=$owner_job session=${owner_session:-unknown}, lock: $MAESTRO_LOCK_DIR)"
     return 0
   fi
   if [ "$owner_job" != "unknown" ]; then
     if printf '%s\n' "$writers" | awk -v job="$owner_job" '$1 == job { found = 1 } END { exit !found }'; then
-      progress "MAESTRO_LOCK: write lease retained because job $owner_job is still running; a later dispatch will resolve it (lock: $MAESTRO_LOCK_DIR)"
+      progress "MAESTRO_LOCK: write lease retained because job $owner_job session=${owner_session:-unknown} is still running; a later dispatch will resolve it (lock: $MAESTRO_LOCK_DIR)"
       return 0
     fi
   elif printf '%s\n' "$writers" | awk '$2 == "true" { found = 1 } END { exit !found }'; then
-    progress "MAESTRO_LOCK: write lease retained because an unidentified write-capable job is still running; a later dispatch will resolve it (lock: $MAESTRO_LOCK_DIR)"
+    progress "MAESTRO_LOCK: write lease retained because an unidentified write-capable job is still running; a later dispatch will resolve it (session=${owner_session:-unknown}, lock: $MAESTRO_LOCK_DIR)"
     return 0
   fi
 
@@ -626,7 +656,9 @@ write_lock_release() {
   if [ "$quiescence" = "unconfirmed" ]; then
     unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
     unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-    progress "MAESTRO_LOCK: write lease retained because quiescence was never confirmed (job=${unconfirmed_job:-$owner_job} reason=${unconfirmed_reason:-unknown}, lock: $MAESTRO_LOCK_DIR)"
+    owner_session=$(write_lock_metadata_value "$poison_metadata" session_id)
+    owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
+    progress "MAESTRO_LOCK: write lease retained because quiescence was never confirmed (job=${unconfirmed_job:-$owner_job} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown}, lock: $MAESTRO_LOCK_DIR)"
     return 0
   fi
   rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" 2>/dev/null || return 0
@@ -635,8 +667,9 @@ write_lock_release() {
     # Best-effort diagnostic only, not an enforcement boundary: repository writers can rewrite this log.
     # A differing before/after pair is a dispatch-window change with an unknown author:
     # lease metadata delimits an interval; it never identifies which process wrote.
-    printf '%s type=dispatch job=%s before=%s after=%s\n' \
-      "$released_at" "$owner_job" "$digest_before" "$digest_after" >> "$log_path" 2>/dev/null || :
+    printf '%s type=dispatch job=%s session=%s before=%s after=%s\n' \
+      "$released_at" "$owner_job" "${owner_session:-unknown}" "$digest_before" "$digest_after" \
+      >> "$log_path" 2>/dev/null || :
   fi
   MAESTRO_LOCK_ACQUIRED=0
 }
@@ -656,7 +689,7 @@ provenance_check() {
     printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"
     return 0
   fi
-  last=$(grep -E '^[^ ]+ type=(dispatch|orphan-adopted) job=[^ ]+ before=[^ ]+ after=[^ ]+$' \
+  last=$(grep -E '^[^ ]+ type=(dispatch|orphan-adopted) job=[^ ]+( session=[^ ]+)? before=[^ ]+ after=[^ ]+$' \
     "$log_path" 2>/dev/null | tail -1)
   if [ -z "$last" ]; then
     printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"

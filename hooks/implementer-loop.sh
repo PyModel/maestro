@@ -103,11 +103,13 @@ if [ "$CLEAR_LEASE" -eq 1 ]; then
     quiescence=unconfirmed
   fi
   if [ ! -d "$lock_path" ] || [ "$quiescence" != "unconfirmed" ]; then
-    progress "MAESTRO_LOCK: no poisoned write lease to clear at $lock_path"
+    progress "MAESTRO_LOCK: no poisoned write lease to clear at $lock_path session=unknown"
     maestro_finish "CLEARED" 0
   fi
   poisoned_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
   poisoned_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
+  poisoned_session=$(write_lock_metadata_value "$poison_metadata" session_id)
+  poisoned_session=$(MAESTRO_SESSION_ID="${poisoned_session:-}" write_lock_session_id)
   writers=$(write_lock_workspace_writers)
   writers_rc=$?
   running_job=""
@@ -116,18 +118,18 @@ if [ "$CLEAR_LEASE" -eq 1 ]; then
       awk '$2 == "true" { print $1; exit }')
   fi
   if [ "$writers_rc" -eq 4 ] || [ -n "$running_job" ]; then
-    progress "MAESTRO_LOCK: refusing to clear — a write-capable job is still running (${running_job:-unknown})"
+    progress "MAESTRO_LOCK: refusing to clear — a write-capable job is still running (${running_job:-unknown}) session=${poisoned_session:-unknown}"
     maestro_finish "BLOCKED" 11
   fi
   if [ -e "$staged_metadata" ]; then
-    progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path, removing: $staged_metadata)"
+    progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path, removing: $staged_metadata)"
   else
-    progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path)"
+    progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path)"
   fi
   if ! rm -f "$metadata" 2>/dev/null ||
     ! rm -rf "$staged_metadata" 2>/dev/null ||
     ! rmdir "$lock_path" 2>/dev/null; then
-    progress "MAESTRO_LOCK: failed to clear poisoned write lease at $lock_path"
+    progress "MAESTRO_LOCK: failed to clear poisoned write lease at $lock_path session=${poisoned_session:-unknown}"
     maestro_finish "BLOCKED" 11
   fi
   maestro_finish "CLEARED" 0

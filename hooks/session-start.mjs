@@ -30,6 +30,14 @@ try { implEffort = fs.readFileSync(IMPL_EFFORT, 'utf8').trim() || 'medium'; } ca
 const armed = fs.existsSync(ASK);
 const source = payload.source || 'startup';
 
+if (typeof process.env.CLAUDE_ENV_FILE === 'string' && process.env.CLAUDE_ENV_FILE &&
+    typeof payload.session_id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(payload.session_id)) {
+  try {
+    // The allowlist rejects every character that would require shell escaping.
+    fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export MAESTRO_SESSION_ID=${payload.session_id}\n`);
+  } catch {}
+}
+
 if (armed && source !== 'resume') {
   process.stdout.write(
     'MAESTRO SESSION SETUP — the user wants to pick the Codex model and role-specific reasoning tiers before work starts.\n' +

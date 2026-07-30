@@ -232,8 +232,86 @@ t12() (
   return 0
 )
 
+# ---------------------------------------------------------------- step 13
+# A valid session id is recorded and identifies the live owner on contention.
+t13() (
+  local dir out rc; dir=$(ws session_valid)
+  cd "$dir"; . "$LIB"; progress_init
+  export MAESTRO_SESSION_ID=session-valid_13
+  write_lock_acquire task-live0000-aaaaaa >/dev/null 2>&1
+  grep -qx 'session_id=session-valid_13' "$dir/.maestro-write.lock/metadata" ||
+    { echo "valid session id not recorded"; return 1; }
+  unset MAESTRO_LOCK_TOKEN
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  printf '%s\n' "$out" | grep -q 'session=session-valid_13' ||
+    { echo "contention did not identify owner session: $out"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 14
+# Invalid environment input is replaced, never copied into metadata.
+t14() (
+  local dir metadata; dir=$(ws session_invalid)
+  cd "$dir"; . "$LIB"; progress_init
+  export MAESTRO_SESSION_ID='bad id; rm -rf /'
+  write_lock_acquire task-invalid0-aaaaaa >/dev/null 2>&1
+  metadata="$dir/.maestro-write.lock/metadata"
+  grep -qx 'session_id=unknown' "$metadata" ||
+    { echo "invalid session id did not record unknown"; return 1; }
+  if grep -Fq 'bad' "$metadata" || grep -Fq 'rm -rf' "$metadata"; then
+    echo "invalid session id leaked into metadata"
+    return 1
+  fi
+  return 0
+)
+
+# ---------------------------------------------------------------- step 15
+# Publishing a job rewrites metadata without losing the recorded session.
+t15() (
+  local dir; dir=$(ws session_set_job)
+  cd "$dir"; . "$LIB"; progress_init
+  export MAESTRO_SESSION_ID=session-set_job
+  write_lock_acquire >/dev/null 2>&1
+  write_lock_set_job task-published-aaaaaa
+  grep -qx 'session_id=session-set_job' "$dir/.maestro-write.lock/metadata" ||
+    { echo "session id lost while publishing job"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 16
+# Completed dispatch provenance carries the originating session.
+t16() (
+  local dir log; dir=$(ws session_dispatch)
+  git -C "$dir" init -q
+  status_empty > "$dir/status.json"
+  cd "$dir"; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
+  export MAESTRO_SESSION_ID=session-dispatch
+  export MAESTRO_TEST_STATUS="$dir/status.json"
+  write_lock_acquire task-session0-aaaaaa >/dev/null 2>&1
+  write_lock_release >/dev/null 2>&1
+  log="$dir/.git/maestro-provenance.log"
+  grep -Eq ' type=dispatch job=task-session0-aaaaaa session=session-dispatch before=[^ ]+ after=[^ ]+$' "$log" ||
+    { echo "dispatch provenance missing session"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 17
+# Legacy provenance without a session field remains a valid acquisition baseline.
+t17() (
+  local dir log; dir=$(ws legacy_baseline)
+  git -C "$dir" init -q
+  log="$dir/.git/maestro-provenance.log"
+  printf '2026-01-01T00:00:00Z type=dispatch job=legacy-job before=tree-v2:old after=tree-v2:old\n' > "$log"
+  cd "$dir"; . "$LIB"; progress_init
+  write_lock_acquire task-new00000-cccccc >/dev/null 2>&1
+  grep -q ' type=gap prior_job=legacy-job ' "$log" ||
+    { echo "legacy provenance was not recognized as a baseline"; return 1; }
+  return 0
+)
+
 printf '=== Plan F green-phase verification ===\n'
-for t in t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12; do
+for t in t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t16 t17; do
   msg=$($t 2>&1) && ok "$t" || bad "$t" "${msg:-no detail}"
 done
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

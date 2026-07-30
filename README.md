@@ -79,6 +79,8 @@ The loop never ends in prose. Every run finishes on a machine-readable state:
 
 Every dispatch has an absolute deadline (`MAESTRO_MAX_DISPATCH_SEC`, default 1200 seconds), while the local verifier has its own process-group deadline (`MAESTRO_VERIFY_TIMEOUT_SEC`, default 900 seconds). Cancellation occurs within one poll interval after the dispatch deadline, not exactly at it. Cancelling a write job cannot prove its brokered turn stopped, so Maestro retains and poisons the lease, ends the loop as `BLOCKED`, and does not re-dispatch. Once no Codex job is writing, recover with `bash hooks/implementer-loop.sh --clear-lease` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`). Read-only discussions hold no write lease and are never poisoned.
 
+On every SessionStart source, the hook appends a validated `MAESTRO_SESSION_ID` export to `$CLAUDE_ENV_FILE`. The value is attribution only: the token, PID/process-start identity, and companion job liveness remain the ownership checks. A missing or invalid value is recorded as `unknown`; the session appears in lease metadata, contention/poison messages, and provenance records.
+
 ## Components
 
 Installed under `~/.claude`, plus one shared library they source.
@@ -110,7 +112,7 @@ The output isn't lost either — the converged design, the losing alternatives, 
 <details>
 <summary><b>Write access is scoped by contract, reviewed by diff</b></summary>
 
-Codex really edits your tree — that's the point. It may touch only the files the plan names, must report every file it changed, and *nothing it does is believed* until the orchestrator re-reads the actual `git diff` against the stated goal. Fixes never get silently patched by the orchestrator; they go back to Codex so the diff stays single-author.
+Codex really edits your tree — that's the point. It may touch only the files the plan names, must report every file it changed, and *nothing it does is believed* until the orchestrator re-reads the actual `git diff` against the stated goal. Before its first edit, it must run `git status --short`, report the pre-existing dirty paths, preserve them, and confirm out-of-scope paths stayed untouched; this is an obligation and report, never a dirty-tree gate. Fixes never get silently patched by the orchestrator; they go back to Codex so the diff stays single-author.
 </details>
 
 <details>
@@ -137,7 +139,7 @@ Research flows plan-first: the orchestrator pre-researches and embeds facts befo
 bash tests/run.sh
 ```
 
-Six suites covering the write lease and provenance detection. They drive the real entry points end to end — acquiring real leases, mutating real repositories between dispatches — rather than calling helpers directly, because a gate that tests a component instead of the product path can pass while the feature detects nothing.
+Nine suites covering the write lease and provenance detection. They drive the real entry points end to end — acquiring real leases, mutating real repositories between dispatches — rather than calling helpers directly, because a gate that tests a component instead of the product path can pass while the feature detects nothing.
 
 They are slow on purpose: several suites wait on real lease timeouts.
 
