@@ -22,9 +22,12 @@
 #
 # Error handling: transient job failures are retried (MAESTRO_DISCUSSION_RETRIES,
 # default 2, backoff MAESTRO_RETRY_SLEEP seconds, default 5) — read-only retries
-# are free. Hangs are NOT auto-retried (a hang is usually prompt-induced). A
-# per-transcript lock stops two turns racing; an orphaned Claude turn (dispatch
-# died before the reply) is replaced, not duplicated, on the next --turn.
+# are free. Hangs are NOT auto-retried (a hang is usually prompt-induced). Every
+# dispatch also has an absolute cap (MAESTRO_MAX_DISPATCH_SEC, default 1200s);
+# cancellation occurs within one poll interval after that deadline. Read-only
+# turns are never poisoned because they hold no write lease. A per-transcript
+# lock stops two turns racing; an orphaned Claude turn (dispatch died before the
+# reply) is replaced, not duplicated, on the next --turn.
 #
 # Exit codes: 0 = reply printed | 5 = round cap | 124 = hung, cancelled
 #             3 = could not start / bad args | 4 = job failed after retries

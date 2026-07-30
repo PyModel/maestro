@@ -11,6 +11,14 @@ function appendCall(line) {
   }
 }
 
+function growLog() {
+  const file = process.env.MAESTRO_TEST_LOGFILE;
+  const bytes = Number(process.env.MAESTRO_TEST_LOG_GROWTH ?? "0");
+  if (file && Number.isInteger(bytes) && bytes > 0) {
+    fs.appendFileSync(file, "x".repeat(bytes));
+  }
+}
+
 if (command === "--help") {
   console.log(`Usage:
   node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]`);
@@ -18,6 +26,7 @@ if (command === "--help") {
 }
 
 if (command === "task") {
+  appendCall(`task ${args.join(" ")}`);
   if (process.env.MAESTRO_TEST_ARGV) {
     fs.writeFileSync(
       process.env.MAESTRO_TEST_ARGV,
@@ -35,6 +44,7 @@ if (command === "task") {
 
 if (command === "status" && args[0] === "--all" && args[1] === "--json") {
   appendCall("status --all --json");
+  growLog();
   const statusFile = process.env.MAESTRO_TEST_STATUS;
   if (!statusFile) {
     process.exit(1);
@@ -46,15 +56,20 @@ if (command === "status" && args[0] === "--all" && args[1] === "--json") {
 
 if (command === "status" && args.at(-1) === "--json") {
   appendCall(`status ${args.join(" ")}`);
+  growLog();
   const status = process.env.MAESTRO_TEST_JOB_PHASE ?? "completed";
-  console.log(JSON.stringify({
+  const value = {
     id: args[0],
     status,
     phase: status === "running" ? "running" : "done",
     elapsed: "1s",
     progressPreview: [],
     request: { model: "gpt-5.6-sol", effort: "high" }
-  }));
+  };
+  if (process.env.MAESTRO_TEST_LOGFILE) {
+    value.logFile = process.env.MAESTRO_TEST_LOGFILE;
+  }
+  console.log(JSON.stringify(value));
   process.exit(0);
 }
 

@@ -33,7 +33,9 @@ Write access is real — Codex edits your working tree directly. Scope the plan 
 
 Write-mode dispatches also hold a workspace lock. A lock-contention `BLOCKED` names the holding job and PID; wait for that job to finish. Never break the lock by hand. Read-only discussion turns do not take this lock.
 
-The watchdog layer auto-cancels after 5 minutes of no progress — the loop counts a hang as a failed attempt and re-dispatches with the evidence.
+Both 5 minutes without log growth and the absolute per-dispatch deadline (`MAESTRO_MAX_DISPATCH_SEC`, default 1200 seconds) cancel a job. Cancellation occurs within one poll interval after the deadline, not exactly at it. Nothing observable from the shell proves a brokered turn stopped, so a write-mode cancellation retains the lease and ends the run instead of re-dispatching. Once no Codex job is writing, clear it with `bash hooks/implementer-loop.sh --clear-lease` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`). Read-only debate turns hold no write lease, are never poisoned, and can be retried normally.
+
+Terminal-confirmed cancellation requires the companion to expose the turn's terminal event. That is an upstream capability Maestro cannot observe from the shell.
 
 **Research flows both ways, with two sources of truth.** Codex's built-in web search is disabled (that was the hang source), but its configured **MCP tools (tavily, context7, …) are available to both loops** for version-sensitive facts: library versions, API changes, current docs. The discipline:
 
@@ -90,7 +92,7 @@ The loop exits with a machine-readable `LOOP_STATE` (and the underlying Codex ru
   For the permitted class, answer, append both the answers **and the run's `CONTINUATION:` capsule** to the plan file, and re-run the loop in the same turn without waiting for the user. Report what you answered and why it was inside the authority; do not ask for permission you already have.
   The answer round is a fresh loop invocation. `implementer-loop.sh` keeps its attempts log in a `mktemp` that `cleanup()` deletes on the `NEEDS_ANSWERS` exit, so nothing survives the stop on its own. The plan file is the only thing the next run reads; if the capsule is not appended there, the work is genuinely lost.
   Deliberately do not resume the stopped Codex thread: the companion's `--resume` is a plain alias for `--resume-last`, which resolves the newest finished task thread for the workspace. A discussion turn has the same `jobClass: "task"` as implementation, so it can silently bind an answer to the wrong thread.
-- **BLOCKED** (exit 11) — missing access, credentials, a destructive step, or write-lock contention. Surface it; never improvise around it. Lock contention names the holding job; wait for that job instead of breaking its lock.
+- **BLOCKED** (exit 11) — missing access, credentials, a destructive step, write-lock contention, or a cancelled write whose quiescence is unconfirmed. Surface it; never improvise around it. Lock contention names the holding job; wait for that job instead of breaking its lock. For an unconfirmed cancellation, first establish that no Codex job is writing, then use the documented `--clear-lease` command.
 - **STUCK** (exit 12) — the iteration cap hit without verified completion. Never just raise `--max-iters`: read the attempts log, and if the root cause is not obvious, take the evidence to a **debugging discussion** first (hypothesis + actual output; let Codex try to break it) — a duel beats a blind re-plan. Then re-plan around the actual failing output and run the loop again.
 
 Single-shot watchdog runs (the fallback) end with one RESULT line. Handle each:
@@ -139,6 +141,8 @@ Content, not refs, is what the next job reads — and anchoring to refs made the
 The digest value is self-describing (`tree-v2:…`). A reader takes the **newest** record and *then* inspects the prefix: an unrecognised or `unavailable` value means **no observation** — never equal, never unequal. Selecting records by prefix instead would skip past newer records to a stale comparable one and manufacture the gap this exists to avoid. One consequence, and it is correct: the first dispatch after a digest-version change finds no comparable baseline, says nothing, and establishes a new one.
 
 Read a gap as *state diverged*, never as *the orchestrator cheated*. Lease metadata delimits an interval; it never identifies which process performed the write. The gap is recorded to `<common-git-dir>/maestro-provenance.log` and the observed state adopted, so it reports once rather than alarming forever — it does not block, and it never changes `LOOP_STATE` or an exit code.
+
+A cancelled job may have left edits it never reported, so the tree can contain work with no report describing it. The provenance digest proves that the materialized tree changed; it never proves the job's intent completed.
 
 A second line covers the one interval Maestro genuinely cannot observe. When a later dispatch steals an orphaned lease, everything between the orphan's last write and the steal is unattributable — Maestro cannot see when the orphan stopped. Rather than resolve that in the orphan's favour, the synthesized record is typed `orphan-adopted` and, when the tree moved, says so:
 

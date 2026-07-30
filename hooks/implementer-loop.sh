@@ -12,12 +12,18 @@
 # Usage:
 #   implementer-loop.sh --plan <plan-file> --verify "<command>"
 #                       [--max-iters N] [--max-idle S] [--poll S]
+#   implementer-loop.sh --clear-lease
 #
 #   --plan       the five-part plan file (same contract as the watchdog --file)
 #   --verify     command run LOCALLY after every RESULT: DONE claim. Exit 0 = pass.
 #                Required: the loop's whole point is that Codex's word is not proof.
 #   --max-iters  cap on dispatch rounds (default 4). 0 is prohibited — an
 #                unbounded write loop is a runaway, not autonomy.
+#   --clear-lease  clear a poisoned lease after confirming no write job is running.
+#
+# MAESTRO_MAX_DISPATCH_SEC caps each Codex dispatch (default 1200).
+# Cancellation occurs within one --poll interval after that deadline.
+# MAESTRO_VERIFY_TIMEOUT_SEC caps each local verifier process group (default 900).
 #
 # Exit codes: 0  = verified done
 #             10 = NEEDS_ANSWERS (questions on stdout — relay to user, append
@@ -36,7 +42,7 @@ progress_init
 
 FINAL_STATE="INTERRUPTED"
 FINAL_RC=4
-ATTEMPTS=""; DISPATCH=""; ERRF=""
+ATTEMPTS=""; DISPATCH=""; ERRF=""; VOUTF=""
 maestro_finish() {
   FINAL_STATE="$1"
   FINAL_RC="$2"
@@ -50,6 +56,7 @@ cleanup() {
   [ -n "$ATTEMPTS" ] && rm -f "$ATTEMPTS"
   [ -n "$DISPATCH" ] && rm -f "$DISPATCH"
   [ -n "$ERRF" ] && rm -f "$ERRF"
+  [ -n "$VOUTF" ] && rm -f "$VOUTF"
   write_lock_release
   progress "MAESTRO_FINAL: LOOP $FINAL_STATE rc=$FINAL_RC"
   exit "$FINAL_RC"
@@ -57,7 +64,7 @@ cleanup() {
 trap cleanup EXIT
 trap maestro_interrupt HUP INT TERM
 
-PLAN=""; VERIFY=""; MAX_ITERS=4; MAX_IDLE=300; POLL=20
+PLAN=""; VERIFY=""; MAX_ITERS=4; MAX_IDLE=300; POLL=20; CLEAR_LEASE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --plan)
@@ -75,14 +82,72 @@ while [ $# -gt 0 ]; do
     --poll)
       [ $# -ge 2 ] || { echo "LOOP_ERROR: --poll needs seconds" >&2; maestro_finish "FAILED" 3; }
       POLL="$2"; shift 2 ;;
+    --clear-lease)
+      CLEAR_LEASE=1; shift ;;
     *) echo "LOOP_ERROR: unknown argument: $1" >&2; maestro_finish "FAILED" 3 ;;
   esac
 done
+
+if [ "$CLEAR_LEASE" -eq 1 ]; then
+  lock_path=$(write_lock_path) || {
+    echo "LOOP_ERROR: could not resolve the write lock path" >&2
+    maestro_finish "FAILED" 3
+  }
+  metadata="$lock_path/metadata"
+  staged_metadata="$lock_path/metadata.new"
+  poison_metadata="$metadata"
+  quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
+  if [ "$quiescence" != "unconfirmed" ] &&
+    [ -e "$staged_metadata" ]; then
+    poison_metadata="$staged_metadata"
+    quiescence=unconfirmed
+  fi
+  if [ ! -d "$lock_path" ] || [ "$quiescence" != "unconfirmed" ]; then
+    progress "MAESTRO_LOCK: no poisoned write lease to clear at $lock_path"
+    maestro_finish "CLEARED" 0
+  fi
+  poisoned_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
+  poisoned_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
+  writers=$(write_lock_workspace_writers)
+  writers_rc=$?
+  running_job=""
+  if [ "$writers_rc" -eq 0 ]; then
+    running_job=$(printf '%s\n' "$writers" |
+      awk '$2 == "true" { print $1; exit }')
+  fi
+  if [ "$writers_rc" -eq 4 ] || [ -n "$running_job" ]; then
+    progress "MAESTRO_LOCK: refusing to clear — a write-capable job is still running (${running_job:-unknown})"
+    maestro_finish "BLOCKED" 11
+  fi
+  if [ -e "$staged_metadata" ]; then
+    progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path, removing: $staged_metadata)"
+  else
+    progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path)"
+  fi
+  if ! rm -f "$metadata" 2>/dev/null ||
+    ! rm -rf "$staged_metadata" 2>/dev/null ||
+    ! rmdir "$lock_path" 2>/dev/null; then
+    progress "MAESTRO_LOCK: failed to clear poisoned write lease at $lock_path"
+    maestro_finish "BLOCKED" 11
+  fi
+  maestro_finish "CLEARED" 0
+fi
 
 [ -n "$PLAN" ] && [ -f "$PLAN" ] || { echo "LOOP_ERROR: --plan <file> required and must exist" >&2; maestro_finish "FAILED" 3; }
 [ -n "$VERIFY" ] || { echo "LOOP_ERROR: --verify \"<command>\" required — RESULT: DONE is a claim, not proof" >&2; maestro_finish "FAILED" 3; }
 [ "$MAX_ITERS" -ge 1 ] 2>/dev/null || { echo "LOOP_ERROR: --max-iters must be >= 1 (0 is prohibited)" >&2; maestro_finish "FAILED" 3; }
 [ -f "$WATCHDOG" ] || { echo "LOOP_ERROR: implementer-watchdog.sh not found next to this script" >&2; maestro_finish "FAILED" 3; }
+
+VERIFY_TIMEOUT="${MAESTRO_VERIFY_TIMEOUT_SEC-900}"
+verify_timeout_invalid=0
+case "$VERIFY_TIMEOUT" in
+  ''|*[!0-9]*) verify_timeout_invalid=1 ;;
+  *) [ "$VERIFY_TIMEOUT" -ge 1 ] 2>/dev/null || verify_timeout_invalid=1 ;;
+esac
+if [ "$verify_timeout_invalid" -eq 1 ]; then
+  progress "MAESTRO_VERIFY: ignoring invalid MAESTRO_VERIFY_TIMEOUT_SEC=$VERIFY_TIMEOUT; using 900s"
+  VERIFY_TIMEOUT=900
+fi
 
 write_lock_acquire
 lock_rc=$?
@@ -93,6 +158,7 @@ fi
 
 ATTEMPTS=$(mktemp /tmp/maestro-attempts.XXXXXXXX)
 ERRF=$(mktemp /tmp/maestro-looperr.XXXXXXXX)
+VOUTF=$(mktemp /tmp/maestro-verify.XXXXXXXX)
 
 i=0
 while [ "$i" -lt "$MAX_ITERS" ]; do
@@ -121,6 +187,13 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
     maestro_finish "FAILED" 3
   fi
 
+  if [ "$rc" -eq 125 ]; then
+    MAESTRO_LOCK_RETAIN=1
+    printf '%s\n' "$OUT"
+    progress "LOOP_STATE: BLOCKED after $i iteration(s) — write lease retained because turn quiescence was never confirmed; clear it with --clear-lease once no Codex job is writing."
+    maestro_finish "BLOCKED" 11
+  fi
+
   STATE=$(printf '%s' "$OUT" | grep -oE '^RESULT:[[:space:]]*(DONE|NEEDS_ANSWERS|BLOCKED|FAILED)' | head -1 | sed 's/^RESULT:[[:space:]]*//')
 
   if { [ "$rc" -eq 124 ] || [ "$rc" -ne 0 ]; } &&
@@ -145,16 +218,51 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
     DONE)
       progress "LOOP: RESULT: DONE on iteration $i — verifying locally: $VERIFY"
       # Close FD 3 so verifier progress re-points to stdout and lands in VOUT instead of the operator channel.
-      VOUT=$(bash -c "$VERIFY" 2>&1 3>&-)
+      : > "$VOUTF"
+      set -m
+      bash -c "$VERIFY" > "$VOUTF" 2>&1 3>&- &
+      vpid=$!
+      vstarted=$(date +%s)
+      vtimed_out=0
+      while kill -0 "$vpid" 2>/dev/null; do
+        vtotal=$(( $(date +%s) - vstarted ))
+        if [ "$vtotal" -ge "$VERIFY_TIMEOUT" ]; then
+          vtimed_out=1
+          break
+        fi
+        sleep 1
+      done
+      if [ "$vtimed_out" -eq 1 ]; then
+        kill -TERM -"$vpid" 2>/dev/null || :
+        vwait=0
+        while kill -0 -"$vpid" 2>/dev/null && [ "$vwait" -lt 5 ]; do
+          sleep 1
+          vwait=$((vwait + 1))
+        done
+        kill -KILL -"$vpid" 2>/dev/null || :
+      fi
+      wait "$vpid" 2>/dev/null
       vrc=$?
+      set +m
+      VOUT=$(cat "$VOUTF")
+      if [ "$vtimed_out" -eq 1 ]; then
+        vrc=124
+      fi
       if [ "$vrc" -eq 0 ]; then
         printf '%s\n' "$OUT"
         progress "LOOP_STATE: VERIFIED_DONE after $i iteration(s) — local verification passed."
         maestro_finish "VERIFIED_DONE" 0
       fi
-      printf '\n## Attempt %s — claimed DONE but LOCAL verification failed (exit %s): %s\n%s\n' \
-        "$i" "$vrc" "$VERIFY" "$(printf '%s' "$VOUT" | tail -n 60)" >> "$ATTEMPTS"
-      progress "LOOP: iteration $i claimed DONE but verification failed (exit $vrc) — re-dispatching with the output"
+      if [ "$vtimed_out" -eq 1 ]; then
+        printf '\n## Attempt %s — claimed DONE but LOCAL verification timed out after %ss (exit %s): %s\n%s\n' \
+          "$i" "$VERIFY_TIMEOUT" "$vrc" "$VERIFY" \
+          "$(printf '%s' "$VOUT" | tail -n 60)" >> "$ATTEMPTS"
+        progress "LOOP: iteration $i claimed DONE but verification timed out after ${VERIFY_TIMEOUT}s — re-dispatching with the output"
+      else
+        printf '\n## Attempt %s — claimed DONE but LOCAL verification failed (exit %s): %s\n%s\n' \
+          "$i" "$vrc" "$VERIFY" "$(printf '%s' "$VOUT" | tail -n 60)" >> "$ATTEMPTS"
+        progress "LOOP: iteration $i claimed DONE but verification failed (exit $vrc) — re-dispatching with the output"
+      fi
       ;;
     FAILED|"")
       label="RESULT: FAILED"
