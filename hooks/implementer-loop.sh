@@ -293,8 +293,16 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
 
   case "$STATE" in
     NEEDS_ANSWERS)
+      persistence_note="the stop report could not be appended to $PLAN"
+      if [ -w "$PLAN" ] &&
+        printf '\n\n--- BEGIN MAESTRO STOP HISTORY (automatically written after iteration %s) ---\n%s\n--- END MAESTRO STOP HISTORY (iteration %s) ---\n' \
+          "$i" "$OUT" "$i" >> "$PLAN"; then
+        persistence_note="the stop report has been appended to $PLAN"
+      else
+        progress "LOOP_WARNING: could not append the stop report to plan file $PLAN; continuing with exit 10."
+      fi
       printf '%s\n' "$OUT"
-      progress "LOOP_STATE: NEEDS_ANSWERS after $i iteration(s) — relay the QUESTIONS verbatim to the user, append the answers to the plan file, and re-run this loop."
+      progress "LOOP_STATE: NEEDS_ANSWERS after $i iteration(s) — $persistence_note; relay the QUESTIONS verbatim to the user, answer the questions, and re-run this loop."
       maestro_finish "NEEDS_ANSWERS" 10 ;;
     BLOCKED)
       printf '%s\n' "$OUT"

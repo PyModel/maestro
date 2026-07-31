@@ -23,6 +23,8 @@ else
 preflight.sh
 lease.sh
 liveness.sh
+stop-report.sh
+bounded-calls.sh
 shared-git-dir.sh
 detection.sh
 orphan-lifecycle.sh
