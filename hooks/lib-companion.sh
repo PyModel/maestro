@@ -19,12 +19,12 @@
 #   companion_verify_pin <C> <job> <model> <effort> → returns 0 match | 4 mismatch
 #   companion_workspace_writers <C>        → prints job<TAB>write, or returns 4
 #   companion_poll  <C> <job> <idle> <sec> → returns 0 done | 4 failed | 124 read-only timeout
-#                                             | 125 write timeout | 6 status-lost
+#                                             | 125 write timeout
 #   companion_result <C> <job>             → prints result (retried), or returns 4
 #
 # Error-handling contract: a companion that cannot answer `status` 4 times in a row
-# is declared lost (6) instead of being polled forever; an empty `result` is fetched
-# once more before being declared a failure. Hangs are cancelled by the poll itself.
+# is cancelled instead of being polled forever; an empty `result` is fetched once
+# more before being declared a failure. Hangs are cancelled by the poll itself.
 
 progress_init() {
   if ! { true >&3; } 2>/dev/null; then exec 3>&1; fi
@@ -175,7 +175,7 @@ repo_digest() {
 
 run_bounded() {
   local timeout="$1" label="$2" default="${run_bounded_default-120}"
-  local invalid output pid elapsed timed_out grace rc
+  local invalid output pid elapsed timed_out grace rc start hb
   shift 2
   invalid=0
   case "$timeout" in
@@ -195,16 +195,22 @@ run_bounded() {
   pid=$!
   set +m
 
+  start=$SECONDS
+  hb=0
   elapsed=0
   timed_out=0
   while kill -0 "$pid" 2>/dev/null; do
+    elapsed=$((SECONDS - start))
     if [ "$elapsed" -ge "$timeout" ]; then
       timed_out=1
       break
     fi
-    sleep 1
-    write_lock_heartbeat_write
-    elapsed=$((elapsed + 1))
+    sleep 0.1
+    hb=$((hb + 1))
+    if [ "$hb" -ge 10 ]; then
+      write_lock_heartbeat_write
+      hb=0
+    fi
   done
   if [ "$timed_out" -eq 1 ]; then
     kill -TERM -"$pid" 2>/dev/null || :
@@ -1092,17 +1098,8 @@ companion_verify_pin() {
   return 4
 }
 
-companion_cancel_job() { # C JOB REASON → 124 read-only, 125 write-mode
-  local C="$1" JOB="$2" REASON="$3" ST pid log write_mode=0
-  ST=$(companion_call "$C" status "$JOB" --json 2>/dev/null) || ST=""
-  pid=$(printf '%s\n' "$ST" |
-    grep -oE '"pid"[[:space:]]*:[[:space:]]*(null|[0-9]+)' |
-    head -1 |
-    sed -E 's/^"pid"[[:space:]]*:[[:space:]]*//')
-  log=$(printf '%s' "$ST" |
-    sed -n 's/.*"logFile"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-    head -1)
-  [ "$pid" = "null" ] && pid=""
+companion_cancel_job() { # C JOB REASON LOG → 124 read-only, 125 write-mode
+  local C="$1" JOB="$2" REASON="$3" log="$4" crc write_mode=0
   MAESTRO_CANCEL_REASON="$REASON"
   MAESTRO_CANCEL_REQUESTED=0
   if write_lock_is_owner; then
@@ -1114,8 +1111,9 @@ companion_cancel_job() { # C JOB REASON → 124 read-only, 125 write-mode
     fi
   fi
   companion_call "$C" cancel "$JOB" >/dev/null 2>&1
-  MAESTRO_CANCEL_REQUESTED=1
-  progress "MAESTRO_POLL: cancelled reason=$REASON job=$JOB pid=${pid:-unknown} log=${log:-unknown}"
+  crc=$?
+  if [ "$crc" -eq 125 ]; then MAESTRO_CANCEL_REQUESTED=0; else MAESTRO_CANCEL_REQUESTED=1; fi
+  progress "MAESTRO_POLL: cancel attempted reason=$REASON job=$JOB log=${log:-unknown}"
   if [ "$write_mode" -eq 1 ]; then
     if ! mv -f "$MAESTRO_LOCK_DIR/metadata.new" "$MAESTRO_LOCK_DIR/metadata"; then
       progress "MAESTRO_LOCK: poison metadata rename failed; retaining $MAESTRO_LOCK_DIR/metadata.new as the fail-closed marker"
@@ -1143,13 +1141,14 @@ companion_poll() {
   while :; do
     sleep "$POLL"
     write_lock_heartbeat_write
-    total=$(( $(date +%s) - poll_started ))
     ST=$(companion_call "$C" status "$JOB" --json 2>/dev/null)
+    total=$(( $(date +%s) - poll_started ))
     if [ -z "$ST" ]; then
       sfails=$((sfails + 1))
-      if [ "$sfails" -ge 4 ]; then
-        printf 'companion status unreachable 4x in a row; giving up on %s' "$JOB" >&2
-        return 6
+      if [ "$sfails" -ge 4 ] || [ "$total" -ge "$MAX_TOTAL" ]; then
+        progress "MAESTRO_POLL: companion status unreachable ${sfails}x in a row for $JOB; cancelling and failing closed"
+        companion_cancel_job "$C" "$JOB" status-lost "$LOG"
+        return $?
       fi
       continue
     fi
@@ -1243,11 +1242,11 @@ companion_poll() {
     fi
 
     if [ "$total" -ge "$MAX_TOTAL" ]; then
-      companion_cancel_job "$C" "$JOB" deadline
+      companion_cancel_job "$C" "$JOB" deadline "$LOG"
       return $?
     fi
     if [ "$idle" -ge "$MAX_IDLE" ]; then
-      companion_cancel_job "$C" "$JOB" idle
+      companion_cancel_job "$C" "$JOB" idle "$LOG"
       return $?
     fi
   done

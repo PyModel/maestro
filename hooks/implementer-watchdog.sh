@@ -191,16 +191,13 @@ case "$rc" in
   125)
     reason=${MAESTRO_CANCEL_REASON:-unknown}
     if [ "${MAESTRO_CANCEL_REQUESTED:-1}" -eq 0 ]; then
-      progress "WATCHDOG_POISONED: job $JOB was not cancelled because poison metadata could not be staged and may still be running; the write lease is retained and this run is over."
+      progress "WATCHDOG_POISONED: job $JOB was not confirmed cancelled and may still be running; the write lease is retained and this run is over."
     else
       progress "WATCHDOG_POISONED: job $JOB was cancelled ($reason) and turn quiescence could not be confirmed; the write lease is retained and this run is over."
     fi
     progress "WATCHDOG_POISONED: recover only after no Codex job is writing: bash hooks/implementer-loop.sh --clear-lease (installed path: bash ~/.claude/hooks/implementer-loop.sh --clear-lease)"
     printf 'RESULT: BLOCKED\n'
     maestro_finish "POISONED" 125 ;;
-  6)
-    echo "WATCHDOG_FAILED: companion status unreachable; job $JOB state unknown. Check the tree before re-dispatching." >&2
-    maestro_finish "FAILED" 4 ;;
   *)
     echo "WATCHDOG_FAILED: job $JOB ended failed. Re-dispatch with the failure evidence, or ask the user." >&2
     maestro_finish "FAILED" 4 ;;

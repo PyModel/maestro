@@ -33,6 +33,15 @@ wait_for_pid() {
   [ "$WAIT_TIMED_OUT" -eq 0 ] || WAIT_RC=124
 }
 
+milliseconds_now() {
+  local value
+  value=$(date +%s%N 2>/dev/null) || value=""
+  case "$value" in
+    ''|*[!0-9]*) python3 -c 'import time; print(int(time.time()*1000))' ;;
+    *) printf '%s\n' "$((value / 1000000))" ;;
+  esac
+}
+
 # shellcheck source=../hooks/lib-companion.sh
 source "$ROOT/hooks/lib-companion.sh"
 progress_init
@@ -124,6 +133,8 @@ t5_repo_digest_survives_refactor() {
 
 t6_poll_hanging_status_is_bounded() {
   local timeout=1 output="$TEST_ROOT/poll-hanging-status.out" pid
+  # This check expects read-only rc=124; an inherited write lease would be poisoned by the fixture job id.
+  unset MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_ACQUIRED
   set -m
   (
     export MAESTRO_COMPANION_TIMEOUT_SEC="$timeout"
@@ -135,10 +146,49 @@ t6_poll_hanging_status_is_bounded() {
   wait_for_pid "$pid" 18
   [ "$WAIT_TIMED_OUT" -eq 0 ] ||
     { echo "poll exceeded 18s outer bound"; return 1; }
-  [ "$WAIT_RC" -eq 6 ] ||
-    { echo "rc=$WAIT_RC want 6 from four consecutive empty statuses"; return 1; }
+  [ "$WAIT_RC" -eq 124 ] ||
+    { echo "rc=$WAIT_RC want 124 from read-only status-loss cancellation"; return 1; }
   grep -q "MAESTRO_COMPANION: timed out after ${timeout}s" "$output" ||
     { echo "timeout progress missing: $(tr '\n' ' ' < "$output")"; return 1; }
+}
+
+t7_fast_status_has_no_one_second_floor() {
+  local started finished elapsed i
+  unset MAESTRO_TEST_STATUS_HANG
+  started=$(milliseconds_now) || return 1
+  for i in 1 2 3 4 5; do
+    companion_call "$FIXTURE" status task-bounded0-aaaaaa --json >/dev/null ||
+      { echo "status call $i failed"; return 1; }
+  done
+  finished=$(milliseconds_now) || return 1
+  elapsed=$((finished - started))
+  printf 'MEASURE 5 fast status calls: %sms\n' "$elapsed" >&3
+  [ "$elapsed" -lt 2000 ] ||
+    { echo "5 status calls took ${elapsed}ms want under 2000ms"; return 1; }
+}
+
+t8_t6_scrubs_an_inherited_lease() {
+  local lease="$TEST_ROOT/injected-lease" output="$TEST_ROOT/t6-inherited.out" rc
+  mkdir "$lease" || return 1
+  cat > "$lease/metadata" <<'EOF' || return 1
+token=faketoken
+pid=1
+process_start=x
+job_id=fakejob
+session_id=fakesess
+started_at=2026-01-01T00:00:00Z
+started_epoch=1767225600
+digest_before=unavailable
+EOF
+  export MAESTRO_LOCK_ACQUIRED=1
+  export MAESTRO_LOCK_TOKEN=faketoken
+  export MAESTRO_LOCK_DIR="$lease"
+  t6_poll_hanging_status_is_bounded > "$output" 2>&1
+  rc=$?
+  unset MAESTRO_LOCK_ACQUIRED MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR
+  [ "$rc" -eq 0 ] || { cat "$output"; return 1; }
+  ! grep -q '^quiescence=unconfirmed$' "$lease/metadata" ||
+    { echo "injected lease was poisoned"; return 1; }
 }
 
 check() {
@@ -157,5 +207,7 @@ check t3_run_bounded_returns_wrapped_rc "bounded runner preserves stdout and com
 check t4_invalid_companion_timeout_falls_back "invalid companion timeout falls back to 120s"
 check t5_repo_digest_survives_refactor "bounded repository digest still returns tree-v2"
 check t6_poll_hanging_status_is_bounded "poll loop bounds repeated hanging statuses"
+check t7_fast_status_has_no_one_second_floor "five fast status calls finish under two seconds"
+check t8_t6_scrubs_an_inherited_lease "t6 scrubs an inherited write lease"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
