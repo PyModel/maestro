@@ -33,7 +33,7 @@ Write access is real — Codex edits your working tree directly. Scope the plan 
 
 Write-mode dispatches also hold a workspace lock. Contention waits rather than failing at once: an acquire blocks up to `MAESTRO_LOCK_WAIT_SEC` (default 300 seconds, `0` restores immediate failure) while the lease has a confirmed release path. A `BLOCKED` therefore means the lease was *not* queueable — poisoned, malformed, of unconfirmed identity, or with a spent stale-break budget — and it names the holding job and PID. The blocked contender also reports whether the holder's heartbeat is fresh or stale. A stale heartbeat never transfers ownership: confirm that process is finished, kill it yourself if it is wedged, and only then run `bash hooks/implementer-loop.sh --clear-lease`; that command independently refuses while any write-capable job is still running. Never break the lock by hand. Read-only discussion turns do not take this lock.
 
-Both 5 minutes without log growth and the absolute per-dispatch deadline (`MAESTRO_MAX_DISPATCH_SEC`, default 1200 seconds) cancel a job. Cancellation occurs within one poll interval after the deadline, not exactly at it. Nothing observable from the shell proves a brokered turn stopped, so a write-mode cancellation retains the lease and ends the run instead of re-dispatching. Once no Codex job is writing, clear it with `bash hooks/implementer-loop.sh --clear-lease` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`). Read-only debate turns hold no write lease, are never poisoned, and can be retried normally.
+Both 5 minutes without log growth and the absolute per-dispatch deadline (`MAESTRO_MAX_DISPATCH_SEC`, default 1200 seconds) cancel a job; `MAESTRO_COMPANION_TIMEOUT_SEC` bounds every companion call (default 120 seconds), so a wedged companion or broker cannot block the poll loop indefinitely where neither guard can fire. Cancellation is detected after the poll interval plus the bounded status call, for a worst-case lag of roughly `POLL + MAESTRO_COMPANION_TIMEOUT_SEC`; a timeout at that poll site produces an empty status and enters the existing status-lost path, which gives up after four consecutive failures. Nothing observable from the shell proves a brokered turn stopped, so a write-mode cancellation retains the lease and ends the run instead of re-dispatching. Once no Codex job is writing, clear it with `bash hooks/implementer-loop.sh --clear-lease` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`). Read-only debate turns hold no write lease, are never poisoned, and can be retried normally.
 
 Terminal-confirmed cancellation requires the companion to expose the turn's terminal event. That is an upstream capability Maestro cannot observe from the shell.
 
@@ -97,6 +97,42 @@ Three more recurring costs, from the implementer's side of the boundary:
 - **State the expected RED explicitly.** Give the exit code and the output that means "correctly failing" for any test-first step, or a passing-by-accident run reads as success.
 - **Grant every test and fixture path the verification touches.** A file-scope contract that omits the fixture the named test loads is correctly refused, and that refusal costs a round. (See also `[[plan-scope-grants-prevent-stuck]]`.)
 
+### Every check you name must be able to fail, and you must have watched it fail
+
+A check that passes both before and after the change is a defect in the check, whatever the
+underlying property is doing. Seven shipped in a single day, all authored here, none caught by
+anything but habit: a `restore-keys` claim that asserted a belief rather than a behaviour; a
+"each pinned version appears once" count that was factually unsatisfiable; a
+`git diff --stat -- hooks/` emptiness test that was unsatisfiable against a legitimately dirty tree
+*and* passed on a tree where nothing had been done yet; a check that a step carried no `if:` guard,
+which passed because the step did not exist; a `git grep` anchored on a full URL that matched 51 of
+52 files; `git -C <missing-dir> status --porcelain`, which prints nothing and reads as clean; and
+`make generate-go && git diff --exit-code`, which cannot separate regeneration drift from a dirty
+tree. Two of them cost a full round each.
+
+This is an authoring defect, not an implementer defect. The implementer never sees `--verify` — the
+loop runs it locally, after the mutation — so no contract clause on Codex's side can catch it. It is
+caught here or not at all.
+
+**Before you dispatch, construct one controlled counterexample that each change-specific check
+rejects, run it, and keep the actual exit code and output.** The unchanged tree is the usual
+counterexample, but not the only one: for a check guarding an already-satisfied invariant, mutate the
+subject instead. *"It must fail on the unchanged tree"* is the wrong rule — it condemns every check
+whose property already holds. The right rule is that some reachable state must make it red, and you
+have seen that state make it red.
+
+**Structural checks carry two extra obligations**, because they are the ones that fail silently:
+
+- **Prove the subject exists.** `select(.name == "…")` against an absent step, a `grep` over a file
+  that moved, a `git -C` into a missing directory — each yields the empty set, and the empty set
+  satisfies almost any assertion you build on it. Assert the count first, then the property.
+- **Preserve command status.** `cmd && echo ok` on one line and a bare `echo ok` on the next produce
+  identical output and opposite meanings. Run assertion blocks under `set -euo pipefail`, or make
+  every check exit non-zero on its own.
+
+If you cannot construct a state that makes a check go red, that check cannot justify
+`VERIFIED_DONE`. Strengthen it or drop it — do not carry it as reassurance.
+
 **Codex has no DNS.** Its sandbox cannot reach the network, and its built-in web search is disabled. You have network, so every external fact — library versions, API shapes, current docs — is researched by you *before* dispatching and embedded in the plan. Its configured MCP tools remain available for version-sensitive lookups, capped and stall-prone; a plan that needs no lookups cannot stall on one.
 
 ## The result protocol
@@ -107,8 +143,8 @@ The loop exits with a machine-readable `LOOP_STATE` (and the underlying Codex ru
 
 - **VERIFIED_DONE** (exit 0) — the plan is executed *and* your verify command passed locally. Do not believe it yet — review the diff (below).
 - **NEEDS_ANSWERS** (exit 10) — answer immediately, without routing to the user, **only** in either invariant-preserving case: grant a mechanically necessary adjacent file when the objective, public behavior, and design stay unchanged; or change venue or substitute an equally strong verifier when the environment blocks the stated verifier. Stop and relay the QUESTIONS block verbatim when an answer would stub or fake verification, weaken or waive a gate, cross a design or security boundary, take an irreversible action, or settle a question of product taste. Those decisions belong to the user; speed is not a reason to take them.
-  For the permitted class, answer, append both the answers **and the run's `CONTINUATION:` capsule** to the plan file, and re-run the loop in the same turn without waiting for the user. Report what you answered and why it was inside the authority; do not ask for permission you already have.
-  The answer round is a fresh loop invocation. `implementer-loop.sh` keeps its attempts log in a `mktemp` that `cleanup()` deletes on the `NEEDS_ANSWERS` exit, so nothing survives the stop on its own. The plan file is the only thing the next run reads; if the capsule is not appended there, the work is genuinely lost.
+  For the permitted class, answer by appending the answers to the plan file, and re-run the loop in the same turn without waiting for the user. Report what you answered and why it was inside the authority; do not ask for permission you already have.
+  The answer round is a fresh loop invocation, and the plan file is the only thing the next run reads. **The loop now persists the stop report itself**: on the `NEEDS_ANSWERS` exit it appends the run's full report — questions and `CONTINUATION:` capsule — to the plan inside a delimited `MAESTRO STOP HISTORY` block, so the completed work survives the stop without a manual copy. Do not paste the capsule yourself; it is already there, and a second copy reads as a second instruction. Write only your answers. If the plan file was not writable the loop says so on the progress channel (`LOOP_WARNING`) and still exits 10 — that is the one case where the capsule is lost and you must carry it across by hand. The attempts log remains a `mktemp` that `cleanup()` deletes; it feeds re-dispatch within a run and is deliberately not preserved across one.
   Deliberately do not resume the stopped Codex thread: the companion's `--resume` is a plain alias for `--resume-last`, which resolves the newest finished task thread for the workspace. A discussion turn has the same `jobClass: "task"` as implementation, so it can silently bind an answer to the wrong thread.
 - **BLOCKED** (exit 11) — missing access, credentials, a destructive step, write-lock contention, or a cancelled write whose quiescence is unconfirmed. Surface it; never improvise around it. Contention here means the wait already ran and the lease was not queueable; it names the holding job, so wait for that job instead of breaking its lock. For an unconfirmed cancellation, first establish that no Codex job is writing, then use the documented `--clear-lease` command — and note it now refuses a healthy lease and clears a structurally invalid one, so a `CLEARED` result genuinely means the lock is gone.
 - **STUCK** (exit 12) — the iteration cap hit without verified completion. Never just raise `--max-iters`: read the attempts log, and if the root cause is not obvious, take the evidence to a **debugging discussion** first (hypothesis + actual output; let Codex try to break it) — a duel beats a blind re-plan. Then re-plan around the actual failing output and run the loop again.
