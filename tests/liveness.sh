@@ -562,8 +562,8 @@ t7_read_only_deadline_no_lease() {
     { echo "read-only turn created a write lock"; return 1; }
 }
 
-t8_verifier_deadline() {
-  local repo state pid verify child
+t8_verifier_boundaries() {
+  local repo state pid verify child ownership
   repo=$(new_repo verifier-repo)
   state="$TEST_ROOT/verifier-state"
   mkdir -p "$state"
@@ -596,6 +596,32 @@ t8_verifier_deadline() {
     echo "verifier child $child survived process-group timeout"
     return 1
   fi
+
+  repo=$(new_repo verifier-lease-repo)
+  state="$TEST_ROOT/verifier-lease-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  status_empty > "$state/status.json"
+  verify=". '$ROOT/hooks/lib-companion.sh'; if write_lock_is_owner; then printf '0\n' > '$state/ownership'; exit 1; else printf '1\n' > '$state/ownership'; fi"
+  set -m
+  (
+    cd "$repo" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_PHASE=completed \
+        MAESTRO_TEST_RESULT='RESULT: DONE' \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify "$verify" \
+          --max-iters 1 --poll 2
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  wait_bounded "$pid" 7
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "verifier lease check exceeded 7s bound"; return 1; }
+  ownership=$(sed -n '1p' "$state/ownership" 2>/dev/null)
+  [ "$ownership" = 1 ] ||
+    { echo "write_lock_is_owner returned ${ownership:-no result} inside verifier, want non-zero"; return 1; }
+  [ "$WAIT_RC" -eq 0 ] || { echo "verifier lease check rc=$WAIT_RC want 0"; return 1; }
 }
 
 t9_terminal_at_deadline_harvests() {
@@ -646,7 +672,7 @@ check t4_poison_stops_redispatch "poison prevents a second dispatch"
 check t5_poison_blocks_acquire "poison blocks later acquisition"
 check t6_clear_lease_works_and_refuses "clear-lease clears safely and refuses a live writer"
 check t7_read_only_deadline_no_lease "read-only deadline creates no write lease"
-check t8_verifier_deadline "verifier deadline bounds the process group"
+check t8_verifier_boundaries "verifier deadline bounds the process group and verifier does not own the lease"
 check t9_terminal_at_deadline_harvests "terminal job is harvested at the dispatch deadline"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

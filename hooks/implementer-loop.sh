@@ -313,7 +313,8 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
       # Close FD 3 so verifier progress re-points to stdout and lands in VOUT instead of the operator channel.
       : > "$VOUTF"
       set -m
-      bash -c "$VERIFY" > "$VOUTF" 2>&1 3>&- &
+      env -u MAESTRO_LOCK_ACQUIRED -u MAESTRO_LOCK_TOKEN -u MAESTRO_LOCK_DIR \
+        bash -c "$VERIFY" > "$VOUTF" 2>&1 3>&- &
       vpid=$!
       vstarted=$(date +%s)
       vtimed_out=0

@@ -9,9 +9,30 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 
 PASS=0
 FAIL=0
+WAIT_RC=0
+WAIT_TIMED_OUT=0
 
 ok()  { printf 'PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf 'FAIL  %s — %s\n' "$1" "$2"; FAIL=$((FAIL + 1)); }
+
+wait_for_pid() {
+  local pid="$1" limit="$2" elapsed=0
+  WAIT_TIMED_OUT=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$elapsed" -ge "$limit" ]; then
+      WAIT_TIMED_OUT=1
+      kill -TERM -"$pid" 2>/dev/null || :
+      sleep 1
+      kill -KILL -"$pid" 2>/dev/null || :
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  wait "$pid" 2>/dev/null
+  WAIT_RC=$?
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || WAIT_RC=124
+}
 
 REAL_NODE=$(node -p 'process.execPath')
 REAL_SLEEP=$(command -v sleep)
@@ -21,6 +42,7 @@ COMPANION="$TEST_HOME/.claude/plugins/cache/openai-codex/codex/test/scripts/code
 REPO="$TEST_ROOT/repo"
 NEEDS_PLAN="$REPO/needs-plan.md"
 DONE_PLAN="$REPO/done-plan.md"
+STATUS_LOSS_PLAN="$REPO/status-loss-plan.md"
 STATUS="$TEST_ROOT/status.json"
 mkdir -p "$SHIM" "$(dirname "$COMPANION")" "$TEST_HOME/.codex" "$REPO"
 : > "$COMPANION"
@@ -39,13 +61,14 @@ printf 'high\n' > "$TEST_HOME/.codex/maestro-impl-effort"
 printf '{\n  "running": [],\n  "latestFinished": null\n}\n' > "$STATUS"
 printf 'Objective: stop for answers.\n' > "$NEEDS_PLAN"
 printf 'Objective: finish successfully.\n' > "$DONE_PLAN"
+printf 'Objective: fail closed when status is lost.\n' > "$STATUS_LOSS_PLAN"
 cp "$DONE_PLAN" "$TEST_ROOT/done-plan.before"
 git init -q "$REPO"
 (
   cd "$REPO" &&
     git config user.email p@p &&
     git config user.name p &&
-    git add needs-plan.md done-plan.md &&
+    git add needs-plan.md done-plan.md status-loss-plan.md &&
     git commit -q -m init
 )
 
@@ -74,6 +97,26 @@ run_loop() {
     3> "$TEST_ROOT/$name.progress"
 }
 
+run_status_loss() {
+  local output="$TEST_ROOT/status-loss.out" pid
+  set -m
+  (
+    cd "$REPO" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_LOCK_WAIT_SEC=0 \
+        MAESTRO_COMPANION_TIMEOUT_SEC=1 \
+        MAESTRO_TEST_STATUS_HANG=1 \
+        MAESTRO_TEST_STATUS="$STATUS" \
+        bash "$LOOP" --plan "$STATUS_LOSS_PLAN" --verify true \
+          --max-iters 2 --max-idle 2 --poll 1
+  ) > "$output" 2>&1 3>&1 &
+  pid=$!
+  set +m
+  wait_for_pid "$pid" 18
+  STATUS_LOSS_RC=$WAIT_RC
+  STATUS_LOSS_TIMED_OUT=$WAIT_TIMED_OUT
+}
+
 run_loop needs-first "$NEEDS_PLAN" "$NEEDS_RESULT"
 FIRST_RC=$?
 cp "$NEEDS_PLAN" "$TEST_ROOT/needs-plan.after-first"
@@ -81,6 +124,7 @@ run_loop needs-second "$NEEDS_PLAN" "$NEEDS_RESULT"
 SECOND_RC=$?
 run_loop done "$DONE_PLAN" 'RESULT: DONE'
 DONE_RC=$?
+run_status_loss
 
 t1_needs_answers_exit() {
   [ "$FIRST_RC" -eq 10 ] && [ "$SECOND_RC" -eq 10 ] ||
@@ -130,6 +174,25 @@ t5_verified_done_unchanged() {
     { echo "done plan changed"; return 1; }
 }
 
+t6_status_loss_fails_closed() {
+  local output="$TEST_ROOT/status-loss.out" starts
+  local lock="$REPO/.git/maestro-write.lock" metadata="$REPO/.git/maestro-write.lock/metadata"
+  [ "$STATUS_LOSS_TIMED_OUT" -eq 0 ] ||
+    { echo "status-loss loop exceeded 18s outer bound"; return 1; }
+  starts=$(grep -c 'WATCHDOG: started' "$output" || true)
+  [ "$starts" -eq 1 ] ||
+    { echo "starts=$starts want 1 (loop rc=$STATUS_LOSS_RC)"; return 1; }
+  [ "$STATUS_LOSS_RC" -eq 11 ] ||
+    { echo "rc=$STATUS_LOSS_RC want 11"; return 1; }
+  grep -q '^MAESTRO_FINAL: LOOP BLOCKED rc=11$' "$output" ||
+    { echo "anchored BLOCKED final missing"; return 1; }
+  [ -d "$lock" ] && [ -f "$metadata" ] ||
+    { echo "write lease was not retained"; return 1; }
+  grep -qx 'quiescence=unconfirmed' "$metadata" &&
+    grep -qx 'unconfirmed_reason=status-lost' "$metadata" ||
+    { echo "retained metadata is not poisoned for status loss"; return 1; }
+}
+
 check() {
   local fn="$1" label="$2" detail
   if detail=$("$fn" 2>&1); then
@@ -145,5 +208,6 @@ check t2_first_stop_persisted "first stop appends a delimited history block with
 check t3_questions_relayed "questions remain on stdout"
 check t4_second_stop_appended "second stop appends a second history block"
 check t5_verified_done_unchanged "VERIFIED_DONE appends nothing"
+check t6_status_loss_fails_closed "status loss blocks after one dispatch and retains poison"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
