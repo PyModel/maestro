@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    # The hooks target macOS /bin/bash 3.2; macos-15 ships it as /bin/bash.
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run test suites
+        # /bin first so run.sh's unqualified `bash` resolves to 3.2, not brew bash 5.
+        run: |
+          export PATH="/bin:$PATH"
+          /bin/bash tests/run.sh
