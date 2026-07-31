@@ -4,9 +4,6 @@ set -uo pipefail
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$TEST_DIR/../hooks/lib-companion.sh"
 D=$(mktemp -d)
-LOG="$D/argv.log"
-ERR="$D/stderr.log"
-trap 'rm -rf "$D"' EXIT
 
 pass() {
   printf 'PASS %s: %s\n' "$1" "$2"
@@ -16,6 +13,24 @@ fail() {
   printf 'FAIL %s: %s\n' "$1" "$2"
   exit 1
 }
+
+REAL_NODE=$(node -p 'process.execPath')
+[ -n "$REAL_NODE" ] && [ -x "$REAL_NODE" ] ||
+  fail 0 "cannot resolve a real node binary"
+mkdir -p "$D/shim"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'exec "%s" "$@"\n' "$REAL_NODE"
+} > "$D/shim/node"
+chmod +x "$D/shim/node"
+export PATH="$D/shim:$PATH"
+mkdir -p "$D/home/.codex"
+printf 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\n' > "$D/home/.codex/config.toml"
+printf 'high\n' > "$D/home/.codex/maestro-impl-effort"
+export HOME="$D/home"
+LOG="$D/argv.log"
+ERR="$D/stderr.log"
+trap 'rm -rf "$D"' EXIT
 
 . "$LIB"
 
