@@ -2,8 +2,23 @@
 # The detector must be silent on the workflow it exists to support, still catch
 # unattributed writes, and migrate without manufacturing a gap.
 set -uo pipefail
-LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hooks/lib-companion.sh"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LIB="$ROOT/hooks/lib-companion.sh"
 D=$(mktemp -d /tmp/commitinv.XXXXXX); trap 'rm -rf "$D"' EXIT
+
+REAL_NODE=$(node -p 'process.execPath')
+mkdir -p "$D/shim"
+{ printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$REAL_NODE"; } > "$D/shim/node"
+chmod +x "$D/shim/node"
+export PATH="$D/shim:$PATH"
+COMPANION="$D/home/.claude/plugins/cache/openai-codex/codex/test/scripts/codex-companion.mjs"
+mkdir -p "$(dirname "$COMPANION")" "$D/home/.codex"
+cp "$ROOT/tests/fixtures/fake-companion.mjs" "$COMPANION"
+printf '{\n  "running": [],\n  "latestFinished": null\n}\n' > "$D/status.json"
+export MAESTRO_TEST_STATUS="$D/status.json"
+printf 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\n' > "$D/home/.codex/config.toml"
+printf 'high\n' > "$D/home/.codex/maestro-impl-effort"
+export HOME="$D/home"
 
 mk() { git init -q "$1"; ( cd "$1" && git config user.email p@p && git config user.name p \
   && printf 'a\n' > s.sh && git add -A && git commit -q -m init ); }
