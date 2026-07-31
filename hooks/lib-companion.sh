@@ -173,26 +173,24 @@ repo_digest() {
   printf 'tree-v2:%s\n' "$digest"
 }
 
-repo_digest_bounded() {
-  local timeout invalid scratch output pid elapsed timed_out grace rc result=""
-  timeout=${MAESTRO_DIGEST_TIMEOUT_SEC-120}
+run_bounded() {
+  local timeout="$1" label="$2" default="${run_bounded_default-120}"
+  local invalid output pid elapsed timed_out grace rc
+  shift 2
   invalid=0
   case "$timeout" in
     ''|*[!0-9]*) invalid=1 ;;
     *) [ "$timeout" -ge 1 ] 2>/dev/null || invalid=1 ;;
   esac
   if [ "$invalid" -eq 1 ]; then
-    progress "MAESTRO_DIGEST: ignoring invalid MAESTRO_DIGEST_TIMEOUT_SEC=$timeout; using 120s"
-    timeout=120
+    progress "$label: ignoring invalid timeout_seconds=$timeout; using ${default}s"
+    timeout=$default
   fi
 
-  scratch=$(mktemp -d "${TMPDIR:-/tmp}/maestro-repo-digest-call.XXXXXX") || return 1
-  output="$scratch/output"
+  output=$(mktemp "${TMPDIR:-/tmp}/maestro-bounded-call.XXXXXX") || return 1
   set -m
   (
-    TMPDIR="$scratch"
-    export TMPDIR
-    repo_digest > "$output"
+    "$@" > "$output"
   ) &
   pid=$!
   set +m
@@ -220,11 +218,22 @@ repo_digest_bounded() {
   wait "$pid" 2>/dev/null
   rc=$?
   if [ "$timed_out" -eq 1 ]; then
-    progress "MAESTRO_DIGEST: repository digest timed out after ${timeout}s"
-    rc=1
+    progress "$label: timed out after ${timeout}s"
+    rc=125
   elif [ "$rc" -eq 0 ]; then
-    result=$(cat "$output") || rc=1
+    cat "$output"
   fi
+  rm -f "$output" 2>/dev/null || :
+  return "$rc"
+}
+
+repo_digest_bounded() {
+  local timeout scratch rc result="" run_bounded_default=120
+  timeout=${MAESTRO_DIGEST_TIMEOUT_SEC-120}
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/maestro-repo-digest-call.XXXXXX") || return 1
+  result=$(TMPDIR="$scratch" run_bounded "$timeout" \
+    "MAESTRO_DIGEST: repository digest" repo_digest)
+  rc=$?
   rm -rf "$scratch" || rc=1
   [ "$rc" -eq 0 ] || return 1
   printf '%s\n' "$result"
@@ -408,9 +417,16 @@ write_lock_is_owner() {
     [ "$recorded_token" = "$MAESTRO_LOCK_TOKEN" ]
 }
 
+companion_call() {
+  local C="$1" run_bounded_default=120
+  shift
+  run_bounded "${MAESTRO_COMPANION_TIMEOUT_SEC-120}" \
+    "MAESTRO_COMPANION" node "$C" "$@"
+}
+
 companion_workspace_writers() {
   local C="$1" status parsed rc
-  if ! status=$(node "$C" status --all --json 2>/dev/null); then
+  if ! status=$(companion_call "$C" status --all --json 2>/dev/null); then
     return 4
   fi
   [ -n "${status//[[:space:]]/}" ] || return 4
@@ -1007,7 +1023,7 @@ companion_start() {
     # Compatibility probe, not an authorization check: only a help text that
     # describes `task` WITHOUT --write proves drift. Anything inconclusive
     # (empty, error, no synopsis) must not block a dispatch.
-    HELP=$(node "$C" --help 2>&1) || HELP=""
+    HELP=$(companion_call "$C" --help 2>&1) || HELP=""
     case "$HELP" in
       *--write*) ;;
       *task*)
@@ -1027,7 +1043,7 @@ companion_start() {
     fi
   fi
   local START JOB
-  START=$(node "$C" "${args[@]}" "$PROMPT" 2>&1)
+  START=$(companion_call "$C" "${args[@]}" "$PROMPT" 2>&1)
   JOB=$(printf '%s' "$START" | grep -oE 'task-[a-z0-9]+-[a-z0-9]+' | head -1)
   if [ -z "$JOB" ]; then
     printf 'could not start Codex job. Output: %s' "$START" >&2
@@ -1041,7 +1057,7 @@ companion_verify_pin() {
   local ST REQUEST MODEL_FIELD EFFORT_FIELD WRITE_FIELD
   local RECORDED_MODEL="null" RECORDED_EFFORT="null" RECORDED_WRITE=""
   local PIN EFFORTS CONFIG_EFFORT IMPL_EFFORT
-  ST=$(node "$C" status "$JOB" --json 2>/dev/null)
+  ST=$(companion_call "$C" status "$JOB" --json 2>/dev/null)
   REQUEST=$(printf '%s' "$ST" | tr '\n' ' ' | sed -n 's/.*"request"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p' | head -1)
   MODEL_FIELD=$(printf '%s' "$REQUEST" | grep -oE '"model"[[:space:]]*:[[:space:]]*(null|"[^"]*")' | head -1)
   EFFORT_FIELD=$(printf '%s' "$REQUEST" | grep -oE '"effort"[[:space:]]*:[[:space:]]*(null|"[^"]*")' | head -1)
@@ -1078,7 +1094,7 @@ companion_verify_pin() {
 
 companion_cancel_job() { # C JOB REASON → 124 read-only, 125 write-mode
   local C="$1" JOB="$2" REASON="$3" ST pid log write_mode=0
-  ST=$(node "$C" status "$JOB" --json 2>/dev/null) || ST=""
+  ST=$(companion_call "$C" status "$JOB" --json 2>/dev/null) || ST=""
   pid=$(printf '%s\n' "$ST" |
     grep -oE '"pid"[[:space:]]*:[[:space:]]*(null|[0-9]+)' |
     head -1 |
@@ -1097,7 +1113,7 @@ companion_cancel_job() { # C JOB REASON → 124 read-only, 125 write-mode
       return 125
     fi
   fi
-  node "$C" cancel "$JOB" >/dev/null 2>&1
+  companion_call "$C" cancel "$JOB" >/dev/null 2>&1
   MAESTRO_CANCEL_REQUESTED=1
   progress "MAESTRO_POLL: cancelled reason=$REASON job=$JOB pid=${pid:-unknown} log=${log:-unknown}"
   if [ "$write_mode" -eq 1 ]; then
@@ -1128,7 +1144,7 @@ companion_poll() {
     sleep "$POLL"
     write_lock_heartbeat_write
     total=$(( $(date +%s) - poll_started ))
-    ST=$(node "$C" status "$JOB" --json 2>/dev/null)
+    ST=$(companion_call "$C" status "$JOB" --json 2>/dev/null)
     if [ -z "$ST" ]; then
       sfails=$((sfails + 1))
       if [ "$sfails" -ge 4 ]; then
@@ -1240,10 +1256,10 @@ companion_poll() {
 companion_result() {
   local C="$1" JOB="$2"
   local OUT
-  OUT=$(node "$C" result "$JOB" 2>/dev/null)
+  OUT=$(companion_call "$C" result "$JOB" 2>/dev/null)
   if [ -z "${OUT//[[:space:]]/}" ]; then
     sleep 3
-    OUT=$(node "$C" result "$JOB" 2>/dev/null)
+    OUT=$(companion_call "$C" result "$JOB" 2>/dev/null)
   fi
   if [ -z "${OUT//[[:space:]]/}" ]; then
     printf 'job %s returned an empty result twice' "$JOB" >&2

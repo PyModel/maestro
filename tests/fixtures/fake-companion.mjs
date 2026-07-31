@@ -57,6 +57,10 @@ if (command === "status" && args[0] === "--all" && args[1] === "--json") {
 if (command === "status" && args.at(-1) === "--json") {
   appendCall(`status ${args.join(" ")}`);
   growLog();
+  const hang = Number(process.env.MAESTRO_TEST_STATUS_HANG ?? "0");
+  if (hang > 0) {
+    await new Promise((resolve) => setTimeout(resolve, hang * 1000));
+  }
   const status = process.env.MAESTRO_TEST_JOB_PHASE ?? "completed";
   const value = {
     id: args[0],
