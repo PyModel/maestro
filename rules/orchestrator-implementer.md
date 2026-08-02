@@ -5,14 +5,14 @@
 
 ## Codex model & effort
 
-At session start a hook asks which Codex model and reasoning effort to use (or shows the current pin). Both loops — discussion and implementation — share the setting. Mid-session, the user can say "codex model" to change it; apply with:
+At session start a hook asks which Codex model and role-specific reasoning efforts to use (or shows the current pin). Discussion and implementation share the model but keep separate effort tiers. Mid-session, the user can say "codex model" to change them; apply with:
 
 ```
 bash ~/.claude/hooks/codex-model-select.sh --show
-bash ~/.claude/hooks/codex-model-select.sh <model> <effort>
+bash ~/.claude/hooks/codex-model-select.sh <model> <debate-effort> <impl-effort>
 ```
 
-Effort guide: minimal/low for quick mechanical fixes, medium for default implementation, **high for architecture debates, delicate refactors, and final-review judgment** — effort is where the quality of the *argument* comes from. Model availability depends on the user's ChatGPT plan; the script validates the name's shape only, and Codex itself rejects a model it cannot reach.
+Effort guide: minimal/low for quick mechanical work, medium for default implementation, and **high for architecture debates, delicate refactors, and final-review judgment**. Debate effort may also use max/ultra through top-level Codex config; implementation effort is limited to none/minimal/low/medium/high/xhigh because the companion must express it explicitly per write job. Never accept a silent fallback from an unsupported implementation tier. Model availability depends on the user's ChatGPT plan; the script validates the name's shape only, and Codex itself rejects a model it cannot reach. “Keep current” is usable only when `--pin` succeeds; a fresh unpinned install cannot dispatch until the user selects values.
 
 ## Dispatch
 
@@ -31,9 +31,9 @@ Write access is real — Codex edits your working tree directly. Scope the plan 
 
 **Orchestrator patience is mandatory.** After dispatching a write-mode job, yield immediately. Perform no workspace reads, verification commands, or diff review until that job reports completion. Reading a tree while Codex is still writing reviews a moving target and silently defeats the loop's final gate.
 
-Write-mode dispatches also hold a workspace lock. Contention waits rather than failing at once: an acquire blocks up to `MAESTRO_LOCK_WAIT_SEC` (default 300 seconds, `0` restores immediate failure) while the lease has a confirmed release path. A `BLOCKED` therefore means the lease was *not* queueable — poisoned, malformed, of unconfirmed identity, or with a spent stale-break budget — and it names the holding job and PID. The blocked contender also reports whether the holder's heartbeat is fresh or stale. A stale heartbeat never transfers ownership: confirm that process is finished, kill it yourself if it is wedged, and only then run `bash hooks/implementer-loop.sh --clear-lease`; that command independently refuses while any write-capable job is still running. Never break the lock by hand. Read-only discussion turns do not take this lock.
+Write-mode dispatches hold one ownership domain across linked worktrees and superproject/submodule overlaps. Contention waits up to `MAESTRO_LOCK_WAIT_SEC` (default 300 seconds, `0` disables waiting) only while the lease has a confirmed release path; each sleep is clipped to the remaining cap. Stale reclaim is token-conditioned, and repository safety queries deliberately ignore companion session filtering and accept compact or pretty valid JSON only. A stale heartbeat is only a recovery candidate: `--clear-lease` still refuses while the recorded owner process is alive or unidentifiable, or any repository-global writer is visible. A metadata-less lock younger than five seconds may still be in its atomic-publication window and is not clearable. Never break the lock by hand. Read-only discussion turns do not take it.
 
-Both 5 minutes without log growth and the absolute per-dispatch deadline (`MAESTRO_MAX_DISPATCH_SEC`, default 1200 seconds) cancel a job; `MAESTRO_COMPANION_TIMEOUT_SEC` bounds every companion call (default 120 seconds), so a wedged companion or broker cannot block the poll loop indefinitely where neither guard can fire. A timeout at the poll site yields an empty status; four consecutive empty statuses, or the dispatch deadline being crossed during status loss, cancel the job and fail closed. The worst case from a wedged broker to that exit is roughly 4 × (`POLL` + `MAESTRO_COMPANION_TIMEOUT_SEC`) — about 9 minutes at the defaults. Nothing observable from the shell proves a brokered turn stopped, so a write-mode cancellation retains the lease, ends the run `BLOCKED`, and does not re-dispatch. Once no Codex job is writing, clear it with `bash hooks/implementer-loop.sh --clear-lease` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`). Read-only debate turns hold no write lease, are never poisoned, and can be retried normally.
+Five minutes without log growth remains the fast idle guard, measured from monotonic elapsed time rather than by adding poll intervals. `--max-idle` and `--poll` must be positive integers and fail before lease acquisition or task launch. `MAESTRO_MAX_DISPATCH_SEC` is the hard ceiling: unset write jobs get 2400 seconds, read-only debates get 1200, and an explicit valid value is used exactly. Startup consumes the budget; poll sleeps clip to the nearest idle/deadline boundary; one halfway warning continues the same turn without claiming a checkpoint. `MAESTRO_COMPANION_TIMEOUT_SEC` bounds every companion call (default 120 seconds). Four consecutive empty or malformed statuses fail closed; read-only `status-lost` uses the configured discussion retries, while idle/deadline cancellation is terminal. Any write cancellation—including companion-observed cancellation—poisons and retains the lease, ends `BLOCKED`, and cannot redispatch; a hard-ceiling stop emits `MAESTRO_RECOVERY: UNREPORTED_PARTIAL`. Clear only after confirming quiescence with the documented standalone `--clear-lease` command; it is mutually exclusive with execution options.
 
 Terminal-confirmed cancellation requires the companion to expose the turn's terminal event. That is an upstream capability Maestro cannot observe from the shell.
 
@@ -57,7 +57,7 @@ bash ~/.claude/hooks/discussion-loop.sh --new "<topic>" <slug>
 bash ~/.claude/hooks/discussion-loop.sh --turn <your-turn-file> <slug>
 ```
 
-You drive, like a user would. Write your turn to a temp file — your position, your strongest evidence, actual diffs and failing output when relevant — the script appends it to the transcript at `~/.maestro/discussions/<workspace>-<slug>.md`, and Codex replies with a `STANCE: AGREE / PUSHBACK / ALTERNATIVE / REFRAME` line. Debate mode is **read-only**: nobody edits code while the design is still being argued. Codex shares no memory between calls — the transcript *is* the memory, so quote, never paraphrase.
+You drive, like a user would. Write your turn to a temp file — your position, your strongest evidence, actual diffs and failing output when relevant — the script appends it to a private transcript at `~/.maestro/discussions/<workspace>-<path-hash>-<slug>.md`, and Codex replies with a `STANCE: AGREE / PUSHBACK / ALTERNATIVE / REFRAME` line. Debate mode is **read-only**: nobody edits code while the design is still being argued. Codex shares no memory between calls — the transcript *is* the memory, so quote, never paraphrase.
 
 **Protocol:**
 
@@ -83,7 +83,7 @@ A plan you can't finish writing means the decision isn't formed yet — form it,
 
 ### Designing the Verification section
 
-Every dispatch is killed at `MAESTRO_MAX_DISPATCH_SEC` (default 1200s), and a write-mode kill retains and poisons the lease — so an over-budget verification list does not merely fail, it wedges the repository and costs a recovery round. This has now cost two rounds on two different delicate changes, both times because verification cost was never connected to the deadline that kills it.
+Every write dispatch is killed at the `MAESTRO_MAX_DISPATCH_SEC` hard ceiling (2400s when unset; read-only defaults to 1200s), and a write-mode kill retains and poisons the lease. An over-budget verification list therefore still costs a recovery round; the larger healthy-write budget is resilience, not permission to duplicate comprehensive verification inside the dispatch.
 
 **Name only fast leaf checks. The loop's `--verify` owns the comprehensive suite.** It runs *after* the dispatch, locally, on your side of the deadline — so a full suite listed in-dispatch is paid for twice, and the second payment is the one that cancels.
 
@@ -149,7 +149,7 @@ The loop exits with a machine-readable `LOOP_STATE` (and the underlying Codex ru
 - **BLOCKED** (exit 11) — missing access, credentials, a destructive step, write-lock contention, or a cancelled write whose quiescence is unconfirmed. Surface it; never improvise around it. Contention here means the wait already ran and the lease was not queueable; it names the holding job, so wait for that job instead of breaking its lock. For an unconfirmed cancellation, first establish that no Codex job is writing, then use the documented `--clear-lease` command — and note it now refuses a healthy lease and clears a structurally invalid one, so a `CLEARED` result genuinely means the lock is gone.
 - **STUCK** (exit 12) — the iteration cap hit without verified completion. Never just raise `--max-iters`: read the attempts log, and if the root cause is not obvious, take the evidence to a **debugging discussion** first (hypothesis + actual output; let Codex try to break it) — a duel beats a blind re-plan. Then re-plan around the actual failing output and run the loop again.
 
-Single-shot watchdog runs (the fallback) end with one RESULT line. Handle each:
+Single-shot watchdog runs must end with one full-line RESULT record. Maestro accepts only defined full-line tokens and, defensively, uses the last valid record rather than a prefix or quoted example. A watchdog cancellation is the exception: it emits `RESULT: BLOCKED`, then `MAESTRO_FINAL: WATCHDOG POISONED rc=125`; treat rc 125 as unconfirmed quiescence, not ordinary RESULT: BLOCKED/11, and clear the retained lease only after proving no writer remains. Handle terminal Codex records as follows:
 
 - **RESULT: DONE** — do not believe it yet. Go to review (below).
 - **RESULT: NEEDS_ANSWERS** — relay the QUESTIONS block verbatim to the user. Answer yourself only when the answer is certain from context; guessing defeats the point of the channel. Re-dispatch with the answers appended to the plan.
@@ -168,7 +168,7 @@ Never silently patch Codex's work yourself — fixes go back through the impleme
 
 ## Gate
 
-A PreToolUse hook blocks your Edit/Write/MultiEdit for the whole task on everything except an explicit non-code allowlist (docs/config/data) and the listed harness/scratch paths. It fails closed on unreadable hook payloads and never honors the direct-edit override inside subagents. Never gated: `~/.claude`, `~/.codex`, `/tmp`, `~/Desktop`, and any non-code file — plan files, notes, and config are always yours to write. The gate opens only when the user explicitly says "edit it yourself" / "sen yap", and resets on the next task. Codex unreachable and the change is trivial → ask the user for direct-edit approval; don't route around the gate.
+A PreToolUse hook blocks your Edit/Write/MultiEdit for the whole task except an explicit non-code allowlist and canonical harness/scratch targets. It requires a validated session ID, fails closed on unreadable payloads, revokes stale authorization after malformed prompt events, and never honors the override inside identified subagents. Symlink targets and nonexistent files beneath symlinked parents are classified by canonical destination, and executable files cannot claim a non-code extension exemption. The gate opens only for an explicit direct-edit imperative and resets on any new task; only a standalone acknowledgement preserves it. Authorization markers live in owner-private `~/.maestro/direct-edit`, must be regular owner-only files with exact content, and the old forgeable `/tmp/maestro-direct-*.flag` path is never consulted.
 
 **What the gate is, exactly — do not overstate it.**
 
@@ -180,11 +180,11 @@ One hole, now version-conditional:
 
 - Fixed on Claude Code versions whose subagent PreToolUse payloads carry `agent_id`/`agent_type`: the gate refuses the override when either is present. On older versions that omit the fields, the original hole remains — there is no cross-version schema guarantee.
 
-Fixed: the lease used to resolve via `git rev-parse --git-dir`, which is per-worktree, so N linked worktrees held N independent leases. It now anchors to `--git-common-dir` and serializes repository-wide.
+Fixed: lease scope now selects the outermost enclosing repository and its `--git-common-dir`, so linked worktrees and superproject/submodule entry points serialize one overlapping writable tree.
 
 **Detection, since prevention is unavailable.** A probe measured it: `Edit` and `Write` are blocked, while a `Bash` redirect, `sed -i`, and `git commit` all reached the tree and moved `HEAD`. Prevention would mean enumerating an unbounded set of write paths, so Maestro compares state instead — path-agnostic, and indifferent to whether bytes arrived via `Edit`, `Bash`, an MCP tool, or a workflow agent.
 
-Each write-mode acquisition digests the **materialized tree** — path, type, mode and content for tracked and non-ignored untracked files, across every linked worktree and every initialized submodule — and compares it against the snapshot the previous dispatch left. `HEAD` and the index are deliberately *not* covered. A mismatch prints one line before the job starts:
+Each write-mode acquisition digests the **materialized tree**—path, entry type, Git-visible executable mode, and actual bytes with clean filters disabled—for tracked and non-ignored untracked files across healthy linked worktrees, initialized submodules, and non-ignored nested repositories. Invalid/prunable worktree records are skipped independently instead of disabling every healthy root. Git itself hashes the final stream, so minimal Linux hosts do not need `shasum`. `MAESTRO_DIGEST_TIMEOUT_SEC` bounds a snapshot (default 120); expiry records `unavailable` and disables that comparison rather than blocking dispatch. Baseline/log publication stays inside the lease-generation claim and atomically replaces, never follows, a provenance-log symlink. `HEAD` and the index are deliberately *not* covered. A mismatch prints one line before the job starts:
 
 ```
 PROVENANCE: BASELINE GAP — tree at acquisition differs from the prior completed snapshot (prior_job=…, expected=…, observed=…); author unknown

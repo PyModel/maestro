@@ -6,28 +6,90 @@
 // "how much does X cost" — trains the loop to tune it out, so silence on unrelated
 // prompts is what gives the directive its weight.
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   NONCODE_EXTENSIONS,
   directiveOpensGate,
+  isValidSessionId,
 } from './maestro-policy.mjs';
-let payload = {};
-try { payload = JSON.parse(fs.readFileSync(0, 'utf8')); } catch {}
-const sid = payload.session_id || 'default';
-const prompt = (payload.prompt || '').trim();
-const flag = `/tmp/maestro-direct-${sid}.flag`;
+
+const MAESTRO_DIR = path.join(os.homedir(), '.maestro');
+const FLAG_DIR = path.join(MAESTRO_DIR, 'direct-edit');
+const FLAG_PATTERN = /^maestro-direct-[A-Za-z0-9_-]{1,64}\.flag$/;
+
+function ensurePrivateDirectory(directory) {
+  try {
+    const stat = fs.lstatSync(directory);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('unsafe authorization directory');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    fs.mkdirSync(directory, { mode: 0o700 });
+  }
+  fs.chmodSync(directory, 0o700);
+}
+
+function ensureFlagDirectory() {
+  ensurePrivateDirectory(MAESTRO_DIR);
+  ensurePrivateDirectory(FLAG_DIR);
+}
+
+function clearAllFlags() {
+  let ok = true;
+  try {
+    for (const name of fs.readdirSync(FLAG_DIR)) {
+      if (!FLAG_PATTERN.test(name)) continue;
+      try { fs.rmSync(`${FLAG_DIR}/${name}`, { force: true }); } catch { ok = false; }
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') ok = false;
+  }
+  return ok;
+}
+
+function failClosed(message) {
+  clearAllFlags();
+  process.stderr.write(`ORCHESTRATOR INJECT: ${message}; direct-edit authorization revoked.\n`);
+  process.exit(2);
+}
+
+let payload;
+try { payload = JSON.parse(fs.readFileSync(0, 'utf8')); }
+catch { failClosed('invalid hook JSON'); }
+if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+    !isValidSessionId(payload.session_id) || typeof payload.prompt !== 'string') {
+  failClosed('invalid hook payload');
+}
+const sid = payload.session_id;
+const prompt = payload.prompt.trim();
+const flag = path.join(FLAG_DIR, `maestro-direct-${sid}.flag`);
 
 // Explicit user override: "edit it yourself" / "don't delegate" → Claude may write
 // source directly for this task. This is the only thing that opens the gate.
 if (directiveOpensGate(prompt)) {
-  try { fs.writeFileSync(flag, '1'); } catch {}
+  try {
+    ensureFlagDirectory();
+    const descriptor = fs.openSync(
+      flag,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC |
+        (fs.constants.O_NOFOLLOW ?? 0),
+      0o600
+    );
+    try {
+      fs.fchmodSync(descriptor, 0o600);
+      fs.writeFileSync(descriptor, '1\n');
+    } finally { fs.closeSync(descriptor); }
+  } catch {
+    failClosed('could not create a safe authorization marker');
+  }
 } else {
   // Only a SHORT standalone ack counts as continuation. "Okay, now fix this other
   // bug" starts with an approval word but carries a new task — it must reset.
   const isApproval =
-    prompt.length <= 24 &&
-    /^(onayl|onay|evet|devam|tamam|olur|approve|ok\b|okay\b|go\b|yes\b|proceed)/i.test(prompt);
+    /^(?:onayl|onay|evet|devam|tamam|olur|approve|ok|okay|go|yes|proceed)[.!]?$/i.test(prompt);
   if (!isApproval) {
-    try { fs.rmSync(flag, { force: true }); } catch {}
+    try { fs.rmSync(flag, { force: true }); }
+    catch { failClosed('could not revoke direct-edit authorization'); }
   }
 }
 
@@ -35,12 +97,13 @@ if (directiveOpensGate(prompt)) {
 // it before the code-signal logic so "codex model" never triggers the work loop.
 if (/(codex (model|settings|effort|config)|pick (the )?codex|change codex|set codex)/i.test(prompt)) {
   process.stdout.write(
-    'CODEX MODEL SETUP — ask the user which Codex model and reasoning effort the implementer\n' +
-    'should use. Show current settings first:  bash ~/.claude/hooks/codex-model-select.sh --show\n' +
-    'Effort guide: minimal/low = quick mechanical fixes, medium = default implementation,\n' +
-    'high = debates, delicate refactors, final-review judgment.\n' +
-    'Apply their pick:  bash ~/.claude/hooks/codex-model-select.sh <model> <effort>\n' +
-    'and confirm in one line. One setting feeds both loops (discussions + implementation).'
+    'CODEX MODEL SETUP — ask the user for the Codex model and separate role-specific efforts.\n' +
+    'Show current settings first:  bash ~/.claude/hooks/codex-model-select.sh --show\n' +
+    'Debate effort governs read-only discussions; implementation effort governs write jobs.\n' +
+    'minimal/low = quick mechanics, medium = default, high = delicate work; max/ultra are\n' +
+    'debate-only because the companion cannot express them for write jobs.\n' +
+    'Apply their picks:  bash ~/.claude/hooks/codex-model-select.sh <model> <debate-effort> <impl-effort>\n' +
+    'and confirm all three values in one line.'
   );
   process.exit(0);
 }
@@ -86,8 +149,9 @@ process.stdout.write(
   '   Both append the implementer contract themselves — do not retype it; never spawn a subagent.\n' +
   '4) HANDLE the loop state:\n' +
   '   VERIFIED_DONE → still review the diff yourself before believing it (next step).\n' +
-  '   NEEDS_ANSWERS → relay the QUESTIONS verbatim to the user (answer yourself only\n' +
-  '     when the answer is certain from context), append answers to the plan, re-run the loop.\n' +
+  '   NEEDS_ANSWERS → answer without interrupting only to grant a mechanically necessary adjacent file\n' +
+  '     with unchanged design/behavior, or to substitute an equally strong verifier/venue. Otherwise\n' +
+  '     relay QUESTIONS verbatim. Append authorized answers to the plan and re-run the loop.\n' +
   '   BLOCKED → surface the blocker; never improvise around credentials/destructive steps.\n' +
   '   STUCK → do not raise --max-iters. Root cause unclear → take the attempts log to a\n' +
   '     debugging discussion (step 1); otherwise re-plan and run the loop again.\n' +

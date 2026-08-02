@@ -24,7 +24,7 @@ git init -q "$D/dep"; ( cd "$D/dep" && git config user.email p@p && git config u
 git init -q "$D/s"; cd "$D/s" || exit 1; git config user.email p@p; git config user.name p
 printf 'a\n' > s.sh; git add -A; git commit -q -m init
 git -c protocol.file.allow=always submodule add -q "$D/dep" dep 2>/dev/null || {
-  echo "SKIP(2): this git refuses local submodules"; echo "VERIFY PASS (case 2 skipped)"; exit 0; }
+  echo "FAIL(2): could not create the required local submodule fixture"; exit 1; }
 git add -A; git commit -q -m addsub
 d() { ( cd "$D/s" && bash -c "exec 3>&-; set -uo pipefail; . '$LIB'; repo_digest" ) 2>/dev/null; }
 

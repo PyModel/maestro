@@ -1,85 +1,179 @@
 #!/usr/bin/env node
-// Maestro uninstaller — removes the hooks + rules and strips ONLY the maestro
-// hook entries from settings.json, leaving your other hooks untouched. Backs up
-// settings.json before editing. Your .maestro.bak files are left in place.
-// A rule is only deleted when it is still byte-identical to this repo's copy, so a
-// file you wrote or edited yourself is never silently removed.
+// Maestro uninstaller — removes only bytes recorded in the ownership manifest and
+// exact marked hook commands. Divergent files are preserved.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { fileURLToPath } from 'node:url';
 
 const HOME = os.homedir();
-const REPO = path.dirname(fileURLToPath(import.meta.url));
 const CLAUDE = path.join(HOME, '.claude');
 const HOOKS = path.join(CLAUDE, 'hooks');
-const RULES = path.join(CLAUDE, 'rules');
 const SETTINGS = path.join(CLAUDE, 'settings.json');
-
-const log = (...a) => console.log('[maestro]', ...a);
-const MAESTRO_HOOKS = [
+const MAESTRO_DIR = path.join(HOME, '.maestro');
+const MANIFEST = path.join(MAESTRO_DIR, 'install-manifest.json');
+const AUTHORIZATION_DIR = path.join(MAESTRO_DIR, 'direct-edit');
+const AUTHORIZATION_PATTERN = /^maestro-direct-[A-Za-z0-9_-]{1,64}\.flag$/;
+const HOOK_FILES = [
   'orchestrator-inject.mjs', 'orchestrator-gate.mjs', 'maestro-policy.mjs', 'session-start.mjs',
   'implementer-watchdog.sh', 'implementer-loop.sh', 'discussion-loop.sh',
   'lib-companion.sh', 'codex-model-select.sh', 'codex-mcp-check.sh',
 ];
-const RULE_FILES = ['orchestrator-implementer.md', 'coding-discipline.md', 'workflow.md'];
-const SKILL_NAMES = ['ralph-protocol', 'plan-authoring'];
 
-// --- 1. Remove hook files ---
-for (const f of MAESTRO_HOOKS) {
-  const p = path.join(HOOKS, f);
-  if (fs.existsSync(p)) { fs.rmSync(p); log(`removed ${f}`); }
-}
+const log = (...args) => console.log('[maestro]', ...args);
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const hashFile = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
-// --- 1b. Remove rules, but only the untouched ones this installer placed ---
-for (const f of RULE_FILES) {
-  const installed = path.join(RULES, f);
-  const source = path.join(REPO, 'rules', f);
-  if (!fs.existsSync(installed)) continue;
-  if (!fs.existsSync(source)) { log(`kept ${f} — no repo copy to compare it against`); continue; }
-  if (fs.readFileSync(installed).equals(fs.readFileSync(source))) { fs.rmSync(installed); log(`removed ${f}`); }
-  else log(`kept ${f} — it differs from this repo's copy, so it is yours to delete`);
-}
-
-// --- 1c. Remove skills, same untouched-only rule ---
-for (const name of SKILL_NAMES) {
-  const installed = path.join(CLAUDE, 'skills', name, 'SKILL.md');
-  const source = path.join(REPO, 'skills', name, 'SKILL.md');
-  if (fs.existsSync(installed) && fs.existsSync(source)) {
-    if (fs.readFileSync(installed).equals(fs.readFileSync(source))) {
-      fs.rmSync(installed);
-      try { fs.rmdirSync(path.dirname(installed)); } catch {} // only when it is now empty
-      log(`removed skills/${name}`);
-    } else log(`kept skills/${name} — it differs from this repo's copy, so it is yours to delete`);
+function atomicWrite(file, bytes, mode) {
+  const tmp = `${file}.maestro-tmp-${process.pid}`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  try {
+    fs.writeFileSync(tmp, bytes, { mode });
+    if (mode !== undefined) fs.chmodSync(tmp, mode);
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try { fs.rmSync(tmp); } catch {}
+    throw error;
   }
 }
 
-// --- 2. Strip maestro hook entries from settings.json (keep the rest) ---
-if (fs.existsSync(SETTINGS)) {
-  const bak = `${SETTINGS}.maestro-uninstall.bak`;
-  if (!fs.existsSync(bak)) fs.copyFileSync(SETTINGS, bak);
-  let s;
-  try { s = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); }
-  catch { log('settings.json is not valid JSON; left it alone.'); process.exit(0); }
-  const isMaestro = (cmd) => MAESTRO_HOOKS.some((a) => (cmd || '').includes(a));
-  for (const event of Object.keys(s.hooks || {})) {
-    s.hooks[event] = (s.hooks[event] || [])
-      .map((block) => ({ ...block, hooks: (block.hooks || []).filter((h) => !isMaestro(h.command)) }))
-      .filter((block) => (block.hooks || []).length > 0);
-    if (s.hooks[event].length === 0) delete s.hooks[event];
-  }
-  fs.writeFileSync(SETTINGS, JSON.stringify(s, null, 2) + '\n');
-  log('stripped maestro hook entries from settings.json (your other hooks kept)');
+function refreshBackup(file, suffix) {
+  if (!fs.existsSync(file)) return;
+  atomicWrite(`${file}${suffix}`, fs.readFileSync(file), fs.statSync(file).mode);
 }
 
-// --- 3. Remove the session-start picker flag; leave config.toml pins to the user ---
-{
-  const askFlag = path.join(HOME, '.maestro', 'ask-on-start');
-  if (fs.existsSync(askFlag)) {
-    fs.rmSync(askFlag);
-    try { fs.rmdirSync(path.join(HOME, '.maestro')); } catch {} // only when empty
-    log('removed ~/.maestro/ask-on-start');
+function managedPath(key) {
+  if (path.isAbsolute(key) || key.split('/').includes('..') ||
+      !/^(hooks|rules|skills)\//.test(key)) return null;
+  const destination = path.resolve(CLAUDE, key);
+  const prefix = `${path.resolve(CLAUDE)}${path.sep}`;
+  return destination.startsWith(prefix) ? destination : null;
+}
+
+function readManifest() {
+  if (!fs.existsSync(MANIFEST) || fs.lstatSync(MANIFEST).isSymbolicLink()) return null;
+  try {
+    const value = JSON.parse(fs.readFileSync(MANIFEST, 'utf8'));
+    if (value?.version !== 1 || !isObject(value.files)) return null;
+    return value;
+  } catch {
+    return null;
   }
 }
 
-log('done. web_search="disabled" and any model/model_reasoning_effort pins in ~/.codex/config.toml were left as-is — remove them by hand if you want Codex defaults back (a .maestro.bak is next to it).');
+function managedCommand(script) {
+  return `node "${path.join(HOOKS, script)}" # maestro-managed:${script}`;
+}
+
+function legacyCommand(script) {
+  return `node "${path.join(HOOKS, script)}"`;
+}
+
+function readSettingsForUninstall() {
+  if (!fs.existsSync(SETTINGS)) return null;
+  if (fs.lstatSync(SETTINGS).isSymbolicLink()) {
+    log('settings.json is a symlink; refusing a partial uninstall.');
+    process.exit(1);
+  }
+  let settings;
+  try { settings = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); }
+  catch {
+    log('settings.json is invalid JSON; refusing a partial uninstall.');
+    process.exit(1);
+  }
+  if (!isObject(settings) || (settings.hooks !== undefined && !isObject(settings.hooks))) {
+    log('settings.json schema is invalid; refusing a partial uninstall.');
+    process.exit(1);
+  }
+  for (const blocks of Object.values(settings.hooks ?? {})) {
+    if (!Array.isArray(blocks) || blocks.some((block) => !isObject(block) ||
+        (block.hooks !== undefined && !Array.isArray(block.hooks)))) {
+      log('settings.json hook schema is invalid; refusing a partial uninstall.');
+      process.exit(1);
+    }
+  }
+  return settings;
+}
+
+const settings = readSettingsForUninstall();
+const manifest = readManifest();
+if (!manifest) {
+  log('ownership manifest missing or invalid — kept all installed files; no filename-only deletion is safe');
+} else {
+  for (const [key, recordedHash] of Object.entries(manifest.files)) {
+    const installed = managedPath(key);
+    if (!installed || !/^[a-f0-9]{64}$/.test(recordedHash)) {
+      log(`kept untrusted manifest entry ${key}`);
+      continue;
+    }
+    if (!fs.existsSync(installed)) {
+      delete manifest.files[key];
+      continue;
+    }
+    const stat = fs.lstatSync(installed);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      log(`kept ${key} — it is not a regular owned file`);
+      continue;
+    }
+    if (hashFile(installed) !== recordedHash) {
+      log(`kept ${key} — its bytes changed after installation`);
+      continue;
+    }
+    fs.rmSync(installed);
+    delete manifest.files[key];
+    log(`removed ${key}`);
+    let parent = path.dirname(installed);
+    while (parent !== CLAUDE && parent.startsWith(`${CLAUDE}${path.sep}`)) {
+      try { fs.rmdirSync(parent); } catch { break; }
+      parent = path.dirname(parent);
+    }
+  }
+  if (Object.keys(manifest.files).length === 0) {
+    fs.rmSync(MANIFEST);
+  } else {
+    atomicWrite(MANIFEST, `${JSON.stringify(manifest, null, 2)}\n`, 0o600);
+  }
+}
+
+if (settings) {
+  const commands = new Set(HOOK_FILES.flatMap((script) => [managedCommand(script), legacyCommand(script)]));
+  let changed = false;
+  for (const [event, blocks] of Object.entries(settings.hooks ?? {})) {
+    settings.hooks[event] = blocks
+      .map((block) => {
+        if (!Array.isArray(block.hooks)) return block;
+        const hooks = block.hooks.filter((hook) => {
+          const remove = isObject(hook) && hook.type === 'command' && commands.has(hook.command);
+          changed ||= remove;
+          return !remove;
+        });
+        return { ...block, hooks };
+      })
+      .filter((block) => !Array.isArray(block.hooks) || block.hooks.length > 0);
+    if (settings.hooks[event].length === 0) delete settings.hooks[event];
+  }
+  if (changed) {
+    refreshBackup(SETTINGS, '.maestro-uninstall.bak');
+    atomicWrite(SETTINGS, `${JSON.stringify(settings, null, 2)}\n`, fs.statSync(SETTINGS).mode);
+    log('stripped exact Maestro hook entries from settings.json (other hooks kept)');
+  }
+}
+
+const askFlag = path.join(MAESTRO_DIR, 'ask-on-start');
+if (fs.existsSync(askFlag) && !fs.lstatSync(askFlag).isSymbolicLink()) {
+  fs.rmSync(askFlag);
+  log('removed ~/.maestro/ask-on-start');
+}
+if (fs.existsSync(AUTHORIZATION_DIR) && !fs.lstatSync(AUTHORIZATION_DIR).isSymbolicLink() &&
+    fs.lstatSync(AUTHORIZATION_DIR).isDirectory()) {
+  for (const name of fs.readdirSync(AUTHORIZATION_DIR)) {
+    if (!AUTHORIZATION_PATTERN.test(name)) continue;
+    const candidate = path.join(AUTHORIZATION_DIR, name);
+    const stat = fs.lstatSync(candidate);
+    if (stat.isFile() || stat.isSymbolicLink()) fs.rmSync(candidate, { force: true });
+  }
+  try { fs.rmdirSync(AUTHORIZATION_DIR); } catch {}
+  log('removed private direct-edit authorization markers');
+}
+try { fs.rmdirSync(MAESTRO_DIR); } catch {}
+log('done. web_search="disabled" and model pins in ~/.codex/config.toml were left as-is.');

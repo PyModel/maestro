@@ -35,12 +35,40 @@ progress_init
 
 FINAL_STATE="INTERRUPTED"
 FINAL_RC=4
+C=""
+JOB=""
 maestro_finish() {
   FINAL_STATE="$1"
   FINAL_RC="$2"
   exit "$FINAL_RC"
 }
 maestro_interrupt() {
+  local signal="$1" reason target="" writers=""
+  trap : HUP INT TERM
+  case "$signal" in
+    HUP) reason="signal-hup" ;;
+    INT) reason="signal-int" ;;
+    TERM) reason="signal-term" ;;
+    *) reason="signal" ;;
+  esac
+  if write_lock_is_owner; then
+    target=${JOB:-}
+    if [ -z "$target" ] && [ -n "${C:-}" ]; then
+      writers=$(companion_workspace_writers "$C" 2>/dev/null) || writers=""
+      target=$(printf '%s\n' "$writers" | awk '$2 == "true" { print $1; exit }')
+    fi
+    MAESTRO_LOCK_RETAIN=1
+    if [ -n "$target" ] && [ -n "${C:-}" ]; then
+      companion_cancel_job "$C" "$target" "$reason" "signal-handler"
+    else
+      write_lock_poison "${target:-unknown}" "$reason" || :
+      if [ -e "$MAESTRO_LOCK_DIR/metadata.new" ]; then
+        mv -f "$MAESTRO_LOCK_DIR/metadata.new" "$MAESTRO_LOCK_DIR/metadata" 2>/dev/null || :
+      fi
+      progress "WATCHDOG_POISONED: interrupted before a companion job id was confirmed; lease retained"
+    fi
+    maestro_finish "POISONED" 125
+  fi
   maestro_finish "INTERRUPTED" 4
 }
 cleanup() {
@@ -50,7 +78,9 @@ cleanup() {
   exit "$FINAL_RC"
 }
 trap cleanup EXIT
-trap maestro_interrupt HUP INT TERM
+trap 'maestro_interrupt HUP' HUP
+trap 'maestro_interrupt INT' INT
+trap 'maestro_interrupt TERM' TERM
 
 if [ "${1:-}" = "--file" ]; then
   [ $# -ge 2 ] || { echo "WATCHDOG_ERROR: plan file required after --file" >&2; maestro_finish "FAILED" 3; }
@@ -68,6 +98,12 @@ else
 fi
 MAX_IDLE="${1:-300}"
 POLL="${2:-20}"
+if ! companion_poll_bounds_valid "$MAX_IDLE" "$POLL"; then
+  echo "WATCHDOG_ERROR: max_idle_sec and poll_sec must be positive integers" >&2
+  maestro_finish "FAILED" 3
+fi
+MAX_IDLE=$((10#$MAX_IDLE))
+POLL=$((10#$POLL))
 
 write_lock_acquire
 lock_rc=$?
@@ -145,24 +181,33 @@ C=$(companion_resolve) || {
 }
 
 PIN=$(companion_pin 2>/dev/null) || {
-  echo "WATCHDOG_ERROR: no Codex model/effort pinned — run codex-model-select.sh <model> <effort> first." >&2
+  echo "WATCHDOG_ERROR: no Codex model/effort pinned — run codex-model-select.sh <model> <debate-effort> <impl-effort> first." >&2
   maestro_finish "FAILED" 3
 }
 PIN_MODEL=${PIN%%$'\t'*}
 PIN_EFFORT=${PIN#*$'\t'}
-PIN_DEBATE_EFFORT=${PIN_EFFORT%%$'\t'*}
 PIN_EFFORT=${PIN_EFFORT#*$'\t'}
-case "$PIN_EFFORT" in max|ultra) PIN_EFFORT="$PIN_DEBATE_EFFORT" ;; esac
 
-JOB=$(companion_start "$C" "$PROMPT" write) || {
+dispatch_started=$SECONDS
+JOB=$(companion_start "$C" "$PROMPT" write)
+start_rc=$?
+if [ "$start_rc" -ne 0 ]; then
+  if [ "$start_rc" -eq 11 ]; then
+    progress "WATCHDOG_BLOCKED: write ownership changed before launch; no job was started."
+    maestro_finish "BLOCKED" 11
+  fi
   echo "WATCHDOG_ERROR: could not start Codex job (see above)." >&2
   maestro_finish "FAILED" 3
+fi
+write_lock_set_job "$JOB" || {
+  progress "WATCHDOG_BLOCKED: job started but its lease generation could not be published; poisoning and cancelling."
+  companion_cancel_job "$C" "$JOB" launch-publication-failed "startup"
+  maestro_finish "POISONED" 125
 }
-write_lock_set_job "$JOB"
 progress "WATCHDOG: started $JOB (model=$PIN_MODEL effort=$PIN_EFFORT, write mode, max_idle=${MAX_IDLE}s poll=${POLL}s)"
 companion_verify_pin "$C" "$JOB" "$PIN_MODEL" "$PIN_EFFORT" || :
 
-companion_poll "$C" "$JOB" "$MAX_IDLE" "$POLL"
+companion_poll "$C" "$JOB" "$MAX_IDLE" "$POLL" "$dispatch_started"
 rc=$?
 case "$rc" in
   0)
@@ -171,7 +216,7 @@ case "$rc" in
       maestro_finish "FAILED" 4
     fi
     printf '%s\n' "$OUT"
-    STATE=$(printf '%s' "$OUT" | grep -oE '^RESULT:[[:space:]]*(DONE|NEEDS_ANSWERS|BLOCKED|FAILED)' | head -1 | sed 's/^RESULT:[[:space:]]*//')
+    STATE=$(companion_result_state "$OUT")
     if [ -n "$STATE" ]; then
       FINAL_STATE="$STATE"
       echo "IMPLEMENTER_STATE: $STATE" >&2

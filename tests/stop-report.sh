@@ -43,11 +43,13 @@ REPO="$TEST_ROOT/repo"
 NEEDS_PLAN="$REPO/needs-plan.md"
 DONE_PLAN="$REPO/done-plan.md"
 STATUS_LOSS_PLAN="$REPO/status-loss-plan.md"
+FAILED_PLAN="$REPO/failed-plan.md"
 STATUS="$TEST_ROOT/status.json"
 mkdir -p "$SHIM" "$(dirname "$COMPANION")" "$TEST_HOME/.codex" "$REPO"
 : > "$COMPANION"
 {
   printf '#!/usr/bin/env bash\n'
+  printf 'if [ "${1:-}" = "-e" ]; then exec "%s" "$@"; fi\n' "$REAL_NODE"
   printf 'shift\n'
   printf 'exec "%s" "%s" "$@"\n' "$REAL_NODE" "$FIXTURE"
 } > "$SHIM/node"
@@ -62,13 +64,14 @@ printf '{\n  "running": [],\n  "latestFinished": null\n}\n' > "$STATUS"
 printf 'Objective: stop for answers.\n' > "$NEEDS_PLAN"
 printf 'Objective: finish successfully.\n' > "$DONE_PLAN"
 printf 'Objective: fail closed when status is lost.\n' > "$STATUS_LOSS_PLAN"
+printf 'Objective: carry failed evidence.\n' > "$FAILED_PLAN"
 cp "$DONE_PLAN" "$TEST_ROOT/done-plan.before"
 git init -q "$REPO"
 (
   cd "$REPO" &&
     git config user.email p@p &&
     git config user.name p &&
-    git add needs-plan.md done-plan.md status-loss-plan.md &&
+    git add needs-plan.md done-plan.md status-loss-plan.md failed-plan.md &&
     git commit -q -m init
 )
 
@@ -91,7 +94,7 @@ run_loop() {
         MAESTRO_TEST_RESULT="$result" \
         MAESTRO_TEST_STATUS="$STATUS" \
         bash "$LOOP" --plan "$plan" --verify true \
-          --max-iters 1 --max-idle 2 --poll 0
+          --max-iters 1 --max-idle 2 --poll 1
   ) > "$TEST_ROOT/$name.stdout" \
     2> "$TEST_ROOT/$name.stderr" \
     3> "$TEST_ROOT/$name.progress"
@@ -117,13 +120,40 @@ run_status_loss() {
   STATUS_LOSS_TIMED_OUT=$WAIT_TIMED_OUT
 }
 
+run_failed_loop() {
+  local output="$TEST_ROOT/failed-loop.out" pid
+  : > "$TEST_ROOT/failed-calls.log"
+  set -m
+  (
+    cd "$REPO" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_LOCK_WAIT_SEC=0 \
+        MAESTRO_TEST_CALL_LOG="$TEST_ROOT/failed-calls.log" \
+        MAESTRO_TEST_JOB_PHASE=completed \
+        MAESTRO_TEST_RESULT=$'RESULT: FAILED\nUNIQUE-FAILED-EVIDENCE-7319' \
+        MAESTRO_TEST_STATUS="$STATUS" \
+        bash "$LOOP" --plan "$FAILED_PLAN" --verify true \
+          --max-iters 2 --max-idle 2 --poll 1
+  ) > "$output" 2>&1 3>&1 &
+  pid=$!
+  set +m
+  wait_for_pid "$pid" 8
+  FAILED_LOOP_RC=$WAIT_RC
+  FAILED_LOOP_TIMED_OUT=$WAIT_TIMED_OUT
+}
+
 run_loop needs-first "$NEEDS_PLAN" "$NEEDS_RESULT"
 FIRST_RC=$?
 cp "$NEEDS_PLAN" "$TEST_ROOT/needs-plan.after-first"
 run_loop needs-second "$NEEDS_PLAN" "$NEEDS_RESULT"
 SECOND_RC=$?
-run_loop done "$DONE_PLAN" 'RESULT: DONE'
+run_loop "done" "$DONE_PLAN" 'RESULT: DONE'
 DONE_RC=$?
+run_loop prefix "$DONE_PLAN" 'RESULT: DONEISH'
+PREFIX_RC=$?
+run_loop last-record "$DONE_PLAN" $'RESULT: FAILED\nearlier failure\nRESULT: DONE'
+LAST_RECORD_RC=$?
+run_failed_loop
 run_status_loss
 
 t1_needs_answers_exit() {
@@ -193,6 +223,25 @@ t6_status_loss_fails_closed() {
     { echo "retained metadata is not poisoned for status loss"; return 1; }
 }
 
+t7_result_records_are_full_line_and_last_wins() {
+  [ "$PREFIX_RC" -eq 12 ] || { echo "DONEISH rc=$PREFIX_RC want 12"; return 1; }
+  grep -q 'no RESULT line' "$TEST_ROOT/prefix.progress" "$TEST_ROOT/prefix.stderr" ||
+    { echo "DONEISH was not rejected as a missing result"; return 1; }
+  [ "$LAST_RECORD_RC" -eq 0 ] || { echo "last-record rc=$LAST_RECORD_RC want 0"; return 1; }
+  grep -q 'LOOP_STATE: VERIFIED_DONE' "$TEST_ROOT/last-record.progress" ||
+    { echo "last anchored DONE record did not win"; return 1; }
+}
+
+t8_failed_result_evidence_reaches_next_dispatch() {
+  local starts evidence
+  [ "$FAILED_LOOP_TIMED_OUT" -eq 0 ] || { echo "failed-evidence loop timed out"; return 1; }
+  [ "$FAILED_LOOP_RC" -eq 12 ] || { echo "rc=$FAILED_LOOP_RC want 12"; return 1; }
+  starts=$(grep -c '^task ' "$TEST_ROOT/failed-calls.log" || true)
+  evidence=$(grep -c 'UNIQUE-FAILED-EVIDENCE-7319' "$TEST_ROOT/failed-calls.log" || true)
+  [ "$starts" -eq 2 ] || { echo "task starts=$starts want 2"; return 1; }
+  [ "$evidence" -ge 1 ] || { echo "iteration two prompt omitted failed result evidence"; return 1; }
+}
+
 check() {
   local fn="$1" label="$2" detail
   if detail=$("$fn" 2>&1); then
@@ -209,5 +258,7 @@ check t3_questions_relayed "questions remain on stdout"
 check t4_second_stop_appended "second stop appends a second history block"
 check t5_verified_done_unchanged "VERIFIED_DONE appends nothing"
 check t6_status_loss_fails_closed "status loss blocks after one dispatch and retains poison"
+check t7_result_records_are_full_line_and_last_wins "RESULT records are anchored and the last record wins"
+check t8_failed_result_evidence_reaches_next_dispatch "FAILED result evidence reaches the next dispatch"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

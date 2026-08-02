@@ -17,13 +17,16 @@ const IMPL_EFFORT = path.join(HOME, '.codex', 'maestro-impl-effort');
 const ASK = path.join(HOME, '.maestro', 'ask-on-start');
 
 let preamble = '';
-try { preamble = fs.readFileSync(CONF, 'utf8').split(/^\[/m)[0]; } catch {}
+try { preamble = fs.readFileSync(CONF, 'utf8').split(/^\s*\[/m)[0]; } catch {}
 const get = (k) => {
   const m = preamble.match(new RegExp(`^\\s*${k}\\s*=\\s*"([^"]+)"`, 'm'));
   return m ? m[1] : null;
 };
-const model = get('model') || '(Codex default — not pinned)';
-const debateEffort = get('model_reasoning_effort') || '(Codex default)';
+const pinnedModel = get('model');
+const pinnedDebateEffort = get('model_reasoning_effort');
+const model = pinnedModel || '(Codex default — not pinned)';
+const debateEffort = pinnedDebateEffort || '(Codex default — not pinned)';
+const hasDispatchPin = Boolean(pinnedModel && pinnedDebateEffort);
 let implEffort = 'medium';
 try { implEffort = fs.readFileSync(IMPL_EFFORT, 'utf8').trim() || 'medium'; } catch {}
 
@@ -52,8 +55,10 @@ if (armed && source !== 'resume') {
     'max and ultra are available for debate/design only because the companion wrapper cannot\n' +
     'express them as an explicit per-job implementation effort.\n' +
     'Then apply their picks:  bash ~/.claude/hooks/codex-model-select.sh <model> <debate-effort> <impl-effort>\n' +
-    'and confirm the new settings in one line. If the user declines, says "keep current", or skips,\n' +
-    'skip silently and proceed without running anything.'
+    'and confirm the new settings in one line. “Keep current” is valid only when the current pin is\n' +
+    (hasDispatchPin
+      ? 'complete; if the user declines or skips, preserve it and proceed.\n'
+      : 'NOT complete: explain that Maestro cannot dispatch Codex until values are selected; do not claim setup succeeded.\n')
   );
 } else {
   process.stdout.write(

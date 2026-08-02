@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIB="$ROOT/hooks/lib-companion.sh"
 LOOP="$ROOT/hooks/implementer-loop.sh"
 FAKE="$ROOT/tests/fixtures/fake-companion.mjs"
+REAL_NODE=$(node -p 'process.execPath')
 [ -f "$FAKE" ] || { echo "VERIFY FAIL: missing fixture $FAKE"; exit 1; }
 TEST_ROOT=$(mktemp -d /tmp/maestro-planf-green.XXXXXXXX)
 trap 'rm -rf "$TEST_ROOT"' EXIT
@@ -34,6 +35,23 @@ confirmed_ps_path() {  # dir
   printf '%s:%s' "$bin" "$PATH"
 }
 
+tz_sensitive_ps_path() {  # dir
+  local bin="$1/tz-sensitive-ps"
+  mkdir -p "$bin"
+  cat > "$bin/ps" <<'EOF'
+#!/bin/sh
+if [ "${TZ:-}" = "UTC0" ] && [ "${LC_ALL:-}" = "C" ]; then
+  printf 'Mon Jan  1 00:00:00 2026\n'
+elif [ "${TZ:-}" = "owner-zone" ]; then
+  printf 'Tue Jan  2 01:00:00 2026\n'
+else
+  printf 'Wed Jan  3 02:00:00 2026\n'
+fi
+EOF
+  chmod +x "$bin/ps"
+  printf '%s:%s' "$bin" "$PATH"
+}
+
 status_running_job() { printf '{\n  "running": [\n    {\n      "id": "%s",\n      "write": %s\n    }\n  ],\n  "latestFinished": null\n}\n' "$1" "$2"; }
 status_empty()       { printf '{\n  "running": [],\n  "latestFinished": null\n}\n'; }
 
@@ -44,8 +62,8 @@ run_clear_lease() {  # dir status stale_sec
   companion="$clear_home/.claude/plugins/cache/openai-codex/codex/test/scripts/codex-companion.mjs"
   mkdir -p "$clear_shim" "$(dirname "$companion")" || return 1
   ln -sf "$FAKE" "$companion" || return 1
-  printf '#!/usr/bin/env bash\nshift\nexport HOME=%q\nexport PATH=%q\nexec node %q "$@"\n' \
-    "$HOME" "$PATH" "$FAKE" > "$clear_shim/node" || return 1
+  printf '#!/usr/bin/env bash\nif [ "${1:-}" = "-e" ]; then exec %q "$@"; fi\nshift\nexec %q %q "$@"\n' \
+    "$REAL_NODE" "$REAL_NODE" "$FAKE" > "$clear_shim/node" || return 1
   chmod +x "$clear_shim/node" || return 1
   (
     cd "$dir" || exit 1
@@ -859,9 +877,199 @@ t36() (
   return 0
 )
 
+# ---------------------------------------------------------------- step 37
+# Repository safety must see writers from every companion session.
+t37() (
+  local dir writers rc; dir=$(ws cross_session_writer)
+  status_running_job task-session-a-writer true > "$dir/status.json"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  export MAESTRO_TEST_STATUS="$dir/status.json"
+  export MAESTRO_TEST_STATUS_SESSION_ID=session-a
+  export CODEX_COMPANION_SESSION_ID=session-b
+  writers=$(companion_workspace_writers "$FAKE"); rc=$?
+  [ "$rc" -eq 0 ] || { echo "global status rc=$rc want 0"; return 1; }
+  printf '%s\n' "$writers" | awk '$1 == "task-session-a-writer" && $2 == "true" { found = 1 } END { exit !found }' ||
+    { echo "session B could not see session A writer: ${writers:-empty}"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 38
+# Process identity is stable across caller locale and timezone changes.
+t38() (
+  local dir lock owner_token out rc; dir=$(ws process_identity_tz)
+  status_empty > "$dir/status.json"
+  cd "$dir" || exit 1
+  . "$LIB"
+  companion_resolve() { printf '%s' "$FAKE"; }
+  progress_init
+  PATH=$(tz_sensitive_ps_path "$dir"); export PATH
+  export TZ=owner-zone LC_ALL=POSIX
+  export MAESTRO_TEST_STATUS="$dir/status.json"
+  write_lock_acquire task-tz-owner-aaaaaa >/dev/null 2>&1 || return 1
+  lock="$dir/.maestro-write.lock"
+  owner_token=$MAESTRO_LOCK_TOKEN
+  unset MAESTRO_LOCK_TOKEN
+  export TZ=contender-zone LC_ALL=C
+  out=$(write_lock_acquire task-tz-contender-aaaaaa 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11 after TZ/locale change: $out"; return 1; }
+  [ "$(write_lock_metadata_value "$lock/metadata" token)" = "$owner_token" ] ||
+    { echo "live owner's token changed after TZ/locale change"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 39
+# A stale heartbeat is not permission to clear a still-live recorded owner.
+t39() (
+  local dir lock status out rc now owner_start; dir=$(ws clear_stale_live_owner)
+  lock="$dir/.maestro-write.lock"
+  status="$dir/status.json"
+  now=$(date +%s)
+  owner_start=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$$" 2>/dev/null |
+    sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$owner_start" ] || { echo "could not read test owner identity"; return 1; }
+  mkdir -p "$lock"
+  printf 'token=stale-live\npid=%s\nprocess_start=%s\njob_id=task-stale-live\nsession_id=session-stale-live\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
+    "$$" "$owner_start" "$((now - 5))" > "$lock/metadata"
+  printf 'token=stale-live\nepoch=%s\n' "$((now - 5))" > "$lock/heartbeat"
+  status_empty > "$status"
+  out=$(run_clear_lease "$dir" "$status" 1 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11: $out"; return 1; }
+  grep -q 'refusing to clear.*owner process is still alive' <<< "$out" ||
+    { echo "live-owner refusal missing: $out"; return 1; }
+  [ -d "$lock" ] || { echo "stale heartbeat cleared a live owner"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 40
+# A stale classification cannot delete a generation acquired while the reclaimer was paused.
+t40() (
+  local dir lock state shim real_rm bpid apid brc arc successes
+  dir=$(ws concurrent_reclaim)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  state="$dir/reclaim-state"
+  shim="$state/shim"
+  real_rm=$(command -v rm)
+  mkdir -p "$lock" "$shim"
+  status_empty > "$dir/status.json"
+  printf 'token=old\npid=999999\nprocess_start=dead\njob_id=task-old\nsession_id=session-old\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' > "$lock/metadata"
+  cat > "$shim/rm" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  if [ "\$arg" = "$lock/metadata" ] && [ "\${MAESTRO_TEST_RECLAIMER:-}" = B ] &&
+    [ ! -d "$lock/.reclaim" ] && [ ! -e "$state/b-paused-once" ]; then
+    : > "$state/b-paused-once"
+    while [ ! -e "$state/a-ready" ]; do sleep 0.05; done
+    break
+  fi
+done
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$shim/rm"
+
+  run_reclaimer() {
+    local role="$1" path="$2"
+    (
+      cd "$dir" || exit 1
+      . "$LIB"
+      companion_resolve() { printf '%s' "$FAKE"; }
+      progress_init
+      export MAESTRO_TEST_STATUS="$dir/status.json"
+      export MAESTRO_TEST_RECLAIMER="$role"
+      export PATH="$path"
+      write_lock_acquire "task-${role}-owner" >/dev/null 2>&1
+      rc=$?
+      printf '%s\n' "$rc" > "$state/${role}.rc"
+      [ "$rc" -ne 0 ] || printf '%s\n' "$MAESTRO_LOCK_TOKEN" > "$state/${role}.token"
+      : > "$state/${role}-ready"
+      while [ ! -e "$state/release-${role}" ]; do sleep 0.05; done
+    )
+  }
+
+  run_reclaimer B "$shim:$PATH" & bpid=$!
+  for _ in $(seq 1 100); do
+    [ -e "$state/b-paused-once" ] || [ -e "$state/B-ready" ] || { sleep 0.05; continue; }
+    break
+  done
+  [ -e "$state/b-paused-once" ] || [ -e "$state/B-ready" ] ||
+    { kill "$bpid" 2>/dev/null || :; echo "reclaimer B did not reach acquisition"; return 1; }
+
+  run_reclaimer A "$PATH" & apid=$!
+  for _ in $(seq 1 100); do
+    [ -e "$state/A-ready" ] && [ -e "$state/B-ready" ] || { sleep 0.05; continue; }
+    break
+  done
+  if [ ! -e "$state/A-ready" ] || [ ! -e "$state/B-ready" ]; then
+    : > "$state/release-A"; : > "$state/release-B"
+    kill "$apid" "$bpid" 2>/dev/null || :
+    echo "concurrent reclaimers did not finish"
+    return 1
+  fi
+  brc=$(sed -n '1p' "$state/B.rc")
+  arc=$(sed -n '1p' "$state/A.rc")
+  successes=0
+  [ "$brc" -eq 0 ] && successes=$((successes + 1))
+  [ "$arc" -eq 0 ] && successes=$((successes + 1))
+  : > "$state/release-A"; : > "$state/release-B"
+  wait "$apid" 2>/dev/null || :
+  wait "$bpid" 2>/dev/null || :
+  [ "$successes" -eq 1 ] ||
+    { echo "successful reclaimers=$successes want 1 (A=$arc B=$brc)"; return 1; }
+  winner=A; [ "$brc" -eq 0 ] && winner=B
+  winner_token=$(sed -n '1p' "$state/${winner}.token")
+  recorded_token=$(sed -n 's/^token=//p' "$lock/metadata" 2>/dev/null | head -1)
+  [ -n "$winner_token" ] && [ "$recorded_token" = "$winner_token" ] ||
+    { echo "successful reclaimer $winner lost ownership (winner=$winner_token recorded=${recorded_token:-missing})"; return 1; }
+  return 0
+)
+
+# ---------------------------------------------------------------- step 41
+# A large wait poll cannot overshoot the documented wait cap.
+t41() (
+  local dir out rc started elapsed; dir=$(ws wait_poll_clipped)
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  write_lock_acquire task-wait-clipped-aaaaaa >/dev/null 2>&1 || return 1
+  unset MAESTRO_LOCK_TOKEN
+  export MAESTRO_LOCK_WAIT_SEC=1 MAESTRO_LOCK_WAIT_POLL_SEC=4
+  started=$(date +%s)
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ "$elapsed" -le 2 ] || { echo "elapsed=${elapsed}s exceeded 1s cap by more than clock granularity: $out"; return 1; }
+)
+
+# ---------------------------------------------------------------- step 42
+# Repository-global writer parsing accepts valid compact JSON and rejects bad entries.
+t42() (
+  local dir output rc; dir=$(ws compact_writer_status)
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  printf '%s\n' '{"running":[],"latestFinished":null}' > "$dir/status.json"
+  export MAESTRO_TEST_STATUS="$dir/status.json"
+  output=$(companion_workspace_writers "$FAKE"); rc=$?
+  [ "$rc" -eq 0 ] && [ -z "$output" ] ||
+    { echo "compact empty status rc=$rc output=${output:-empty}"; return 1; }
+
+  printf '%s\n' '{"running":[{"id":"task-compact0-aaaaaa","write":true}],"latestFinished":null}' > "$dir/status.json"
+  output=$(companion_workspace_writers "$FAKE"); rc=$?
+  [ "$rc" -eq 0 ] || { echo "compact writer status rc=$rc"; return 1; }
+  [ "$output" = $'task-compact0-aaaaaa\ttrue' ] ||
+    { echo "compact writer output=$output"; return 1; }
+
+  printf '%s\n' '{"running":[{"id":"task-bad0000-aaaaaa"}]}' > "$dir/status.json"
+  companion_workspace_writers "$FAKE" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 4 ] || { echo "malformed writer entry rc=$rc want 4"; return 1; }
+)
+
 printf '=== Plan F green-phase verification ===\n'
 for t in t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t16 t17 \
-  t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 t29 t30 t31 t32 t33 t34 t35 t36; do
+  t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 t29 t30 t31 t32 t33 t34 t35 t36 t37 t38 t39 t40 t41 t42; do
   msg=$($t 2>&1) && ok "$t" || bad "$t" "${msg:-no detail}"
 done
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

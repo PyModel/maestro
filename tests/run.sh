@@ -16,16 +16,61 @@ if [ "$suite_timeout_invalid" -eq 1 ]; then
   SUITE_TIMEOUT=600
 fi
 
+suite_descendants() { # root pid
+  ps -axo pid=,ppid= 2>/dev/null | awk -v root="$1" '
+    { pid[NR] = $1; parent[$1] = $2 }
+    END {
+      selected[root] = 1
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (i = 1; i <= NR; i++) {
+          current = pid[i]
+          if (!selected[current] && selected[parent[current]]) {
+            selected[current] = 1
+            changed = 1
+          }
+        }
+      }
+      for (i = 1; i <= NR; i++) if (pid[i] != root && selected[pid[i]]) print pid[i]
+    }
+  '
+}
+
+terminate_suite_tree() { # process-group leader
+  local root="$1" descendants descendant ticks=0 alive
+  descendants=$(suite_descendants "$root")
+  kill -TERM -"$root" 2>/dev/null || :
+  for descendant in $descendants; do kill -TERM "$descendant" 2>/dev/null || :; done
+  while [ "$ticks" -lt 50 ]; do
+    alive=0
+    kill -0 -"$root" 2>/dev/null && alive=1
+    for descendant in $descendants; do
+      kill -0 "$descendant" 2>/dev/null && alive=1
+    done
+    [ "$alive" -eq 1 ] || break
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  kill -KILL -"$root" 2>/dev/null || :
+  for descendant in $descendants; do kill -KILL "$descendant" 2>/dev/null || :; done
+}
+
 if [ "$#" -gt 0 ]; then
   suites="$*"
 else
   suites="gate.sh
+install.sh
+model-selector.sh
 preflight.sh
 lease.sh
 liveness.sh
 stop-report.sh
 bounded-calls.sh
+runner-timeout.sh
 shared-git-dir.sh
+provenance-edge.sh
+discussion.sh
 detection.sh
 orphan-lifecycle.sh
 commit-invariance.sh
@@ -48,13 +93,7 @@ for suite in $suites; do
     elapsed=$((elapsed + 1))
   done
   if [ "$timed_out" -eq 1 ]; then
-    kill -TERM -"$pid" 2>/dev/null || :
-    grace=0
-    while kill -0 -"$pid" 2>/dev/null && [ "$grace" -lt 5 ]; do
-      sleep 1
-      grace=$((grace + 1))
-    done
-    kill -KILL -"$pid" 2>/dev/null || :
+    terminate_suite_tree "$pid"
   fi
   wait "$pid" 2>/dev/null
   rc=$?

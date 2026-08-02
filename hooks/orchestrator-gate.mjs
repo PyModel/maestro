@@ -11,7 +11,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { isNonCode } from './maestro-policy.mjs';
+import { isNonCode, isValidSessionId } from './maestro-policy.mjs';
+
+const MAESTRO_DIR = path.join(os.homedir(), '.maestro');
+const AUTHORIZATION_DIR = path.join(MAESTRO_DIR, 'direct-edit');
 
 const failClosed = () => {
   process.stderr.write(
@@ -28,10 +31,33 @@ try {
   failClosed();
 }
 
-if (!payload || typeof payload !== 'object') failClosed();
+if (!payload || typeof payload !== 'object' || Array.isArray(payload)) failClosed();
+if (!isValidSessionId(payload.session_id)) failClosed();
 const filePath = payload.tool_input?.file_path;
 if (typeof filePath !== 'string' || filePath.trim() === '') failClosed();
 if (payload.cwd !== undefined && typeof payload.cwd !== 'string') failClosed();
+
+function canonicalPolicyPath(absolutePath) {
+  let cursor = absolutePath;
+  const missing = [];
+  while (true) {
+    let stat;
+    try {
+      stat = fs.lstatSync(cursor);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw error;
+      missing.unshift(path.basename(cursor));
+      cursor = parent;
+      continue;
+    }
+    if (stat.isSymbolicLink() || stat.isFile() || stat.isDirectory()) {
+      return path.join(fs.realpathSync(cursor), ...missing);
+    }
+    return path.join(cursor, ...missing);
+  }
+}
 
 try {
   const cwd =
@@ -39,22 +65,30 @@ try {
   const resolvedPath = path.isAbsolute(filePath)
     ? path.resolve(filePath)
     : path.resolve(cwd, filePath);
-  const sid = payload.session_id || 'default';
+  const policyPath = canonicalPolicyPath(resolvedPath);
+  const sid = payload.session_id;
 
   // Scratch roots are anchored: ordinary repository dirs named tmp or Desktop
   // must not become write bypasses. Harness dirs remain exempt at any segment.
   const scratchRoots = new Set(['/tmp', '/private/tmp', os.tmpdir()]);
   const inScratchRoot = [...scratchRoots].some(
-    (root) => resolvedPath.startsWith(`${root}${path.sep}`)
+    (root) => policyPath.startsWith(`${root}${path.sep}`)
   );
-  const desktopRoot = path.join(os.homedir(), 'Desktop');
-  const inDesktop = resolvedPath.startsWith(`${desktopRoot}${path.sep}`);
-  const inHarnessDir = resolvedPath
+  const desktopRoot = canonicalPolicyPath(path.join(os.homedir(), 'Desktop'));
+  const inDesktop = policyPath.startsWith(`${desktopRoot}${path.sep}`);
+  const inHarnessDir = policyPath
     .split(path.sep)
     .some((segment) => segment === '.claude' || segment === '.codex');
   if (inScratchRoot || inDesktop || inHarnessDir) process.exit(0);
 
-  if (isNonCode(resolvedPath)) process.exit(0);
+  let executable = false;
+  try {
+    const stat = fs.statSync(policyPath);
+    executable = stat.isFile() && (stat.mode & 0o111) !== 0;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  if (!executable && isNonCode(policyPath)) process.exit(0);
 
   const isSubagent = [payload.agent_id, payload.agent_type].some(
     (value) => typeof value === 'string' && value.trim() !== ''
@@ -78,7 +112,20 @@ try {
     process.exit(2);
   }
 
-  if (fs.existsSync(`/tmp/maestro-direct-${sid}.flag`)) process.exit(0);
+  const flag = path.join(AUTHORIZATION_DIR, `maestro-direct-${sid}.flag`);
+  try {
+    const expectedUid = typeof process.getuid === 'function' ? process.getuid() : null;
+    for (const directory of [MAESTRO_DIR, AUTHORIZATION_DIR]) {
+      const stat = fs.lstatSync(directory);
+      if (stat.isSymbolicLink() || !stat.isDirectory() || (stat.mode & 0o077) !== 0 ||
+          (expectedUid !== null && stat.uid !== expectedUid)) throw new Error('unsafe authorization directory');
+    }
+    const stat = fs.lstatSync(flag);
+    if (stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o077) === 0 &&
+        (expectedUid === null || stat.uid === expectedUid) && fs.readFileSync(flag, 'utf8') === '1\n') {
+      process.exit(0);
+    }
+  } catch {}
   process.stderr.write(blockMessage);
   process.exit(2);
 } catch {

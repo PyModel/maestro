@@ -32,6 +32,12 @@ progress_init() {
 
 progress() { printf '%s\n' "$*" >&3; }
 
+companion_result_state() { # result text → last valid full-line state
+  printf '%s\n' "$1" |
+    sed -nE 's/^RESULT:[[:space:]]*(DONE|NEEDS_ANSWERS|BLOCKED|FAILED)[[:space:]]*$/\1/p' |
+    tail -1
+}
+
 # This is the companion wrapper's allowlist, not the Codex binary's. The wrapper
 # is narrower: Codex also accepts max and ultra when it reads effort from config.
 COMPANION_WRAPPER_REASONING_EFFORTS=(none minimal low medium high xhigh)
@@ -46,7 +52,7 @@ companion_wrapper_accepts_effort() {
 
 repo_digest() {
   local inside worktrees roots root_list digest material tracked untracked paths entries
-  local regular_paths hashes link_output link_rc path type mode contents worktree
+  local regular_paths hashes link_output link_rc path type mode contents worktree nested_list candidate nested_top
   inside=$(git rev-parse --is-inside-work-tree 2>/dev/null) || return 1
   [ "$inside" = "true" ] || return 1
   worktrees=$(git worktree list --porcelain 2>/dev/null) || return 1
@@ -56,9 +62,26 @@ repo_digest() {
   if ! (
     while IFS= read -r worktree; do
       [ -n "$worktree" ] || continue
+      if [ ! -d "$worktree" ] ||
+        ! git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        printf 'MAESTRO_DIGEST: skipping invalid/prunable worktree record: %s\n' "$worktree" >&2
+        continue
+      fi
       printf '%s\n' "$worktree"
       git -C "$worktree" submodule foreach --recursive --quiet \
         'printf "%s\n" "$PWD"' 2>/dev/null || exit 1
+      nested_list="${root_list}.nested"
+      git -C "$worktree" ls-files --others --exclude-standard -z \
+        > "$nested_list" 2>/dev/null || exit 1
+      while IFS= read -r -d '' path; do
+        candidate="$worktree/${path%/}"
+        [ -e "$candidate/.git" ] || continue
+        nested_top=$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null) || continue
+        nested_top=$(cd "$nested_top" 2>/dev/null && pwd -P) || continue
+        [ "$nested_top" = "$(cd "$candidate" 2>/dev/null && pwd -P)" ] || continue
+        printf '%s\n' "$nested_top"
+      done < "$nested_list"
+      rm -f "$nested_list"
     done <<< "$worktrees"
   ) > "$root_list"; then
     rm -f "$root_list"
@@ -131,13 +154,13 @@ repo_digest() {
       if [ -s "$regular_paths" ]; then
         # xargs is serial: it preserves the sorted NUL-delimited path order, and
         # hash-object emits exactly one output line per argument in argument order.
-        if ! xargs -0 git -C "$worktree" hash-object -- \
+        if ! xargs -0 git -C "$worktree" hash-object --no-filters -- \
           < "$regular_paths" > "$hashes" 2>/dev/null; then
           # A path can vanish after enumeration. Re-run only this degraded case
           # individually so the unavailable marker stays paired with that path.
           : > "$hashes"
           while IFS= read -r -d '' path; do
-            if contents=$(git -C "$worktree" hash-object -- "$path" 2>/dev/null); then
+            if contents=$(git -C "$worktree" hash-object --no-filters -- "$path" 2>/dev/null); then
               printf '%s\n' "$contents"
             else
               printf 'unavailable\n'
@@ -164,7 +187,7 @@ repo_digest() {
     rm -f "$material" "$tracked" "$untracked" "$paths" "$entries" "$regular_paths" "$hashes"
     return 1
   fi
-  if ! digest=$(shasum < "$material" | awk '{print $1}'); then
+  if ! digest=$(git hash-object --no-filters --stdin < "$material" 2>/dev/null); then
     rm -f "$material" "$tracked" "$untracked" "$paths" "$entries" "$regular_paths" "$hashes"
     return 1
   fi
@@ -252,19 +275,39 @@ repo_digest_is_observed() {
   esac
 }
 
+write_lock_scope_root() {
+  local dir top parent selected=""
+  dir=$(pwd -P) || return 1
+  while :; do
+    if top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
+      top=$(cd "$top" 2>/dev/null && pwd -P) || return 1
+      selected=$top
+      dir=$(dirname "$top")
+    else
+      parent=$(dirname "$dir")
+      [ "$parent" != "$dir" ] || break
+      dir=$parent
+    fi
+  done
+  [ -n "$selected" ] || return 1
+  printf '%s\n' "$selected"
+}
+
 write_lock_path() {
   local workspace git_dir
-  workspace=$(pwd -P)
-  if { git_dir=$(git rev-parse --git-common-dir 2>/dev/null) && [ -n "$git_dir" ]; } ||
-    git_dir=$(git rev-parse --git-dir 2>/dev/null); then
-    case "$git_dir" in
-      /*) ;;
-      *) git_dir="$workspace/$git_dir" ;;
-    esac
-    printf '%s/maestro-write.lock' "$(cd "$git_dir" && pwd -P)"
-  else
-    printf '%s/.maestro-write.lock' "$workspace"
+  if workspace=$(write_lock_scope_root); then
+    if { git_dir=$(git -C "$workspace" rev-parse --git-common-dir 2>/dev/null) && [ -n "$git_dir" ]; } ||
+      git_dir=$(git -C "$workspace" rev-parse --git-dir 2>/dev/null); then
+      case "$git_dir" in
+        /*) ;;
+        *) git_dir="$workspace/$git_dir" ;;
+      esac
+      printf '%s/maestro-write.lock' "$(cd "$git_dir" && pwd -P)"
+      return 0
+    fi
   fi
+  workspace=$(pwd -P) || return 1
+  printf '%s/.maestro-write.lock' "$workspace"
 }
 
 provenance_log_path() {
@@ -280,16 +323,66 @@ provenance_log_path() {
   esac
 }
 
+provenance_log_append() { # path record
+  local log_path="$1" record="$2"
+  node -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const [file, record] = process.argv.slice(1);
+    const noFollow = fs.constants.O_NOFOLLOW;
+    if (noFollow === undefined) process.exit(2);
+    const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND |
+      fs.constants.O_CREAT | noFollow;
+    try {
+      const fd = fs.openSync(file, flags, 0o600);
+      try {
+        fs.fchmodSync(fd, 0o600);
+        fs.writeFileSync(fd, `${record}\n`);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch (error) {
+      if (error?.code !== "ELOOP") throw error;
+      const temp = path.join(path.dirname(file),
+        `.maestro-provenance.${process.pid}.${Date.now()}`);
+      try {
+        fs.writeFileSync(temp, `${record}\n`, { flag: "wx", mode: 0o600 });
+        fs.renameSync(temp, file);
+      } catch (replaceError) {
+        try { fs.rmSync(temp); } catch {}
+        throw replaceError;
+      }
+    }
+  ' "$log_path" "$record" 2>/dev/null
+}
+
 write_lock_metadata_value() {
   local metadata="$1" field="$2"
   sed -n "s/^${field}=//p" "$metadata" 2>/dev/null | head -1
 }
 
 write_lock_publish_metadata() {   # lock_dir token record
-  local lock_dir="$1" token="$2" record="$3" metadata temp
+  local lock_dir="$1" token="$2" record="$3" metadata temp recorded_token
   metadata="$lock_dir/metadata"
   temp="$lock_dir/metadata.tmp.$token"
-  if printf '%s\n' "$record" > "$temp" && mv -f "$temp" "$metadata"; then
+  [ ! -d "$lock_dir/.reclaim" ] || return 1
+  if [ -f "$metadata" ]; then
+    recorded_token=$(write_lock_metadata_value "$metadata" token)
+    [ "$recorded_token" = "$token" ] || return 1
+  fi
+  printf '%s\n' "$record" > "$temp" || return 1
+  if [ -d "$lock_dir/.reclaim" ]; then
+    rm -f "$temp" 2>/dev/null || :
+    return 1
+  fi
+  if [ -f "$metadata" ]; then
+    recorded_token=$(write_lock_metadata_value "$metadata" token)
+    if [ "$recorded_token" != "$token" ]; then
+      rm -f "$temp" 2>/dev/null || :
+      return 1
+    fi
+  fi
+  if mv -f "$temp" "$metadata"; then
     return 0
   fi
   rm -f "$temp" 2>/dev/null || :
@@ -365,6 +458,15 @@ write_lock_heartbeat_stale_sec() {
   printf '%s\n' "$stale"
 }
 
+write_lock_process_start() {   # pid
+  LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null |
+    sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+write_lock_path_mtime_epoch() { # path
+  stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1" 2>/dev/null
+}
+
 write_lock_session_id() {   # prints a validated session id, or unknown
   local session_id="${MAESTRO_SESSION_ID:-}"
   case "$session_id" in
@@ -384,12 +486,15 @@ write_lock_session_id() {   # prints a validated session id, or unknown
 # ponytail: no ticket files, so no arrival order and nothing to reap — the cap
 # bounds starvation. Add FIFO only if starvation is actually reproduced.
 write_lock_wait_tick() {   # deadline job session lock_dir
-  local deadline="$1" job="$2" session="$3" lock_dir="$4" now
+  local deadline="$1" job="$2" session="$3" lock_dir="$4" now remaining sleep_for
   [ "$deadline" -gt 0 ] 2>/dev/null || return 1
   now=$(date +%s)
   [ "$now" -lt "$deadline" ] || return 1
-  progress "MAESTRO_LOCK: waiting for the write lease held by job=$job session=$session — $((deadline - now))s left before blocking (lock: $lock_dir); arrival order is not guaranteed"
-  sleep "$MAESTRO_LOCK_WAIT_POLL_SEC"
+  remaining=$((deadline - now))
+  sleep_for=$MAESTRO_LOCK_WAIT_POLL_SEC
+  [ "$sleep_for" -le "$remaining" ] || sleep_for=$remaining
+  progress "MAESTRO_LOCK: waiting for the write lease held by job=$job session=$session — ${remaining}s left before blocking (lock: $lock_dir); arrival order is not guaranteed"
+  sleep "$sleep_for"
   return 0
 }
 
@@ -412,11 +517,13 @@ write_lock_poison_gate() {   # lock_dir metadata → 11 when poisoned (after pri
 }
 
 write_lock_is_owner() {
-  local metadata recorded_token
+  local lock_dir metadata recorded_token
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || {
     [ -n "${MAESTRO_LOCK_TOKEN:-}" ] || return 1
   }
-  metadata="${MAESTRO_LOCK_DIR:-$(write_lock_path)}/metadata"
+  lock_dir="${MAESTRO_LOCK_DIR:-$(write_lock_path)}"
+  [ ! -d "$lock_dir/.reclaim" ] || return 1
+  metadata="$lock_dir/metadata"
   [ -f "$metadata" ] || return 1
   recorded_token=$(write_lock_metadata_value "$metadata" token)
   [ -n "${MAESTRO_LOCK_TOKEN:-}" ] &&
@@ -432,91 +539,31 @@ companion_call() {
 
 companion_workspace_writers() {
   local C="$1" status parsed rc
-  if ! status=$(companion_call "$C" status --all --json 2>/dev/null); then
+  if ! status=$(unset CODEX_COMPANION_SESSION_ID; companion_call "$C" status --all --json 2>/dev/null); then
     return 4
   fi
   [ -n "${status//[[:space:]]/}" ] || return 4
 
-  parsed=$(printf '%s\n' "$status" | awk '
-    function trim(value) {
-      sub(/^[[:space:]]+/, "", value)
-      sub(/[[:space:]]+$/, "", value)
-      return value
-    }
-    BEGIN {
-      first = ""
-      last = ""
-      seen_running = 0
-      closed_running = 0
-      in_running = 0
-      depth = 0
-      bad = 0
-    }
-    {
-      line = $0
-      stripped = trim(line)
-      if (stripped != "") {
-        if (first == "") first = stripped
-        last = stripped
-      }
-
-      if (!in_running) {
-        if (line ~ /^[[:space:]]*"running"[[:space:]]*:[[:space:]]*\[[[:space:]]*\][[:space:]]*,?[[:space:]]*$/) {
-          seen_running = 1
-          closed_running = 1
-        } else if (line ~ /^[[:space:]]*"running"[[:space:]]*:[[:space:]]*\[[[:space:]]*$/) {
-          seen_running = 1
-          in_running = 1
+  parsed=$(printf '%s\n' "$status" | node -e '
+    let input = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => {
+      try {
+        const value = JSON.parse(input);
+        if (!value || typeof value !== "object" || Array.isArray(value) ||
+            !Array.isArray(value.running)) process.exit(4);
+        for (const job of value.running) {
+          if (!job || typeof job !== "object" || Array.isArray(job) ||
+              typeof job.id !== "string" || !/^task-[a-z0-9][a-z0-9-]*$/.test(job.id) ||
+              typeof job.write !== "boolean") process.exit(4);
+          process.stdout.write(`${job.id}\t${job.write}\n`);
         }
-        next
+      } catch {
+        process.exit(4);
       }
-
-      if (depth == 0 && line ~ /^[[:space:]]*\][[:space:]]*,?[[:space:]]*$/) {
-        in_running = 0
-        closed_running = 1
-        next
-      }
-
-      if (line ~ /\{[[:space:]]*$/) {
-        depth++
-        if (depth == 1) {
-          job_id = ""
-          write_flag = ""
-        }
-        next
-      }
-
-      if (line ~ /^[[:space:]]*\}[[:space:]]*,?[[:space:]]*$/) {
-        if (depth == 1) {
-          if (job_id == "" || write_flag == "") {
-            bad = 1
-          } else {
-            print job_id, write_flag
-          }
-        }
-        depth--
-        if (depth < 0) bad = 1
-        next
-      }
-
-      if (depth == 1 && line ~ /^[[:space:]]*"id"[[:space:]]*:[[:space:]]*"[^"]*"[[:space:]]*,?[[:space:]]*$/) {
-        value = line
-        sub(/^[[:space:]]*"id"[[:space:]]*:[[:space:]]*"/, "", value)
-        sub(/"[[:space:]]*,?[[:space:]]*$/, "", value)
-        job_id = value
-      } else if (depth == 1 && line ~ /^[[:space:]]*"write"[[:space:]]*:[[:space:]]*(true|false)[[:space:]]*,?[[:space:]]*$/) {
-        value = line
-        sub(/^[[:space:]]*"write"[[:space:]]*:[[:space:]]*/, "", value)
-        sub(/[[:space:]]*,?[[:space:]]*$/, "", value)
-        write_flag = value
-      }
-    }
-    END {
-      if (first != "{" || last != "}" || !seen_running || !closed_running || in_running || depth != 0 || bad) {
-        exit 4
-      }
-    }
-  ')
+    });
+  ' 2>/dev/null)
   rc=$?
   [ "$rc" -eq 0 ] || return 4
   [ -n "$parsed" ] && printf '%s\n' "$parsed"
@@ -535,7 +582,7 @@ write_lock_acquire() {
   local identity_note owner_session malformed_metadata
   local writers writers_rc digest_before log_path last prior_job prior_after observed_at
   local stale_digest_before stale_digest_after stale_released_at session_id started_at
-  local metadata_record
+  local metadata_record reclaim_dir current_token
   local wait_cap wait_poll wait_deadline initializing_grace
   local heartbeat_stale heartbeat_epoch heartbeat_effective heartbeat_age heartbeat_note
   MAESTRO_LOCK_ACQUIRED=0
@@ -588,7 +635,7 @@ write_lock_acquire() {
     write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata" || return 11
     if mkdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
       token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-      process_start=$(ps -o lstart= -p "$$" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+      process_start=$(write_lock_process_start "$$")
       # ponytail: mkdir gives mutual exclusion; ps only sharpens stale-owner recovery.
       # Without it, record the gap and let the contention path fail closed instead.
       if [ -z "$process_start" ]; then
@@ -618,7 +665,8 @@ write_lock_acquire() {
         progress "MAESTRO_LOCK: repository digest could not be recorded; lease retains digest_before=unavailable (lock: $MAESTRO_LOCK_DIR)"
       fi
 
-      if log_path=$(provenance_log_path 2>/dev/null) && [ -f "$log_path" ]; then
+      if log_path=$(provenance_log_path 2>/dev/null) &&
+        [ -f "$log_path" ] && [ ! -L "$log_path" ]; then
         last=$(grep -E '^[^ ]+ type=(dispatch|orphan-adopted) job=[^ ]+( session=[^ ]+)? before=[^ ]+ after=[^ ]+$' \
           "$log_path" 2>/dev/null | tail -1)
         if [ -n "$last" ]; then
@@ -630,9 +678,8 @@ write_lock_acquire() {
             [ "$prior_after" != "$digest_before" ]; then
             observed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
             progress "PROVENANCE: BASELINE GAP — tree at acquisition differs from the prior completed snapshot (prior_job=$prior_job, expected=$prior_after, observed=$digest_before); author unknown"
-            printf '%s type=gap prior_job=%s session=%s expected=%s observed=%s\n' \
-              "$observed_at" "$prior_job" "${session_id:-unknown}" "$prior_after" "$digest_before" \
-              >> "$log_path" 2>/dev/null || :
+            provenance_log_append "$log_path" "$(printf '%s type=gap prior_job=%s session=%s expected=%s observed=%s' \
+              "$observed_at" "$prior_job" "${session_id:-unknown}" "$prior_after" "$digest_before")" || :
           fi
         fi
       fi
@@ -676,7 +723,7 @@ write_lock_acquire() {
     current_start=""
     if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
       owner_alive=1
-      current_start=$(ps -o lstart= -p "$owner_pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+      current_start=$(write_lock_process_start "$owner_pid")
     fi
 
     if [ "$owner_alive" -eq 1 ] &&
@@ -750,28 +797,59 @@ write_lock_acquire() {
     # Recheck after liveness so that transition cannot be erased as stale.
     write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata" || return 11
 
-    if rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" \
-      "$MAESTRO_LOCK_DIR/heartbeat" 2>/dev/null &&
-      rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
-      progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown}"
-      stale_digest_after=$(repo_digest_bounded 2>/dev/null) || stale_digest_after=unavailable
-      if repo_digest_is_observed "$stale_digest_before" &&
-        repo_digest_is_observed "$stale_digest_after" &&
-        [ "$stale_digest_before" != "$stale_digest_after" ]; then
-        progress "PROVENANCE: ADOPTED UNOBSERVED INTERVAL — the tree changed while an orphaned lease was held (job=$owner_job, expected=$stale_digest_before, observed=$stale_digest_after); the interval was not observed and the author is unknown"
-      fi
-      stale_released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-      if log_path=$(provenance_log_path 2>/dev/null); then
-        # The interval between the orphan's last write and this steal was never observed,
-        # so the after value is adopted, not witnessed.
-        printf '%s type=orphan-adopted job=%s session=%s before=%s after=%s\n' \
-          "$stale_released_at" "$owner_job" "${owner_session:-unknown}" \
-          "$stale_digest_before" "$stale_digest_after" \
-          >> "$log_path" 2>/dev/null || :
-      fi
+    # Claim this exact generation before deletion. The second token check closes
+    # the path-reuse ABA: a delayed reclaimer may observe a successor at the same
+    # pathname, but it cannot delete that successor using the stale classification.
+    current_token=$(write_lock_metadata_value "$metadata" token)
+    if [ "$current_token" != "$recorded_token" ]; then
       attempt=$((attempt + 1))
       continue
     fi
+    reclaim_dir="$MAESTRO_LOCK_DIR/.reclaim"
+    if ! mkdir "$reclaim_dir" 2>/dev/null; then
+      progress "MAESTRO_LOCK: write dispatch blocked by a competing stale-lease reclaimer (lock: $MAESTRO_LOCK_DIR)"
+      return 11
+    fi
+    current_token=$(write_lock_metadata_value "$metadata" token)
+    if [ "$current_token" != "$recorded_token" ]; then
+      rmdir "$reclaim_dir" 2>/dev/null || :
+      attempt=$((attempt + 1))
+      continue
+    fi
+    if ! write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata"; then
+      rmdir "$reclaim_dir" 2>/dev/null || :
+      return 11
+    fi
+
+    # Observe and publish the adopted baseline while this generation claim still
+    # blocks a successor. Removing the lock first lets a successor publish and
+    # release before this older record, reversing baseline order.
+    stale_digest_after=$(repo_digest_bounded 2>/dev/null) || stale_digest_after=unavailable
+    stale_released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    if ! rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" \
+      "$MAESTRO_LOCK_DIR/heartbeat" 2>/dev/null; then
+      rmdir "$reclaim_dir" 2>/dev/null || :
+      return 11
+    fi
+    if repo_digest_is_observed "$stale_digest_before" &&
+      repo_digest_is_observed "$stale_digest_after" &&
+      [ "$stale_digest_before" != "$stale_digest_after" ]; then
+      progress "PROVENANCE: ADOPTED UNOBSERVED INTERVAL — the tree changed while an orphaned lease was held (job=$owner_job, expected=$stale_digest_before, observed=$stale_digest_after); the interval was not observed and the author is unknown"
+    fi
+    if log_path=$(provenance_log_path 2>/dev/null); then
+      # The interval between the orphan's last write and this steal was never observed,
+      # so the after value is adopted, not witnessed.
+      provenance_log_append "$log_path" "$(printf '%s type=orphan-adopted job=%s session=%s before=%s after=%s' \
+        "$stale_released_at" "$owner_job" "${owner_session:-unknown}" \
+        "$stale_digest_before" "$stale_digest_after")" || :
+    fi
+    if rmdir "$reclaim_dir" 2>/dev/null &&
+      rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
+      progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown}"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    rmdir "$reclaim_dir" 2>/dev/null || :
 
     case "$started_epoch" in
       ''|*[!0-9]*) held="unknown" ;;
@@ -812,12 +890,15 @@ write_lock_set_job() {
   session_id=$(write_lock_metadata_value "$metadata" session_id)
   session_id=$(MAESTRO_SESSION_ID="${session_id:-}" write_lock_session_id)
   next_metadata="${MAESTRO_LOCK_DIR}/metadata.new"
-  if printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
+  if ! printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
     "$recorded_token" "$owner_pid" "$owner_start" "$job" "${session_id:-unknown}" \
     "$started_at" "$started_epoch" "$digest_before" > "$next_metadata"; then
-    mv -f "$next_metadata" "$metadata"
-  else
     rm -f "$next_metadata" 2>/dev/null || :
+    return 3
+  fi
+  if ! write_lock_is_owner || ! mv -f "$next_metadata" "$metadata"; then
+    rm -f "$next_metadata" 2>/dev/null || :
+    progress "MAESTRO_LOCK: this lease changed while publishing job=$job; job update rejected"
     return 3
   fi
 }
@@ -859,7 +940,7 @@ write_lock_poison() {
 write_lock_release() {
   local metadata recorded_token owner_job owner_session writers writers_rc quiescence
   local unconfirmed_job unconfirmed_reason poison_metadata
-  local digest_before digest_after log_path released_at
+  local digest_before digest_after log_path released_at reclaim_dir current_token
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || return 0
   metadata="${MAESTRO_LOCK_DIR:-}/metadata"
   [ -n "${MAESTRO_LOCK_DIR:-}" ] && [ -f "$metadata" ] || return 0
@@ -928,16 +1009,46 @@ write_lock_release() {
     progress "MAESTRO_LOCK: write lease retained because quiescence was never confirmed (job=${unconfirmed_job:-$owner_job} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown}, lock: $MAESTRO_LOCK_DIR)"
     return 0
   fi
-  rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" \
-    "$MAESTRO_LOCK_DIR/heartbeat" 2>/dev/null || return 0
-  rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
+  current_token=$(write_lock_metadata_value "$metadata" token)
+  [ "$current_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || return 0
+  reclaim_dir="$MAESTRO_LOCK_DIR/.reclaim"
+  if ! mkdir "$reclaim_dir" 2>/dev/null; then
+    progress "MAESTRO_LOCK: lease release lost the generation claim; retaining the lock"
+    return 0
+  fi
+  current_token=$(write_lock_metadata_value "$metadata" token)
+  if [ "$current_token" != "${MAESTRO_LOCK_TOKEN:-}" ]; then
+    rmdir "$reclaim_dir" 2>/dev/null || :
+    progress "MAESTRO_LOCK: lease generation changed during release; releasing nothing"
+    return 0
+  fi
+  poison_metadata="$metadata"
+  quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
+  if [ "$quiescence" != "unconfirmed" ] && [ -e "$MAESTRO_LOCK_DIR/metadata.new" ]; then
+    poison_metadata="$MAESTRO_LOCK_DIR/metadata.new"
+    quiescence=unconfirmed
+  fi
+  if [ "$quiescence" = "unconfirmed" ]; then
+    rmdir "$reclaim_dir" 2>/dev/null || :
+    progress "MAESTRO_LOCK: write lease retained because cancellation poison arrived during release (lock: $MAESTRO_LOCK_DIR)"
+    return 0
+  fi
+  # Publish the completed baseline while the generation claim still excludes a
+  # successor. Otherwise the next acquirer can compare against the older record
+  # and report this authorized dispatch as a false baseline gap.
   if log_path=$(provenance_log_path 2>/dev/null); then
     # Best-effort diagnostic only, not an enforcement boundary: repository writers can rewrite this log.
     # A differing before/after pair is a dispatch-window change with an unknown author:
     # lease metadata delimits an interval; it never identifies which process wrote.
-    printf '%s type=dispatch job=%s session=%s before=%s after=%s\n' \
-      "$released_at" "$owner_job" "${owner_session:-unknown}" "$digest_before" "$digest_after" \
-      >> "$log_path" 2>/dev/null || :
+    provenance_log_append "$log_path" "$(printf '%s type=dispatch job=%s session=%s before=%s after=%s' \
+      "$released_at" "$owner_job" "${owner_session:-unknown}" "$digest_before" "$digest_after")" || :
+  fi
+  if ! rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" \
+    "$MAESTRO_LOCK_DIR/heartbeat" 2>/dev/null ||
+    ! rmdir "$reclaim_dir" 2>/dev/null ||
+    ! rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
+    rmdir "$reclaim_dir" 2>/dev/null || :
+    return 0
   fi
   MAESTRO_LOCK_ACQUIRED=0
 }
@@ -953,7 +1064,8 @@ provenance_check() {
     printf '%s\n' "PROVENANCE: in flight — a write lease is held (job=$job), so the tree is mid-dispatch"
     return 0
   fi
-  if ! log_path=$(provenance_log_path 2>/dev/null) || [ ! -f "$log_path" ]; then
+  if ! log_path=$(provenance_log_path 2>/dev/null) ||
+    [ ! -f "$log_path" ] || [ -L "$log_path" ]; then
     printf '%s\n' "PROVENANCE: no baseline yet (first dispatch will establish one)"
     return 0
   fi
@@ -983,13 +1095,49 @@ provenance_check() {
   return 1
 }
 
+companion_version_is_newer() { # candidate current
+  awk -v left="$1" -v right="$2" '
+    BEGIN {
+      sub(/^v/, "", left)
+      sub(/^v/, "", right)
+      left_count = split(left, left_dash, "-")
+      right_count = split(right, right_dash, "-")
+      left_base = left_dash[1]
+      right_base = right_dash[1]
+      left_n = split(left_base, left_parts, ".")
+      right_n = split(right_base, right_parts, ".")
+      max = left_n > right_n ? left_n : right_n
+      for (i = 1; i <= max; i++) {
+        l = i <= left_n ? left_parts[i] : 0
+        r = i <= right_n ? right_parts[i] : 0
+        if (l !~ /^[0-9]+$/ || r !~ /^[0-9]+$/) {
+          exit left > right ? 0 : 1
+        }
+        if ((l + 0) != (r + 0)) exit (l + 0) > (r + 0) ? 0 : 1
+      }
+      left_pre = left_count > 1 ? substr(left, length(left_base) + 2) : ""
+      right_pre = right_count > 1 ? substr(right, length(right_base) + 2) : ""
+      if (left_pre == "" && right_pre != "") exit 0
+      if (left_pre != "" && right_pre == "") exit 1
+      exit left_pre > right_pre ? 0 : 1
+    }
+  '
+}
+
 companion_resolve() {
-  local c
-  c=$(ls -dt "$HOME"/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs 2>/dev/null | head -1)
-  if [ -z "$c" ] || [ ! -f "$c" ]; then
-    return 3
-  fi
-  printf '%s' "$c"
+  local base candidate version best="" best_version=""
+  base="$HOME/.claude/plugins/cache/openai-codex/codex"
+  for candidate in "$base"/*/scripts/codex-companion.mjs; do
+    [ -f "$candidate" ] || continue
+    version=${candidate#"$base"/}
+    version=${version%%/*}
+    if [ -z "$best" ] || companion_version_is_newer "$version" "$best_version"; then
+      best=$candidate
+      best_version=$version
+    fi
+  done
+  [ -n "$best" ] || return 3
+  printf '%s' "$best"
 }
 
 companion_pin() {
@@ -997,13 +1145,13 @@ companion_pin() {
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   selector="$here/codex-model-select.sh"
   if ! pin=$(bash "$selector" --pin 2>/dev/null); then
-    echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <effort>" >&2
+    echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <debate-effort> <impl-effort>" >&2
     return 3
   fi
   case "$pin" in
     *$'\t'*$'\t'*) ;;
     *)
-      echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <effort>" >&2
+      echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <debate-effort> <impl-effort>" >&2
       return 3 ;;
   esac
   model=${pin%%$'\t'*}
@@ -1011,7 +1159,11 @@ companion_pin() {
   debate_effort=${efforts%%$'\t'*}
   impl_effort=${efforts#*$'\t'}
   if [ -z "$model" ] || [ -z "$debate_effort" ] || [ -z "$impl_effort" ]; then
-    echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <effort>" >&2
+    echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <debate-effort> <impl-effort>" >&2
+    return 3
+  fi
+  if ! companion_wrapper_accepts_effort "$impl_effort"; then
+    echo "unsupported implementation effort '$impl_effort' — choose none|minimal|low|medium|high|xhigh; max/ultra are debate-only" >&2
     return 3
   fi
   printf '%s\t%s\t%s\n' "$model" "$debate_effort" "$impl_effort"
@@ -1019,7 +1171,7 @@ companion_pin() {
 
 companion_start() {
   local C="$1" PROMPT="$2" WRITE="${3:-}"
-  local PIN MODEL EFFORTS DEBATE_EFFORT IMPL_EFFORT HELP
+  local PIN MODEL EFFORTS DEBATE_EFFORT IMPL_EFFORT HELP TASK_HELP
   PIN=$(companion_pin) || return 3
   MODEL=${PIN%%$'\t'*}
   EFFORTS=${PIN#*$'\t'}
@@ -1030,26 +1182,48 @@ companion_start() {
     # describes `task` WITHOUT --write proves drift. Anything inconclusive
     # (empty, error, no synopsis) must not block a dispatch.
     HELP=$(companion_call "$C" --help 2>&1) || HELP=""
-    case "$HELP" in
-      *--write*) ;;
-      *task*)
-        echo "companion at $C describes its task subcommand without --write — the plugin may have renamed the flag (README: Plugin flag drift). Refusing to dispatch a write job blind; update Maestro or pin the previous plugin version." >&2
-        return 3 ;;
-      *) ;;
-    esac
+    TASK_HELP=$(printf '%s\n' "$HELP" |
+      grep -E '(^|[[:space:]])task([[:space:]]|$)' | head -1)
+    if [ -n "$TASK_HELP" ]; then
+      case "$TASK_HELP" in
+        *--write*) ;;
+        *)
+          echo "companion at $C describes its task subcommand without --write — the plugin may have renamed the flag (README: Plugin flag drift). Refusing to dispatch a write job blind; update Maestro or pin the previous plugin version." >&2
+          return 3 ;;
+      esac
+    fi
+  fi
+  if [ "$WRITE" = "write" ]; then
+    if ! write_lock_is_owner; then
+      progress "MAESTRO_LOCK: write launch blocked because this process no longer owns the lease"
+      return 11
+    fi
+    if ! write_lock_poison_gate "${MAESTRO_LOCK_DIR:-$(write_lock_path)}" \
+      "${MAESTRO_LOCK_DIR:-$(write_lock_path)}/metadata"; then
+      return 11
+    fi
   fi
   local -a args=(task --background)
   [ "$WRITE" = "write" ] && args+=(--write)
   args+=(--model "$MODEL")
   if [ "$WRITE" = "write" ]; then
-    if companion_wrapper_accepts_effort "$IMPL_EFFORT"; then
-      args+=(--effort "$IMPL_EFFORT")
-    else
-      progress "CODEX: companion wrapper cannot express implementation effort=$IMPL_EFFORT; --effort omitted and config debate tier=$DEBATE_EFFORT governs this write dispatch"
+    if ! companion_wrapper_accepts_effort "$IMPL_EFFORT"; then
+      echo "companion cannot express implementation effort=$IMPL_EFFORT; refusing to silently substitute the debate tier" >&2
+      return 3
     fi
+    args+=(--effort "$IMPL_EFFORT")
+  elif companion_wrapper_accepts_effort "$DEBATE_EFFORT"; then
+    args+=(--effort "$DEBATE_EFFORT")
+  else
+    progress "CODEX: companion wrapper cannot express debate effort=$DEBATE_EFFORT explicitly; the pinned top-level config value governs this read-only dispatch"
   fi
-  local START JOB
+  local START JOB START_RC
   START=$(companion_call "$C" "${args[@]}" "$PROMPT" 2>&1)
+  START_RC=$?
+  if [ "$START_RC" -ne 0 ]; then
+    printf 'could not start Codex job (exit %s). Output: %s' "$START_RC" "$START" >&2
+    return 3
+  fi
   JOB=$(printf '%s' "$START" | grep -oE 'task-[a-z0-9]+-[a-z0-9]+' | head -1)
   if [ -z "$JOB" ]; then
     printf 'could not start Codex job. Output: %s' "$START" >&2
@@ -1062,7 +1236,7 @@ companion_verify_pin() {
   local C="$1" JOB="$2" EXPECTED_MODEL="$3" EXPECTED_EFFORT="$4"
   local ST REQUEST MODEL_FIELD EFFORT_FIELD WRITE_FIELD
   local RECORDED_MODEL="null" RECORDED_EFFORT="null" RECORDED_WRITE=""
-  local PIN EFFORTS CONFIG_EFFORT IMPL_EFFORT
+  local PIN EFFORTS CONFIG_EFFORT
   ST=$(companion_call "$C" status "$JOB" --json 2>/dev/null)
   REQUEST=$(printf '%s' "$ST" | tr '\n' ' ' | sed -n 's/.*"request"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p' | head -1)
   MODEL_FIELD=$(printf '%s' "$REQUEST" | grep -oE '"model"[[:space:]]*:[[:space:]]*(null|"[^"]*")' | head -1)
@@ -1085,17 +1259,41 @@ companion_verify_pin() {
     PIN=$(companion_pin 2>/dev/null); then
     EFFORTS=${PIN#*$'\t'}
     CONFIG_EFFORT=${EFFORTS%%$'\t'*}
-    IMPL_EFFORT=${EFFORTS#*$'\t'}
-    if [ "$CONFIG_EFFORT" = "$EXPECTED_EFFORT" ]; then
-      case "$RECORDED_WRITE" in
-        false) return 0 ;;
-        true)
-          case "$IMPL_EFFORT" in max|ultra) return 0 ;; esac ;;
-      esac
+    if [ "$CONFIG_EFFORT" = "$EXPECTED_EFFORT" ] && [ "$RECORDED_WRITE" = false ]; then
+      return 0
     fi
   fi
   echo "Codex pin verification warning for $JOB: requested model=$EXPECTED_MODEL effort=$EXPECTED_EFFORT; recorded model=$RECORDED_MODEL effort=$RECORDED_EFFORT" >&2
   return 4
+}
+
+companion_poll_bounds_valid() { # max_idle poll
+  local max_idle="$1" poll="$2"
+  case "$max_idle" in ''|*[!0-9]*) return 1 ;; esac
+  case "$poll" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$((10#$max_idle))" -ge 1 ] && [ "$((10#$poll))" -ge 1 ]
+}
+
+companion_dispatch_budget() { # write|read
+  local mode="$1" value invalid=0
+  if [ "${MAESTRO_MAX_DISPATCH_SEC+x}" = x ]; then
+    value=$MAESTRO_MAX_DISPATCH_SEC
+  elif [ "$mode" = write ]; then
+    value=2400
+  else
+    value=1200
+  fi
+  case "$value" in
+    ''|*[!0-9]*) invalid=1 ;;
+    *) [ "$value" -ge 1 ] 2>/dev/null || invalid=1 ;;
+  esac
+  if [ "$invalid" -eq 1 ]; then
+    progress "MAESTRO_POLL: ignoring invalid MAESTRO_MAX_DISPATCH_SEC=$value; using 1200s"
+    value=1200
+  else
+    value=$((10#$value))
+  fi
+  printf '%s\n' "$value"
 }
 
 companion_cancel_job() { # C JOB REASON LOG → 124 read-only, 125 write-mode
@@ -1114,6 +1312,9 @@ companion_cancel_job() { # C JOB REASON LOG → 124 read-only, 125 write-mode
   crc=$?
   if [ "$crc" -eq 125 ]; then MAESTRO_CANCEL_REQUESTED=0; else MAESTRO_CANCEL_REQUESTED=1; fi
   progress "MAESTRO_POLL: cancel attempted reason=$REASON job=$JOB log=${log:-unknown}"
+  if [ "$write_mode" -eq 1 ] && [ "$REASON" = deadline ]; then
+    progress "MAESTRO_RECOVERY: UNREPORTED_PARTIAL job=$JOB reason=deadline; the tree may contain incomplete edits and local verification did not run. Confirm quiescence, clear the poisoned lease, inspect the diff and targeted tests, then write an evidence-based continuation plan. Do not restart from scratch or auto-resume."
+  fi
   if [ "$write_mode" -eq 1 ]; then
     if ! mv -f "$MAESTRO_LOCK_DIR/metadata.new" "$MAESTRO_LOCK_DIR/metadata"; then
       progress "MAESTRO_LOCK: poison metadata rename failed; retaining $MAESTRO_LOCK_DIR/metadata.new as the fail-closed marker"
@@ -1125,35 +1326,96 @@ companion_cancel_job() { # C JOB REASON LOG → 124 read-only, 125 write-mode
 
 companion_poll() {
   local C="$1" JOB="$2" MAX_IDLE="$3" POLL="$4"
-  local LOG="" last_size=-1 idle=0 sfails=0 MAX_TOTAL invalid=0 poll_started total
-  local last_phase="__MAESTRO_UNSET__" last_preview="" quiet=0 keepalive_size=0
-  local ST state size phase elapsed preview preview_emit preview_json emitted line growth
-  MAX_TOTAL="${MAESTRO_MAX_DISPATCH_SEC-1200}"
-  case "$MAX_TOTAL" in
-    ''|*[!0-9]*) invalid=1 ;;
-    *) [ "$MAX_TOTAL" -ge 1 ] 2>/dev/null || invalid=1 ;;
-  esac
-  if [ "$invalid" -eq 1 ]; then
-    progress "MAESTRO_POLL: ignoring invalid MAESTRO_MAX_DISPATCH_SEC=$MAX_TOTAL; using 1200s"
-    MAX_TOTAL=1200
+  local poll_started="${5:-$SECONDS}" mode=read
+  if ! companion_poll_bounds_valid "$MAX_IDLE" "$POLL"; then
+    progress "MAESTRO_POLL: max_idle and poll must be positive integers (max_idle=$MAX_IDLE poll=$POLL)"
+    return 3
   fi
-  poll_started=$(date +%s)
+  MAX_IDLE=$((10#$MAX_IDLE))
+  POLL=$((10#$POLL))
+  local LOG="" last_size=-1 sfails=0 MAX_TOTAL total midpoint warned=0
+  local last_phase="__MAESTRO_UNSET__" last_preview="" quiet=0 keepalive_size=0
+  local last_activity="$poll_started" idle_elapsed=0 sleep_for remaining_total remaining_idle
+  local configured_call_timeout call_timeout invalid_call_timeout=0
+  local ST state status_compact size phase elapsed preview preview_emit preview_json emitted line growth
+  write_lock_is_owner && mode="write"
+  MAX_TOTAL=$(companion_dispatch_budget "$mode")
+  configured_call_timeout=${MAESTRO_COMPANION_TIMEOUT_SEC-120}
+  case "$configured_call_timeout" in
+    ''|*[!0-9]*) invalid_call_timeout=1 ;;
+    *) [ "$configured_call_timeout" -ge 1 ] 2>/dev/null || invalid_call_timeout=1 ;;
+  esac
+  if [ "$invalid_call_timeout" -eq 1 ]; then
+    progress "MAESTRO_COMPANION: ignoring invalid timeout_seconds=$configured_call_timeout; using 120s"
+    configured_call_timeout=120
+  else
+    configured_call_timeout=$((10#$configured_call_timeout))
+  fi
+  midpoint=$((MAX_TOTAL / 2))
+  [ "$midpoint" -ge 1 ] || midpoint=1
   while :; do
-    sleep "$POLL"
+    total=$((SECONDS - poll_started))
+    [ "$total" -ge 0 ] || total=0
+    idle_elapsed=$((SECONDS - last_activity))
+    [ "$idle_elapsed" -ge 0 ] || idle_elapsed=0
+    remaining_total=$((MAX_TOTAL - total))
+    remaining_idle=$((MAX_IDLE - idle_elapsed))
+    sleep_for=$POLL
+    if [ "$remaining_total" -le 0 ]; then
+      sleep_for=0
+    elif [ "$sleep_for" -gt "$remaining_total" ]; then
+      sleep_for=$remaining_total
+    fi
+    if [ "$last_size" -ge 0 ]; then
+      if [ "$remaining_idle" -le 0 ]; then
+        sleep_for=0
+      elif [ "$sleep_for" -gt "$remaining_idle" ]; then
+        sleep_for=$remaining_idle
+      fi
+    fi
+    [ "$sleep_for" -eq 0 ] || sleep "$sleep_for"
     write_lock_heartbeat_write
-    ST=$(companion_call "$C" status "$JOB" --json 2>/dev/null)
-    total=$(( $(date +%s) - poll_started ))
+    total=$((SECONDS - poll_started))
+    [ "$total" -ge 0 ] || total=0
+    remaining_total=$((MAX_TOTAL - total))
+    if [ "$remaining_total" -le 0 ]; then call_timeout=1; else call_timeout=$remaining_total; fi
+    [ "$call_timeout" -le "$configured_call_timeout" ] || call_timeout=$configured_call_timeout
+    ST=$(MAESTRO_COMPANION_TIMEOUT_SEC="$call_timeout" \
+      companion_call "$C" status "$JOB" --json 2>/dev/null)
+    total=$((SECONDS - poll_started))
+    [ "$total" -ge 0 ] || total=0
     if [ -z "$ST" ]; then
       sfails=$((sfails + 1))
-      if [ "$sfails" -ge 4 ] || [ "$total" -ge "$MAX_TOTAL" ]; then
+      if [ "$total" -ge "$MAX_TOTAL" ]; then
+        progress "MAESTRO_POLL: hard deadline reached while companion status was unreachable for $JOB; cancelling and failing closed"
+        companion_cancel_job "$C" "$JOB" deadline "$LOG"
+        return $?
+      fi
+      if [ "$sfails" -ge 4 ]; then
         progress "MAESTRO_POLL: companion status unreachable ${sfails}x in a row for $JOB; cancelling and failing closed"
         companion_cancel_job "$C" "$JOB" status-lost "$LOG"
         return $?
       fi
       continue
     fi
-    sfails=0
     state=$(printf '%s' "$ST" | grep -oiE '"status"[[:space:]]*:[[:space:]]*"[a-z]+"' | head -1 | grep -oiE '[a-z]+"$' | tr -d '"')
+    status_compact=$(printf '%s' "$ST" | tr '\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    case "$status_compact" in \{*\}) ;; *) state="" ;; esac
+    if [ -z "$state" ]; then
+      sfails=$((sfails + 1))
+      if [ "$total" -ge "$MAX_TOTAL" ]; then
+        progress "MAESTRO_POLL: hard deadline reached while companion status was malformed for $JOB; cancelling and failing closed"
+        companion_cancel_job "$C" "$JOB" deadline "$LOG"
+        return $?
+      fi
+      if [ "$sfails" -ge 4 ]; then
+        progress "MAESTRO_POLL: companion status malformed or unreachable ${sfails}x in a row for $JOB; cancelling and failing closed"
+        companion_cancel_job "$C" "$JOB" status-lost "$LOG"
+        return $?
+      fi
+      continue
+    fi
+    sfails=0
     [ -z "$LOG" ] && LOG=$(printf '%s' "$ST" | sed -n 's/.*"logFile"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
     phase=$(printf '%s' "$ST" | grep -oE '"phase"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/^"phase"[[:space:]]*:[[:space:]]*"//; s/"$//')
     elapsed=$(printf '%s' "$ST" | grep -oE '"elapsed"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/^"elapsed"[[:space:]]*:[[:space:]]*"//; s/"$//')
@@ -1230,22 +1492,45 @@ companion_poll() {
     case "$state" in
       completed|done|finished|succeeded|success)
         return 0 ;;
-      failed|error|errored|cancelled|canceled)
+      cancelled|canceled)
+        if write_lock_is_owner; then
+          MAESTRO_CANCEL_REASON=cancelled-observed
+          MAESTRO_CANCEL_REQUESTED=0
+          MAESTRO_LOCK_RETAIN=1
+          if ! write_lock_poison "$JOB" cancelled-observed; then
+            progress "MAESTRO_LOCK: companion reported cancellation, but poison could not be staged; retaining the lease"
+            return 125
+          fi
+          if ! mv -f "$MAESTRO_LOCK_DIR/metadata.new" "$MAESTRO_LOCK_DIR/metadata"; then
+            progress "MAESTRO_LOCK: observed-cancellation poison rename failed; retaining metadata.new as the fail-closed marker"
+          fi
+          progress "MAESTRO_POLL: companion reported job=$JOB state=$state; write lease poisoned and no replacement will start"
+          return 125
+        fi
+        printf 'job %s ended in state %s' "$JOB" "$state" >&2
+        return 4 ;;
+      failed|error|errored)
         printf 'job %s ended in state %s' "$JOB" "${state:-unknown}" >&2
         return 4 ;;
     esac
 
-    if [ "$size" -gt "$last_size" ]; then
-      last_size=$size; idle=0
-    else
-      idle=$((idle + POLL))
+    if [ "$warned" -eq 0 ] && [ "$total" -ge "$midpoint" ]; then
+      progress "MAESTRO_BUDGET: job=$JOB crossed the normal budget and remains active; continuing to the ${MAX_TOTAL}s hard ceiling. Activity is not proof of completion."
+      warned=1
     fi
+
+    if [ "$size" -gt "$last_size" ]; then
+      last_size=$size
+      last_activity=$SECONDS
+    fi
+    idle_elapsed=$((SECONDS - last_activity))
+    [ "$idle_elapsed" -ge 0 ] || idle_elapsed=0
 
     if [ "$total" -ge "$MAX_TOTAL" ]; then
       companion_cancel_job "$C" "$JOB" deadline "$LOG"
       return $?
     fi
-    if [ "$idle" -ge "$MAX_IDLE" ]; then
+    if [ "$idle_elapsed" -ge "$MAX_IDLE" ]; then
       companion_cancel_job "$C" "$JOB" idle "$LOG"
       return $?
     fi

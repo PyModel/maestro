@@ -12,7 +12,7 @@
 [![Bash](https://img.shields.io/badge/shell-bash-4EAA25?style=for-the-badge&logo=gnubash&logoColor=white)](hooks/)
 [![Node](https://img.shields.io/badge/runtime-Node-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)](install.mjs)
 [![Platform](https://img.shields.io/badge/platform-macOS%20·%20Linux-0A84FF?style=for-the-badge&logo=apple&logoColor=white)](#requirements)
-[![Tests](https://img.shields.io/badge/tests-11%20suites-00B34A?style=for-the-badge)](tests/)
+[![Tests](https://img.shields.io/badge/tests-16%20suites-00B34A?style=for-the-badge)](tests/)
 [![No API key](https://img.shields.io/badge/no%20API%20key-ChatGPT%20login-FF6B35?style=for-the-badge)](#requirements)
 
 </div>
@@ -52,7 +52,7 @@ The loop also fixes what breaks in practice — Codex hanging mid-task, an imple
 ## How it works
 
 ```
-session start → pick Codex model + effort (or keep current)                       ← the setup
+session start → pick model + debate/write efforts (or keep a complete pin)        ← the setup
 your prompt
    → design fork or murky bug? Opus DEBATES Codex (read-only, transcript-carried)  ← the argument
        grill and be grilled, until CONVERGED / ESCALATE / 6-turn cap
@@ -77,11 +77,13 @@ The loop never ends in prose. Every run finishes on a machine-readable state:
 | `11` | **BLOCKED** | Missing access, a destructive step, lease contention, or an unconfirmed cancelled writer | Surface it; never improvise around it |
 | `12` | **STUCK** | Hit the iteration cap without verification | Read the attempts log, re-plan — don't just raise the cap |
 
+These codes describe `implementer-loop.sh`. A directly invoked single-shot watchdog uses rc `125` plus `MAESTRO_FINAL: WATCHDOG POISONED` when cancellation leaves quiescence unconfirmed; the outer loop translates that condition to `BLOCKED`/11.
+
 Write contention waits without arrival ordering only while the current lease has a confirmed release path. `MAESTRO_LOCK_WAIT_SEC` caps the wait (default 300 seconds; `0` disables it), and `MAESTRO_LOCK_WAIT_POLL_SEC` controls polling (default 5 seconds, minimum 1); invalid values disable waiting.
 
-Foreground write supervisors update a separate lease heartbeat every `MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC` (default 20 seconds, minimum 1; invalid values use 20). `MAESTRO_LOCK_HEARTBEAT_STALE_SEC` controls when a missed heartbeat is reported and makes `--clear-lease` eligible after its independent writer check (default 90 seconds; `0` disables staleness reporting; invalid values use 90). A stale heartbeat is diagnostic only and never transfers ownership automatically.
+Foreground write supervisors update a separate lease heartbeat every `MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC` (default 20 seconds, minimum 1; invalid values use 20). `MAESTRO_LOCK_HEARTBEAT_STALE_SEC` controls when a missed heartbeat is reported (default 90 seconds; `0` disables staleness reporting; invalid values use 90). A stale heartbeat is only a recovery candidate: `--clear-lease` still refuses while the recorded owner process is alive or unidentifiable, or any repository-global companion writer is visible.
 
-Every dispatch has an absolute deadline (`MAESTRO_MAX_DISPATCH_SEC`, default 1200 seconds), while the local verifier has its own process-group deadline (`MAESTRO_VERIFY_TIMEOUT_SEC`, default 900 seconds), and `MAESTRO_COMPANION_TIMEOUT_SEC` bounds each companion call (default 120 seconds) so a wedged companion or broker cannot block the poll loop indefinitely, where neither the idle guard nor dispatch deadline can fire. At the poll site, a timed-out companion call yields an empty status; four consecutive empty statuses, or the dispatch deadline being crossed during status loss, cancel the job and fail closed. The worst case from a wedged broker to that exit is roughly 4 × (`POLL` + `MAESTRO_COMPANION_TIMEOUT_SEC`) — about 9 minutes at the defaults. For a write job, that fail-closed exit retains and poisons the lease, ends the loop as `BLOCKED`, and does not re-dispatch because nothing observable proves the brokered turn stopped. Once no Codex job is writing, recover with `bash hooks/implementer-loop.sh --clear-lease` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`). Read-only discussions hold no write lease and are never poisoned.
+`MAESTRO_MAX_DISPATCH_SEC` is a hard ceiling: unset write jobs get 2400 seconds and read-only discussions get 1200; an explicit valid value is used exactly, while invalid input warns and falls back to 1200. Startup consumes this budget, poll sleeps are clipped to the nearest deadline, and one halfway warning continues the same job without claiming progress or creating a checkpoint. Idle time uses elapsed monotonic time rather than configured poll counts. `--max-idle` and `--poll` must be positive integers and are rejected before any lease or task starts. The local verifier has its own process-group deadline (`MAESTRO_VERIFY_TIMEOUT_SEC`, default 900 seconds), and `MAESTRO_COMPANION_TIMEOUT_SEC` bounds each companion call (default 120 seconds). Four consecutive empty **or malformed** statuses, or the hard ceiling during status loss, cancel and fail closed. Read-only status loss consumes its configured retry allowance; idle/deadline cancellation does not. A write cancellation—including one reported externally by the companion—poisons and retains the lease, ends the loop as `BLOCKED`, emits `UNREPORTED_PARTIAL` at the hard ceiling, and never starts a replacement writer. Once no Codex job is writing, recover with `bash hooks/implementer-loop.sh --clear-lease` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`). A metadata-less lease younger than five seconds is treated as an owner still initializing, not an orphan to clear.
 
 On every SessionStart source, the hook appends a validated `MAESTRO_SESSION_ID` export to `$CLAUDE_ENV_FILE`. The value is attribution only: the token, PID/process-start identity, and companion job liveness remain the ownership checks. A missing or invalid value is recorded as `unknown`; the session appears in lease metadata, contention/poison messages, and provenance records.
 
@@ -91,11 +93,11 @@ Installed under `~/.claude`, plus one shared library they source.
 
 | File | Role |
 |---|---|
-| **`session-start.mjs`** | Opens each session with the Codex model + effort picker. Resumed sessions get a status line instead of a re-ask. |
-| **`codex-model-select.sh`** | Pins `model` and reasoning effort in `~/.codex/config.toml` — TOML-safe, backed up, idempotent. Debate and implementation get separate tiers. |
+| **`session-start.mjs`** | Opens each session with model plus separate debate/write effort picks. Resumed sessions get a status line instead of a re-ask. |
+| **`codex-model-select.sh`** | Serializes concurrent selectors and transactionally pins model plus debate/implementation effort, preserving config modes and top-level TOML scope. |
 | **`codex-mcp-check.sh`** | Shows exactly which MCP servers your background Codex jobs inherit, env keys masked. |
 | **`implementer-loop.sh`** | The autonomous heart: dispatch → parse `RESULT` → re-verify **locally** → feed failure evidence back in. Bounded by `--max-iters` and a verifier deadline. |
-| **`discussion-loop.sh`** | The bidirectional debate channel. Read-only — nobody edits code mid-argument. |
+| **`discussion-loop.sh`** | Read-only debate with collision-resistant workspace identity, private transcripts, sidecar turn state, and stale-lock recovery. |
 | **`implementer-watchdog.sh`** | Single dispatch with `--write`; idle or absolute cancellation poisons and retains its write lease. |
 | **`orchestrator-inject.mjs`** | Resets the direct-edit flag per task; states the loop only when the prompt carries a code/design signal. |
 | **`orchestrator-gate.mjs`** | Blocks the orchestrator's `Edit`/`Write`/`MultiEdit` on source files. |
@@ -143,7 +145,7 @@ Research flows plan-first: the orchestrator pre-researches and embeds facts befo
 bash tests/run.sh
 ```
 
-Nine suites covering the write lease and provenance detection. They drive the real entry points end to end — acquiring real leases, mutating real repositories between dispatches — rather than calling helpers directly, because a gate that tests a component instead of the product path can pass while the feature detects nothing.
+Sixteen suites cover leases, liveness, installation ownership, model selection, gate authorization, discussions, provenance, and nested process cleanup. They drive real entry points end to end—acquiring leases, mutating repositories, signalling supervisors, and installing into isolated homes—rather than replacing lifecycle behavior with mocks.
 
 They are slow on purpose: several suites wait on real lease timeouts.
 
@@ -164,7 +166,7 @@ node install.mjs
 
 Or hand the repo to Claude Code and say: *"run `node install.mjs` in this repo."*
 
-The installer is idempotent — re-running it changes nothing. It backs up `settings.json`, `config.toml`, and any hook or rule file it would overwrite (`.maestro.bak`), merges its hooks without touching your existing ones, and offers to disable Codex web search.
+The installer validates options, settings, and every managed destination before changing anything. An ownership manifest records installed bytes; known-owned files update atomically, byte-identical reinstalls preserve file identity, and divergent or same-named user files cause a refusal instead of an overwrite. Ordinary late failures roll back every path published by that run; abrupt termination still leaves byte-atomic files that a rerun can reconcile. Settings/config backups refresh immediately before each merge, only a true top-level TOML `web_search` key satisfies the hang guard, disabled session prompts stay disabled on reinstall, and hook registrations carry exact Maestro markers rather than filename substring guesses.
 
 <details>
 <summary><b>Optional: the workflow rule</b></summary>
@@ -182,17 +184,17 @@ Adds `workflow.md` plus the `ralph-protocol` skill it defers to: a bounded execu
 node uninstall.mjs
 ```
 
-Removes the hooks, strips only its own entries from `settings.json`, and leaves your backups in place. A rule is deleted only while it's still byte-identical to this repo's copy — edit one and the uninstaller keeps it and tells you.
+Removes only files whose bytes still match the ownership manifest, strips only exact Maestro-marked commands from `settings.json`, and clears private direct-edit authorization markers. Modified hooks, rules, skills, foreign similarly named commands, and backups remain untouched; uninstall ownership does not depend on the current checkout version.
 
 ## Limits
 
 Stated plainly, because a tool that overstates its guarantees is worse than one that has fewer.
 
-- **The gate is a guardrail, not a boundary.** It is registered for `Edit|Write|MultiEdit` only. `Bash`, MCP tools, and `Workflow`/`Agent` are *not* matched, so a redirect or `sed -i` reaches the tree untouched. Unknown file types are gated by default through a non-code allowlist, the hook fails closed on malformed payloads, and subagents never inherit "edit it yourself". The orchestrator not writing source is a discipline it keeps, not a control that keeps it.
-- **Provenance detection reports, it never attributes.** Each write-lease acquisition digests the materialized tree and compares it to the snapshot the previous dispatch left. A mismatch names an interval — never a writer. Ignored paths are out of observation scope on cost grounds, and the log lives inside the repository it watches. It catches accidental convention failures and unnoticed agent writes. It is not an adversarial control.
+- **The gate is a guardrail, not a boundary.** It is registered for `Edit|Write|MultiEdit` only. `Bash`, MCP tools, and `Workflow`/`Agent` are *not* matched, so a redirect or `sed -i` reaches the tree untouched. Authorization requires a validated session, lives under a private `~/.maestro/direct-edit` directory with owner/mode/content checks, ignores the legacy forgeable `/tmp` marker path, and is revoked by malformed prompt payloads. Scratch/non-code exemptions use canonical existing targets or parents so symlinks cannot change classification; executable files remain gated regardless of extension. The orchestrator not writing source remains a discipline, not a sandbox.
+- **Provenance detection reports, it never attributes.** Each write-lease acquisition hashes actual materialized bytes with Git filters disabled, using Git itself rather than a platform-specific digest utility, across healthy worktrees, initialized submodules, and non-ignored nested repositories. One prunable worktree degrades independently. Baseline records publish before lease handoff, and log publication atomically replaces rather than follows a symlink. A mismatch names an interval—never a writer—and ignored paths remain out of scope on cost grounds. `MAESTRO_DIGEST_TIMEOUT_SEC` bounds each snapshot (default 120); timeout degrades that interval to `unavailable` and disables comparison rather than blocking dispatch. It is not an adversarial control.
 - **Cancellation terminality is upstream.** The companion does not expose the brokered turn's terminal event to Maestro's shell. A cancelled write may therefore leave unreported edits, so Maestro stops and retains the lease instead of guessing that the turn is quiescent.
 - **Same-vendor review.** The orchestrator reviews its own plan's execution.
-- **Model pin depends on config being honored.** If your companion version overrides the model with its own flags, the pin won't take — check `codex-model-select.sh --show` against one dispatch's behavior.
+- **Model pin depends on config being honored for debate max/ultra.** Model and wrapper-supported efforts are explicit per task. Debate max/ultra rely on the top-level Codex config because the companion cannot express them; implementation therefore rejects max/ultra instead of silently substituting another tier. A fresh unpinned install cannot dispatch until model and effort values are selected.
 - **Plugin flag drift.** Write dispatches preflight the companion's global `--help` and refuse only when it describes `task` without `--write`; inconclusive help (empty, error, or no synopsis) proceeds rather than blocking work.
 - **Windows.** The watchdog is a bash script — run Claude Code from Git Bash or WSL.
 - **Codex on Plus.** The implementer model is whatever your ChatGPT plan's Codex can reach.

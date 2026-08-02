@@ -21,7 +21,8 @@
 #                unbounded write loop is a runaway, not autonomy.
 #   --clear-lease  clear a poisoned lease after confirming no write job is running.
 #
-# MAESTRO_MAX_DISPATCH_SEC caps each Codex dispatch (default 1200).
+# MAESTRO_MAX_DISPATCH_SEC caps each Codex dispatch (unset write default 2400;
+# read-only callers default 1200; explicit valid values are exact).
 # Cancellation occurs within one --poll interval after that deadline.
 # MAESTRO_VERIFY_TIMEOUT_SEC caps each local verifier process group (default 900).
 #
@@ -42,51 +43,129 @@ progress_init
 
 FINAL_STATE="INTERRUPTED"
 FINAL_RC=4
-ATTEMPTS=""; DISPATCH=""; ERRF=""; VOUTF=""
+ATTEMPTS=""; DISPATCH=""; ERRF=""; OUTF=""; VOUTF=""; WATCHDOG_PID=""; VERIFY_PID=""
+terminate_process_group() {
+  local pid="$1" ticks=0
+  [ -n "$pid" ] || return 0
+  kill -TERM -"$pid" 2>/dev/null || :
+  while kill -0 -"$pid" 2>/dev/null && [ "$ticks" -lt 50 ]; do
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  kill -KILL -"$pid" 2>/dev/null || :
+}
 maestro_finish() {
   FINAL_STATE="$1"
   FINAL_RC="$2"
   exit "$FINAL_RC"
 }
 maestro_interrupt() {
+  local signal="$1" reason target="" writers="" companion="" metadata=""
+  trap : HUP INT TERM
+  case "$signal" in
+    HUP) reason="signal-hup" ;;
+    INT) reason="signal-int" ;;
+    TERM) reason="signal-term" ;;
+    *) reason="signal" ;;
+  esac
+  if [ -n "$VERIFY_PID" ]; then
+    terminate_process_group "$VERIFY_PID"
+    VERIFY_PID=""
+  fi
+  if write_lock_is_owner; then
+    MAESTRO_LOCK_RETAIN=1
+    metadata="${MAESTRO_LOCK_DIR:-}/metadata"
+    target=$(write_lock_metadata_value "$metadata" job_id)
+    [ "$target" = unknown ] && target=""
+    companion=$(companion_resolve 2>/dev/null) || companion=""
+    if [ -z "$target" ] && [ -n "$companion" ]; then
+      writers=$(companion_workspace_writers "$companion" 2>/dev/null) || writers=""
+      target=$(printf '%s\n' "$writers" | awk '$2 == "true" { print $1; exit }')
+    fi
+    if [ -n "$target" ] && [ -n "$companion" ]; then
+      companion_cancel_job "$companion" "$target" "$reason" "loop-signal-handler"
+    else
+      write_lock_poison "${target:-unknown}" "$reason" || :
+      if [ -e "$MAESTRO_LOCK_DIR/metadata.new" ]; then
+        mv -f "$MAESTRO_LOCK_DIR/metadata.new" "$MAESTRO_LOCK_DIR/metadata" 2>/dev/null || :
+      fi
+      progress "LOOP_STATE: BLOCKED — interrupted before a companion job id was confirmed; lease retained"
+    fi
+    if [ -n "$WATCHDOG_PID" ]; then
+      kill -KILL -"$WATCHDOG_PID" 2>/dev/null || :
+    fi
+    maestro_finish "BLOCKED" 11
+  fi
+  if [ -n "$WATCHDOG_PID" ]; then
+    kill -KILL -"$WATCHDOG_PID" 2>/dev/null || :
+  fi
   maestro_finish "INTERRUPTED" 4
 }
 cleanup() {
   trap - EXIT HUP INT TERM
+  if [ -n "$VERIFY_PID" ]; then
+    terminate_process_group "$VERIFY_PID"
+    VERIFY_PID=""
+  fi
   [ -n "$ATTEMPTS" ] && rm -f "$ATTEMPTS"
   [ -n "$DISPATCH" ] && rm -f "$DISPATCH"
   [ -n "$ERRF" ] && rm -f "$ERRF"
+  [ -n "$OUTF" ] && rm -f "$OUTF"
   [ -n "$VOUTF" ] && rm -f "$VOUTF"
   write_lock_release
   progress "MAESTRO_FINAL: LOOP $FINAL_STATE rc=$FINAL_RC"
   exit "$FINAL_RC"
 }
 trap cleanup EXIT
-trap maestro_interrupt HUP INT TERM
+trap 'maestro_interrupt HUP' HUP
+trap 'maestro_interrupt INT' INT
+trap 'maestro_interrupt TERM' TERM
 
-PLAN=""; VERIFY=""; MAX_ITERS=4; MAX_IDLE=300; POLL=20; CLEAR_LEASE=0
+PLAN=""; VERIFY=""; MAX_ITERS=4; MAX_IDLE=300; POLL=20; CLEAR_LEASE=0; EXECUTION_OPTIONS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --plan)
       [ $# -ge 2 ] || { echo "LOOP_ERROR: --plan needs a file" >&2; maestro_finish "FAILED" 3; }
-      PLAN="$2"; shift 2 ;;
+      PLAN="$2"; EXECUTION_OPTIONS=1; shift 2 ;;
     --verify)
       [ $# -ge 2 ] || { echo "LOOP_ERROR: --verify needs a command" >&2; maestro_finish "FAILED" 3; }
-      VERIFY="$2"; shift 2 ;;
+      VERIFY="$2"; EXECUTION_OPTIONS=1; shift 2 ;;
     --max-iters)
       [ $# -ge 2 ] || { echo "LOOP_ERROR: --max-iters needs a number" >&2; maestro_finish "FAILED" 3; }
-      MAX_ITERS="$2"; shift 2 ;;
+      MAX_ITERS="$2"; EXECUTION_OPTIONS=1; shift 2 ;;
     --max-idle)
       [ $# -ge 2 ] || { echo "LOOP_ERROR: --max-idle needs seconds" >&2; maestro_finish "FAILED" 3; }
-      MAX_IDLE="$2"; shift 2 ;;
+      MAX_IDLE="$2"; EXECUTION_OPTIONS=1; shift 2 ;;
     --poll)
       [ $# -ge 2 ] || { echo "LOOP_ERROR: --poll needs seconds" >&2; maestro_finish "FAILED" 3; }
-      POLL="$2"; shift 2 ;;
+      POLL="$2"; EXECUTION_OPTIONS=1; shift 2 ;;
     --clear-lease)
       CLEAR_LEASE=1; shift ;;
     *) echo "LOOP_ERROR: unknown argument: $1" >&2; maestro_finish "FAILED" 3 ;;
   esac
 done
+
+if [ "$CLEAR_LEASE" -eq 1 ] && [ "$EXECUTION_OPTIONS" -eq 1 ]; then
+  echo "LOOP_ERROR: --clear-lease is mutually exclusive with execution options" >&2
+  maestro_finish "FAILED" 3
+fi
+if [ "$CLEAR_LEASE" -eq 0 ]; then
+  case "$MAX_ITERS" in ''|*[!0-9]*)
+    echo "LOOP_ERROR: --max-iters must be a positive integer" >&2
+    maestro_finish "FAILED" 3 ;;
+  esac
+  if [ "$((10#$MAX_ITERS))" -lt 1 ]; then
+    echo "LOOP_ERROR: --max-iters must be >= 1 (0 is prohibited)" >&2
+    maestro_finish "FAILED" 3
+  fi
+  if ! companion_poll_bounds_valid "$MAX_IDLE" "$POLL"; then
+    echo "LOOP_ERROR: --max-idle and --poll must be positive integers" >&2
+    maestro_finish "FAILED" 3
+  fi
+  MAX_ITERS=$((10#$MAX_ITERS))
+  MAX_IDLE=$((10#$MAX_IDLE))
+  POLL=$((10#$POLL))
+fi
 
 if [ "$CLEAR_LEASE" -eq 1 ]; then
   lock_path=$(write_lock_path) || {
@@ -104,6 +183,17 @@ if [ "$CLEAR_LEASE" -eq 1 ]; then
   orphan=0
   stale_heartbeat=0
   if [ ! -e "$metadata" ] && [ ! -e "$staged_metadata" ]; then
+    lock_mtime=$(write_lock_path_mtime_epoch "$lock_path") || {
+      progress "MAESTRO_LOCK: refusing to clear — metadata is absent and lock age is unconfirmed (lock: $lock_path)"
+      maestro_finish "BLOCKED" 11
+    }
+    now=$(date +%s)
+    lock_age=$((now - lock_mtime))
+    [ "$lock_age" -ge 0 ] || lock_age=0
+    if [ "$lock_age" -lt 5 ]; then
+      progress "MAESTRO_LOCK: refusing to clear — metadata is absent but the ${lock_age}s-old lease may still be initializing (lock: $lock_path); retry after 5s"
+      maestro_finish "BLOCKED" 11
+    fi
     orphan=1
     poisoned_job=unknown
     poisoned_reason=missing-metadata
@@ -123,6 +213,7 @@ if [ "$CLEAR_LEASE" -eq 1 ]; then
       owner_session=$(write_lock_metadata_value "$metadata" session_id)
       owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
       owner_pid=$(write_lock_metadata_value "$metadata" pid)
+      owner_start=$(write_lock_metadata_value "$metadata" process_start)
       started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
       malformed=0
       case "$owner_pid" in
@@ -161,6 +252,14 @@ if [ "$CLEAR_LEASE" -eq 1 ]; then
       if [ "$stale_heartbeat" -eq 0 ]; then
         progress "MAESTRO_LOCK: refusing to clear — write lease is healthy and not this command's to clear (job=$owner_job session=${owner_session:-unknown} pid=$owner_pid, lock: $lock_path)${heartbeat_note}"
         maestro_finish "BLOCKED" 11
+      fi
+      if kill -0 "$owner_pid" 2>/dev/null; then
+        current_start=$(write_lock_process_start "$owner_pid")
+        if [ -z "$current_start" ] || [ -z "$owner_start" ] ||
+          [ "$owner_start" = unavailable ] || [ "$current_start" = "$owner_start" ]; then
+          progress "MAESTRO_LOCK: refusing to clear — heartbeat is stale but the recorded owner process is still alive or its identity is unconfirmed (job=$owner_job session=${owner_session:-unknown} pid=$owner_pid, lock: $lock_path)"
+          maestro_finish "BLOCKED" 11
+        fi
       fi
       poisoned_job=$owner_job
       poisoned_session=$owner_session
@@ -216,7 +315,6 @@ fi
 
 [ -n "$PLAN" ] && [ -f "$PLAN" ] || { echo "LOOP_ERROR: --plan <file> required and must exist" >&2; maestro_finish "FAILED" 3; }
 [ -n "$VERIFY" ] || { echo "LOOP_ERROR: --verify \"<command>\" required — RESULT: DONE is a claim, not proof" >&2; maestro_finish "FAILED" 3; }
-[ "$MAX_ITERS" -ge 1 ] 2>/dev/null || { echo "LOOP_ERROR: --max-iters must be >= 1 (0 is prohibited)" >&2; maestro_finish "FAILED" 3; }
 [ -f "$WATCHDOG" ] || { echo "LOOP_ERROR: implementer-watchdog.sh not found next to this script" >&2; maestro_finish "FAILED" 3; }
 
 VERIFY_TIMEOUT="${MAESTRO_VERIFY_TIMEOUT_SEC-900}"
@@ -239,6 +337,7 @@ fi
 
 ATTEMPTS=$(mktemp /tmp/maestro-attempts.XXXXXXXX)
 ERRF=$(mktemp /tmp/maestro-looperr.XXXXXXXX)
+OUTF=$(mktemp /tmp/maestro-loopout.XXXXXXXX)
 VOUTF=$(mktemp /tmp/maestro-verify.XXXXXXXX)
 
 i=0
@@ -262,8 +361,15 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
     progress "LOOP_STATE: BLOCKED — this loop no longer holds the write lease; stopping before re-dispatching"
     maestro_finish "BLOCKED" 11
   fi
-  OUT=$(bash "$WATCHDOG" --file "$DISPATCH" "$MAX_IDLE" "$POLL" 2>"$ERRF")
+  : > "$OUTF"
+  set -m
+  bash "$WATCHDOG" --file "$DISPATCH" "$MAX_IDLE" "$POLL" > "$OUTF" 2>"$ERRF" &
+  WATCHDOG_PID=$!
+  set +m
+  wait "$WATCHDOG_PID"
   rc=$?
+  WATCHDOG_PID=""
+  OUT=$(cat "$OUTF")
   cat "$ERRF" >&2
   rm -f "$DISPATCH"; DISPATCH=""
 
@@ -279,11 +385,12 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
     maestro_finish "BLOCKED" 11
   fi
 
-  STATE=$(printf '%s' "$OUT" | grep -oE '^RESULT:[[:space:]]*(DONE|NEEDS_ANSWERS|BLOCKED|FAILED)' | head -1 | sed 's/^RESULT:[[:space:]]*//')
+  STATE=$(companion_result_state "$OUT")
 
   if { [ "$rc" -eq 124 ] || [ "$rc" -ne 0 ]; } &&
     ! { [ "$rc" -eq 10 ] && [ "$STATE" = "NEEDS_ANSWERS" ]; } &&
-    ! { [ "$rc" -eq 11 ] && [ "$STATE" = "BLOCKED" ]; }; then
+    ! { [ "$rc" -eq 11 ] && [ "$STATE" = "BLOCKED" ]; } &&
+    ! { [ "$rc" -eq 4 ] && [ "$STATE" = "FAILED" ]; }; then
     kind="failed"; [ "$rc" -eq 124 ] && kind="hung"
     printf '\n## Attempt %s — job %s before producing a result\n%s\n' "$i" "$kind" \
       "$(tail -n 40 "$ERRF")" >> "$ATTEMPTS"
@@ -316,6 +423,7 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
       env -u MAESTRO_LOCK_ACQUIRED -u MAESTRO_LOCK_TOKEN -u MAESTRO_LOCK_DIR \
         bash -c "$VERIFY" > "$VOUTF" 2>&1 3>&- &
       vpid=$!
+      VERIFY_PID=$vpid
       vstarted=$(date +%s)
       vtimed_out=0
       while kill -0 "$vpid" 2>/dev/null; do
@@ -338,6 +446,12 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
       fi
       wait "$vpid" 2>/dev/null
       vrc=$?
+      # A verifier shell can exit while leaving background children in its process
+      # group. Reap that group on every path before trusting success or retrying.
+      if kill -0 -"$vpid" 2>/dev/null; then
+        terminate_process_group "$vpid"
+      fi
+      VERIFY_PID=""
       set +m
       if ! write_lock_is_owner; then
         progress "LOOP_STATE: BLOCKED — this loop no longer holds the write lease; stopping before re-dispatching"

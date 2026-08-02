@@ -1,37 +1,9 @@
 #!/usr/bin/env bash
-# Maestro discussion loop.
-# Bidirectional, multi-turn debate between the orchestrator (Claude) and Codex —
-# design, architecture, solution duels, root-cause debugging. READ-ONLY: nobody
-# edits code while the design is still being argued.
-#
-# Claude drives the loop like a user would: it writes its turn to a file, this
-# script appends it to the running transcript, dispatches the WHOLE transcript to
-# Codex, and prints the reply. Codex shares no context between calls, so the
-# transcript is the entire memory — quote evidence in it, never paraphrase.
-#
-# Usage:
-#   discussion-loop.sh --new "<topic>" [slug]              start a fresh transcript
-#   discussion-loop.sh --turn <turn-file> [slug] [max_idle_sec] [poll_sec]
-# Transcript: ~/.maestro/discussions/<workspace-key>-<slug>.md
-#             (default slug: main)
-#
-# Termination (enforced): after MAESTRO_MAX_ROUNDS Claude turns (default 6) the
-# script refuses another turn — converge with a stated assumption or ESCALATE.
-# After each reply the script prints DISCUSSION_STATE: CONVERGED | ESCALATE |
-# CONTINUE to stderr, so the orchestrator never has to guess whether to stop.
-#
-# Error handling: transient job failures are retried (MAESTRO_DISCUSSION_RETRIES,
-# default 2, backoff MAESTRO_RETRY_SLEEP seconds, default 5) — read-only retries
-# are free. Hangs are NOT auto-retried (a hang is usually prompt-induced). Every
-# dispatch also has an absolute cap (MAESTRO_MAX_DISPATCH_SEC, default 1200s);
-# cancellation occurs within one poll interval after that deadline. Read-only
-# turns are never poisoned because they hold no write lease. A per-transcript
-# lock stops two turns racing; an orphaned Claude turn (dispatch died before the
-# reply) is replaced, not duplicated, on the next --turn.
-#
-# Exit codes: 0 = reply printed | 5 = round cap | 124 = hung, cancelled
-#             3 = could not start / bad args | 4 = job failed after retries
+# Maestro read-only, bounded discussion loop.
+# Transcript state is kept in a sidecar file so quoted Markdown headings cannot
+# alter turn counting or orphan recovery.
 set -uo pipefail
+umask 077
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib-companion.sh
@@ -41,17 +13,27 @@ progress_init
 FINAL_STATE="INTERRUPTED"
 FINAL_RC=4
 DISCUSSION_LOCK=""
+DISCUSSION_LOCK_TOKEN=""
 maestro_finish() {
   FINAL_STATE="$1"
   FINAL_RC="$2"
   exit "$FINAL_RC"
 }
-maestro_interrupt() {
-  maestro_finish "INTERRUPTED" 4
+
+discussion_lock_release() {
+  local metadata token
+  [ -n "$DISCUSSION_LOCK" ] && [ -n "$DISCUSSION_LOCK_TOKEN" ] || return 0
+  metadata="$DISCUSSION_LOCK/metadata"
+  token=$(write_lock_metadata_value "$metadata" token)
+  [ "$token" = "$DISCUSSION_LOCK_TOKEN" ] || return 0
+  rm -f "$metadata" 2>/dev/null || return 0
+  rmdir "$DISCUSSION_LOCK" 2>/dev/null || :
 }
+
+maestro_interrupt() { maestro_finish "INTERRUPTED" 4; }
 cleanup() {
   trap - EXIT HUP INT TERM
-  [ -n "$DISCUSSION_LOCK" ] && rmdir "$DISCUSSION_LOCK" 2>/dev/null
+  discussion_lock_release
   progress "MAESTRO_FINAL: DISCUSSION $FINAL_STATE rc=$FINAL_RC"
   exit "$FINAL_RC"
 }
@@ -60,23 +42,92 @@ trap maestro_interrupt HUP INT TERM
 
 SLUG="main"
 MODE="${1:-}"
-
 valid_slug() { [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; }
 
 transcript_path() {
-  local root key
-  # Anchor to the repo root so subdirectories share one workspace transcript.
+  local root readable hash
   root=$(git rev-parse --show-toplevel 2>/dev/null) || root=$PWD
-  key=$(printf '%s' "$root" | tr -c 'A-Za-z0-9' '-')
+  root=$(cd "$root" 2>/dev/null && pwd -P) || return 1
+  readable=$(basename "$root" | tr -c 'A-Za-z0-9' '-')
+  hash=$(printf '%s' "$root" | git hash-object --stdin 2>/dev/null)
+  hash=${hash:0:12}
+  [ -n "$hash" ] || return 1
   DISCUSS_DIR="$HOME/.maestro/discussions"
-  mkdir -p "$DISCUSS_DIR"
-  T="$DISCUSS_DIR/${key}-${SLUG}.md"
+  [ ! -L "$DISCUSS_DIR" ] || return 1
+  mkdir -p "$DISCUSS_DIR" || return 1
+  chmod 700 "$DISCUSS_DIR" || return 1
+  T="$DISCUSS_DIR/${readable}-${hash}-${SLUG}.md"
+  STATE="$T.state"
+}
 
-  # Best-effort migration keeps an in-flight discussion intact.
-  OLD_T="/tmp/maestro-discussion-${SLUG}.md"
-  if [ -f "$OLD_T" ] && [ ! -f "$T" ]; then
-    mv "$OLD_T" "$T" 2>/dev/null || :
+discussion_write_state() { # turns awaiting_reply rollback_bytes
+  local tmp="$STATE.tmp.$$"
+  if printf 'turns=%s\nawaiting_reply=%s\nrollback_bytes=%s\n' "$1" "$2" "$3" > "$tmp" &&
+    chmod 600 "$tmp" && mv -f "$tmp" "$STATE"; then
+    return 0
   fi
+  rm -f "$tmp" 2>/dev/null || :
+  return 1
+}
+
+discussion_read_state() {
+  [ -f "$STATE" ] && [ ! -L "$STATE" ] || return 1
+  STATE_TURNS=$(write_lock_metadata_value "$STATE" turns)
+  STATE_AWAITING=$(write_lock_metadata_value "$STATE" awaiting_reply)
+  STATE_ROLLBACK=$(write_lock_metadata_value "$STATE" rollback_bytes)
+  case "$STATE_TURNS" in ''|*[!0-9]*) return 1 ;; esac
+  case "$STATE_ROLLBACK" in ''|*[!0-9]*) return 1 ;; esac
+  case "$STATE_AWAITING" in 0|1) ;; *) return 1 ;; esac
+  return 0
+}
+
+discussion_lock_acquire() {
+  local metadata recorded_token owner_pid owner_start current_start attempt token process_start reclaim_dir
+  LOCK="$T.lock"
+  metadata="$LOCK/metadata"
+  attempt=0
+  while [ "$attempt" -lt 2 ]; do
+    token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    if mkdir -m 700 "$LOCK" 2>/dev/null; then
+      process_start=$(write_lock_process_start "$$")
+      [ -n "$process_start" ] || process_start=unavailable
+      if ! printf 'token=%s\npid=%s\nprocess_start=%s\n' "$token" "$$" "$process_start" > "$metadata"; then
+        rmdir "$LOCK" 2>/dev/null || :
+        return 1
+      fi
+      DISCUSSION_LOCK="$LOCK"
+      DISCUSSION_LOCK_TOKEN="$token"
+      return 0
+    fi
+    [ -f "$metadata" ] || return 1
+    recorded_token=$(write_lock_metadata_value "$metadata" token)
+    owner_pid=$(write_lock_metadata_value "$metadata" pid)
+    owner_start=$(write_lock_metadata_value "$metadata" process_start)
+    case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
+    if kill -0 "$owner_pid" 2>/dev/null; then
+      current_start=$(write_lock_process_start "$owner_pid")
+      if [ -z "$current_start" ] || [ -z "$owner_start" ] ||
+        [ "$owner_start" = unavailable ] || [ "$current_start" = "$owner_start" ]; then
+        return 1
+      fi
+    fi
+    [ -n "$recorded_token" ] || return 1
+    [ "$(write_lock_metadata_value "$metadata" token)" = "$recorded_token" ] || return 1
+    reclaim_dir="$LOCK/.reclaim"
+    mkdir "$reclaim_dir" 2>/dev/null || return 1
+    if [ "$(write_lock_metadata_value "$metadata" token)" != "$recorded_token" ]; then
+      rmdir "$reclaim_dir" 2>/dev/null || :
+      return 1
+    fi
+    if ! rm -f "$metadata" 2>/dev/null ||
+      ! rmdir "$reclaim_dir" 2>/dev/null || ! rmdir "$LOCK" 2>/dev/null; then
+      rmdir "$reclaim_dir" 2>/dev/null || :
+      return 1
+    fi
+    progress "DISCUSSION: reclaimed stale transcript lock $LOCK"
+    attempt=$((attempt + 1))
+  done
+  return 1
 }
 
 if [ "$MODE" = "--new" ]; then
@@ -84,12 +135,19 @@ if [ "$MODE" = "--new" ]; then
   TOPIC="$2"
   SLUG="${3:-main}"
   valid_slug "$SLUG" || { echo "DISCUSSION_ERROR: slug may only contain [a-zA-Z0-9_-]" >&2; maestro_finish "FAILED" 3; }
-  transcript_path
-  if [ -f "$T" ]; then
+  transcript_path || { echo "DISCUSSION_ERROR: could not resolve a private transcript path" >&2; maestro_finish "FAILED" 3; }
+  if [ -e "$T" ] || [ -e "$STATE" ]; then
     echo "DISCUSSION_ERROR: transcript already exists: $T (pick another slug or remove it)" >&2
     maestro_finish "FAILED" 3
   fi
-  printf '# Discussion: %s\n\n' "$TOPIC" > "$T"
+  tmp="$T.tmp.$$"
+  if ! printf '# Discussion: %s\n\n' "$TOPIC" > "$tmp" ||
+    ! chmod 600 "$tmp" || ! mv -f "$tmp" "$T" ||
+    ! discussion_write_state 0 0 0; then
+    rm -f "$tmp" "$T" "$STATE" 2>/dev/null || :
+    echo "DISCUSSION_ERROR: could not create transcript state at $T" >&2
+    maestro_finish "FAILED" 3
+  fi
   echo "DISCUSSION: started '$TOPIC' → $T"
   echo "Write your opening position to a file, then: discussion-loop.sh --turn <file> ${SLUG}"
   maestro_finish "CONTINUE" 0
@@ -110,18 +168,39 @@ RETRIES="${MAESTRO_DISCUSSION_RETRIES:-2}"
 RETRY_SLEEP="${MAESTRO_RETRY_SLEEP:-5}"
 
 valid_slug "$SLUG" || { echo "DISCUSSION_ERROR: slug may only contain [a-zA-Z0-9_-]" >&2; maestro_finish "FAILED" 3; }
-transcript_path
-if [ ! -f "$T" ]; then
-  echo "DISCUSSION_ERROR: no transcript at $T — start one with --new \"<topic>\" ${SLUG}" >&2
+for value in "$MAX_IDLE" "$POLL" "$MAX_ROUNDS" "$RETRIES" "$RETRY_SLEEP"; do
+  case "$value" in ''|*[!0-9]*) echo "DISCUSSION_ERROR: bounds must be non-negative integers" >&2; maestro_finish "FAILED" 3 ;; esac
+done
+[ "$MAX_IDLE" -ge 1 ] && [ "$POLL" -ge 1 ] && [ "$MAX_ROUNDS" -ge 1 ] ||
+  { echo "DISCUSSION_ERROR: max_idle, poll, and max rounds must be at least 1" >&2; maestro_finish "FAILED" 3; }
+[ "$RETRIES" -le 10 ] || { echo "DISCUSSION_ERROR: retries must be at most 10" >&2; maestro_finish "FAILED" 3; }
+transcript_path || { echo "DISCUSSION_ERROR: could not resolve transcript path" >&2; maestro_finish "FAILED" 3; }
+[ -f "$T" ] || { echo "DISCUSSION_ERROR: no transcript at $T — start one with --new \"<topic>\" ${SLUG}" >&2; maestro_finish "FAILED" 3; }
+[ -f "$FILE" ] || { echo "DISCUSSION_ERROR: turn file not found: $FILE" >&2; maestro_finish "FAILED" 3; }
+if ! discussion_lock_acquire; then
+  echo "DISCUSSION_ERROR: another turn is in progress or its owner cannot be disproved for $T (lock: $T.lock)" >&2
   maestro_finish "FAILED" 3
 fi
-if [ ! -f "$FILE" ]; then
-  echo "DISCUSSION_ERROR: turn file not found: $FILE" >&2
+if ! discussion_read_state; then
+  echo "DISCUSSION_ERROR: transcript state is missing or malformed: $STATE" >&2
   maestro_finish "FAILED" 3
 fi
 
-# Round cap — checked BEFORE dispatching, so a capped discussion costs nothing.
-TURNS=$(grep -c '^### Claude' "$T" || true)
+if [ "$STATE_AWAITING" -eq 1 ]; then
+  rollback_tmp="$T.rollback.$$"
+  if ! dd if="$T" of="$rollback_tmp" bs=1 count="$STATE_ROLLBACK" 2>/dev/null ||
+    ! chmod 600 "$rollback_tmp" || ! mv -f "$rollback_tmp" "$T"; then
+    rm -f "$rollback_tmp" 2>/dev/null || :
+    echo "DISCUSSION_ERROR: could not roll back orphaned turn" >&2
+    maestro_finish "FAILED" 3
+  fi
+  STATE_TURNS=$((STATE_TURNS - 1))
+  discussion_write_state "$STATE_TURNS" 0 0 || {
+    echo "DISCUSSION_ERROR: could not persist orphan recovery" >&2
+    maestro_finish "FAILED" 3
+  }
+fi
+TURNS=$STATE_TURNS
 if [ "$TURNS" -ge "$MAX_ROUNDS" ]; then
   echo "DISCUSSION_CAP: ${MAX_ROUNDS} turns exhausted. Do not re-run: either state the design" >&2
   echo "with its deciding assumption and proceed to planning, or ESCALATE the exact fork" >&2
@@ -129,17 +208,6 @@ if [ "$TURNS" -ge "$MAX_ROUNDS" ]; then
   maestro_finish "ESCALATE" 5
 fi
 
-# One turn at a time per transcript.
-LOCK="$T.lock"
-if ! mkdir "$LOCK" 2>/dev/null; then
-  echo "DISCUSSION_ERROR: another turn is in progress for $T (lock: $LOCK)" >&2
-  maestro_finish "FAILED" 3
-fi
-DISCUSSION_LOCK="$LOCK"
-
-# Discussion doctrine — appended to every turn so Codex debates with discipline by
-# default. Adversarial in both directions: no manufactured objections, AND no
-# manufactured agreement. Grilling is the job; politeness is not.
 DOCTRINE='
 
 --- DISCUSSION DOCTRINE (always applies) ---
@@ -157,108 +225,89 @@ The text above is the full transcript so far; it is your only memory.
   evidence, not the better argument. Demand the actual output, log, or code line that
   distinguishes the rival hypotheses — and say which experiment would settle it.
 - Built-in web search is disabled (it hangs). Your configured MCP tools (e.g. tavily,
-  context7) ARE available — use them to verify version-sensitive facts (library
-  versions, API changes, current docs) instead of trusting training data. Max 2
-  lookups per turn; if a lookup fails or stalls, do NOT retry — mark it
-  "RESEARCH NEEDED: <question>" and argue from what you have.
-- When an MCP check changes your position, name it: "verified via context7: <fact>"
-  beats an unsupported claim. When it does not change your position, say nothing.
-- You have read-only repo access: ground claims in the actual code (git log, blame,
-  ripgrep) whenever the debate touches reality.
-- If the decision genuinely belongs to the human (product taste, irreversible
-  tradeoff, budget), end with:
-    ESCALATE: <the exact fork — both options, the case for each, your recommendation>
+  context7) ARE available — max 2 lookups per turn.
+- You have read-only repo access: ground claims in the actual code.
+- If the decision belongs to the human, end with:
+    ESCALATE: <the exact fork, both options, and recommendation>
 - If the design is settled, end with:
-    CONVERGED: <the agreed design in 2-3 lines — including what the losing
-    alternatives were and why they lost>
+    CONVERGED: <the agreed design and rejected alternatives>
 - Stay under ~300 words.'
 
-C=$(companion_resolve) || {
-  echo "DISCUSSION_ERROR: codex-companion.mjs not found. Is the openai/codex-plugin-cc plugin installed? (run: /plugin install codex@openai-codex)" >&2
-  maestro_finish "FAILED" 3
-}
-
-PIN=$(companion_pin 2>/dev/null) || {
-  echo "DISCUSSION_ERROR: no Codex model/effort pinned — run codex-model-select.sh <model> <effort> first." >&2
-  maestro_finish "FAILED" 3
-}
+C=$(companion_resolve) || { echo "DISCUSSION_ERROR: codex-companion.mjs not found" >&2; maestro_finish "FAILED" 3; }
+PIN=$(companion_pin 2>/dev/null) || { echo "DISCUSSION_ERROR: no Codex model/effort pinned" >&2; maestro_finish "FAILED" 3; }
 PIN_MODEL=${PIN%%$'\t'*}
 PIN_EFFORT=${PIN#*$'\t'}
 PIN_EFFORT=${PIN_EFFORT%%$'\t'*}
 
-# If the previous Claude turn never got a Codex reply (dispatch died, hang, job
-# failed), replace that orphaned turn instead of appending a duplicate.
-LAST_CLAUDE=$(grep -n '^### Claude' "$T" | tail -1 | cut -d: -f1 || true)
-LAST_CODEX=$(grep -n '^### Codex' "$T" | tail -1 | cut -d: -f1 || true)
-LAST_CODEX=${LAST_CODEX:-0}
-if [ -n "$LAST_CLAUDE" ] && [ "$LAST_CLAUDE" -gt "$LAST_CODEX" ]; then
-  head -n $((LAST_CLAUDE - 1)) "$T" > "$T.tmp.$$" && mv "$T.tmp.$$" "$T"
-  TURNS=$((TURNS - 1))
-fi
-
-# Append Claude's turn to the transcript, then dispatch the whole thing.
 N=$((TURNS + 1))
-printf '\n### Claude (turn %s)\n\n' "$N" >> "$T"
-cat "$FILE" >> "$T"
-printf '\n' >> "$T"
-
+ROLLBACK_BYTES=$(wc -c < "$T" | tr -d ' ')
+backup="$T.before.$$"
+tmp="$T.tmp.$$"
+if ! cp -p "$T" "$backup" || ! cp -p "$T" "$tmp" ||
+  ! printf '\n### Claude (turn %s)\n\n' "$N" >> "$tmp" ||
+  ! cat "$FILE" >> "$tmp" || ! printf '\n' >> "$tmp" ||
+  ! chmod 600 "$tmp" || ! mv -f "$tmp" "$T" ||
+  ! discussion_write_state "$N" 1 "$ROLLBACK_BYTES"; then
+  [ -f "$backup" ] && mv -f "$backup" "$T" 2>/dev/null || :
+  rm -f "$tmp" 2>/dev/null || :
+  echo "DISCUSSION_ERROR: could not persist Claude turn" >&2
+  maestro_finish "FAILED" 3
+fi
+rm -f "$backup"
 PROMPT="$(cat "$T")${DOCTRINE}"
 
-# READ-ONLY on purpose: no write flag here. Debate mode argues; the implementer
-# path is the only one that edits code, and only after convergence.
 REPLY=""
 attempt=0
 while :; do
   attempt=$((attempt + 1))
-  JOB=$(companion_start "$C" "$PROMPT") || {
-    echo "DISCUSSION_ERROR: could not start Codex job (see above)." >&2
-    maestro_finish "FAILED" 3
-  }
+  dispatch_started=$SECONDS
+  JOB=$(companion_start "$C" "$PROMPT") || { echo "DISCUSSION_ERROR: could not start Codex job" >&2; maestro_finish "FAILED" 3; }
   progress "DISCUSSION: turn $N dispatched as $JOB (model=$PIN_MODEL effort=$PIN_EFFORT, read-only, attempt $attempt, max_idle=${MAX_IDLE}s poll=${POLL}s)"
   companion_verify_pin "$C" "$JOB" "$PIN_MODEL" "$PIN_EFFORT" || :
-
-  companion_poll "$C" "$JOB" "$MAX_IDLE" "$POLL"
+  companion_poll "$C" "$JOB" "$MAX_IDLE" "$POLL" "$dispatch_started"
   rc=$?
-
-  if [ "$rc" -eq 124 ]; then
-    echo "DISCUSSION_HUNG: job $JOB stalled; cancelled. Your turn is saved in $T — re-run --turn to retry, or proceed alone." >&2
+  if [ "$rc" -eq 124 ] && [ "${MAESTRO_CANCEL_REASON:-unknown}" != status-lost ]; then
+    echo "DISCUSSION_HUNG: job $JOB stalled; cancelled. Your turn is saved in $T." >&2
     maestro_finish "HUNG" 124
   fi
-
-  if [ "$rc" -eq 0 ]; then
-    if REPLY=$(companion_result "$C" "$JOB"); then
-      break
-    fi
-    rc=4
-  fi
-
-  # rc is 4 (failed) or 6 (status-lost) — transient; retry if attempts remain.
+  if [ "$rc" -eq 0 ] && REPLY=$(companion_result "$C" "$JOB"); then break; fi
   if [ "$attempt" -le "$RETRIES" ]; then
-    left=$((RETRIES - attempt + 1))
-    word="retries"; [ "$left" -eq 1 ] && word="retry"
+    left=$((RETRIES - attempt + 1)); word=retries; [ "$left" -eq 1 ] && word=retry
     echo "DISCUSSION_RETRY: attempt $attempt failed; retrying in ${RETRY_SLEEP}s ($left $word left)" >&2
     sleep "$RETRY_SLEEP"
   else
-    echo "DISCUSSION_FAILED: job failed after $attempt attempt(s). Your turn is saved in $T — re-run --turn to retry, or proceed alone." >&2
+    echo "DISCUSSION_FAILED: job failed after $attempt attempt(s). Your turn is saved in $T." >&2
     maestro_finish "FAILED" 4
   fi
 done
 
-printf '\n### Codex (turn %s · model=%s effort=%s)\n\n%s\n' "$N" "$PIN_MODEL" "$PIN_EFFORT" "$REPLY" >> "$T"
+backup="$T.before.$$"
+tmp="$T.tmp.$$"
+if ! cp -p "$T" "$backup" || ! cp -p "$T" "$tmp" ||
+  ! printf '\n### Codex (turn %s · model=%s effort=%s)\n\n%s\n' "$N" "$PIN_MODEL" "$PIN_EFFORT" "$REPLY" >> "$tmp" ||
+  ! chmod 600 "$tmp" || ! mv -f "$tmp" "$T" ||
+  ! discussion_write_state "$N" 0 "$ROLLBACK_BYTES"; then
+  [ -f "$backup" ] && mv -f "$backup" "$T" 2>/dev/null || :
+  rm -f "$tmp" 2>/dev/null || :
+  echo "DISCUSSION_ERROR: reply was received but could not be persisted" >&2
+  maestro_finish "FAILED" 3
+fi
+rm -f "$backup"
 printf '%s\n' "$REPLY"
 
-# Machine-readable state so the orchestrator knows whether the debate is over
-# without parsing prose.
-if printf '%s' "$REPLY" | grep -q '^CONVERGED:'; then
-  FINAL_STATE="CONVERGED"
-  progress "DISCUSSION_STATE: CONVERGED — extract the agreed design into the plan's Decisions section"
-elif printf '%s' "$REPLY" | grep -q '^ESCALATE:'; then
-  FINAL_STATE="ESCALATE"
-  progress "DISCUSSION_STATE: ESCALATE — relay the fork verbatim to the user before continuing"
-else
-  FINAL_STATE="CONTINUE"
-  progress "DISCUSSION_STATE: CONTINUE — write your next turn and re-run --turn (or converge yourself and say why)"
-fi
-printf '%s' "$REPLY" | grep -q '^STANCE:' || \
+marker=$(printf '%s\n' "$REPLY" |
+  sed -nE 's/^(CONVERGED|ESCALATE):[[:space:]].*$/\1/p' | tail -1)
+case "$marker" in
+  CONVERGED)
+    FINAL_STATE="CONVERGED"
+    progress "DISCUSSION_STATE: CONVERGED — extract the agreed design into the plan's Decisions section" ;;
+  ESCALATE)
+    FINAL_STATE="ESCALATE"
+    progress "DISCUSSION_STATE: ESCALATE — relay the fork verbatim to the user before continuing" ;;
+  *)
+    FINAL_STATE="CONTINUE"
+    progress "DISCUSSION_STATE: CONTINUE — write your next turn and re-run --turn" ;;
+esac
+printf '%s\n' "$REPLY" | sed -n '1p' | grep -q '^STANCE:' ||
   echo "DISCUSSION_WARN: reply opened without a STANCE line — weigh it accordingly" >&2
 maestro_finish "$FINAL_STATE" 0

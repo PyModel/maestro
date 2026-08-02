@@ -52,6 +52,9 @@ if (args[0] === "--help") {
     case "capable":
       console.log("Usage:\n  node x task [--background] [--write] [--model <m>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]");
       break;
+    case "misleading":
+      console.log("Usage:\n  node x task [--background] [--model <m>] [prompt]\n  node x review [--write] [prompt]");
+      break;
     case "silent":
       break;
     case "erroring":
@@ -64,7 +67,7 @@ if (args[0] === "--help") {
 }
 EOF
 
-for stub in drifted capable silent erroring; do
+for stub in drifted capable misleading silent erroring; do
   cp "$D/stub.cjs" "$D/$stub.cjs"
 done
 
@@ -76,6 +79,10 @@ run_start() {
   : > "$LOG"
   : > "$ERR"
   if [ "$mode" = "write" ]; then
+    mkdir -p "$D/lease"
+    printf 'token=preflight-token\npid=%s\nprocess_start=unavailable\njob_id=unknown\nsession_id=preflight\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' \
+      "$$" > "$D/lease/metadata"
+    export MAESTRO_LOCK_ACQUIRED=1 MAESTRO_LOCK_TOKEN=preflight-token MAESTRO_LOCK_DIR="$D/lease"
     if OUTPUT=$(companion_start "$D/$stub.cjs" "hello" write 2>"$ERR"); then
       RC=0
     else
@@ -99,6 +106,15 @@ grep -q '^task\( \|$\)' "$LOG" &&
   fail 1 "drifted write attempted a task dispatch"
 pass 1 "conclusive flag drift refuses write dispatch"
 
+run_start misleading write
+[ "$RC" -eq 3 ] ||
+  fail 1b "unrelated --write returned rc=$RC, want 3; output: $OUTPUT"
+grep -qi 'flag drift' "$ERR" ||
+  fail 1b "unrelated --write did not report task flag drift; stderr: $(cat "$ERR")"
+grep -q '^task\( \|$\)' "$LOG" &&
+  fail 1b "--write from another subcommand authorized a task dispatch"
+pass 1b "--write on another subcommand does not authorize task"
+
 run_start capable write
 [ "$RC" -eq 0 ] ||
   fail 2 "capable write returned rc=$RC, want 0; stderr: $(cat "$ERR")"
@@ -106,7 +122,9 @@ run_start capable write
   fail 2 "capable write returned unexpected job id: $OUTPUT"
 grep -q '^task .*--write' "$LOG" ||
   fail 2 "capable write task invocation omitted --write"
-pass 2 "advertised --write dispatches with the flag"
+grep -q '^task .*--effort high' "$LOG" ||
+  fail 2 "write task invocation omitted the explicit implementation effort"
+pass 2 "advertised --write dispatches with explicit implementation effort"
 
 run_start silent write
 [ "$RC" -eq 0 ] ||
@@ -131,7 +149,20 @@ grep -q '^task\( \|$\)' "$LOG" ||
   fail 5 "read-only invocation did not dispatch a task"
 grep -q -- '--write' "$LOG" &&
   fail 5 "read-only task invocation included --write"
-pass 5 "read-only dispatch skips the compatibility probe"
+grep -q '^task .*--effort high' "$LOG" ||
+  fail 5 "read-only invocation omitted the explicit debate effort"
+pass 5 "read-only dispatch skips the compatibility probe and pins debate effort"
 
-echo "VERIFY PASS: conclusive-only --write preflight, inconclusive help allowed, read-only probe skipped"
+CACHE="$HOME/.claude/plugins/cache/openai-codex/codex"
+mkdir -p "$CACHE/1.0.2/scripts" "$CACHE/1.0.10/scripts"
+: > "$CACHE/1.0.2/scripts/codex-companion.mjs"
+: > "$CACHE/1.0.10/scripts/codex-companion.mjs"
+sleep 1
+touch "$CACHE/1.0.2/scripts/codex-companion.mjs"
+RESOLVED=$(companion_resolve)
+[ "$RESOLVED" = "$CACHE/1.0.10/scripts/codex-companion.mjs" ] ||
+  fail 6 "resolved $RESOLVED, want highest semantic version 1.0.10"
+pass 6 "runtime companion resolution ignores cache mtime and selects highest semantic version"
+
+echo "VERIFY PASS: task-scoped write preflight, inconclusive help allowed, read-only probe skipped, highest companion version selected"
 exit 0

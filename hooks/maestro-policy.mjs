@@ -18,6 +18,10 @@ export const NONCODE_BASENAMES = new Set([
   '.python-version', '.tool-versions',
 ]);
 
+export function isValidSessionId(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(value);
+}
+
 export function isNonCode(absPath) {
   const basename = path.basename(absPath).toLowerCase();
   if (basename.startsWith('.env')) return true;
@@ -37,6 +41,21 @@ const DIRECTIVE =
   /\b(edit it yourself|do it yourself|write it yourself|yourself this time|kendin yap(?!ma)\b|sen yap(?!ma)\b|sen d[üu]zenle|don'?t delegate|no codex|skip codex)\b/gi;
 const GUARDED_PREFIX =
   /(?:\b(?:do not|don'?t|never|won'?t|shouldn'?t|not|saying|says|say|said|typing|typed|phrase|words|means|mean)(?:\s+(?:ever|even|just|really|actually|simply))?\s*|["'`“‘]\s*)$/i;
+const CLAUSE_GUARD =
+  /\b(?:do not|don'?t|never|won'?t|shouldn'?t|not|saying|says|say|said|typing|typed|phrase|words|means|mean)\b/i;
+
+function isGuarded(prefix) {
+  if (GUARDED_PREFIX.test(prefix)) return true;
+  const clause = prefix.slice(Math.max(
+    prefix.lastIndexOf('.'), prefix.lastIndexOf('!'), prefix.lastIndexOf('?'),
+    prefix.lastIndexOf(';'), prefix.lastIndexOf('\n')
+  ) + 1);
+  if (CLAUSE_GUARD.test(clause)) return true;
+  const openDoubleQuotes = (clause.match(/["“]/g) || []).length;
+  const closeDoubleQuotes = (clause.match(/["”]/g) || []).length;
+  const backticks = (clause.match(/`/g) || []).length;
+  return openDoubleQuotes % 2 === 1 || closeDoubleQuotes % 2 === 1 || backticks % 2 === 1;
+}
 
 export function directiveOpensGate(prompt) {
   const text = String(prompt);
@@ -44,7 +63,7 @@ export function directiveOpensGate(prompt) {
 
   for (const match of text.matchAll(DIRECTIVE)) {
     const prefix = text.slice(0, match.index);
-    if (!GUARDED_PREFIX.test(prefix)) return true;
+    if (!isGuarded(prefix)) return true;
   }
   return false;
 }

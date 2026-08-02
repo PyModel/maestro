@@ -18,8 +18,9 @@ REAL_NODE=$(node -p 'process.execPath')
 mkdir -p "$D/shim"
 cat > "$D/shim/node" <<EOF
 #!/usr/bin/env bash
-# lib-companion invokes: node <resolved-companion-path> <subcommand> …
-# Drop the resolved path and run the fixture in its place.
+# Pass standard-library helper snippets through to the real runtime. For companion
+# calls, drop the resolved path and run the fixture in its place.
+case "\${1:-}" in -e|-p) exec "$REAL_NODE" "\$@" ;; esac
 shift
 exec "$REAL_NODE" "$FIXTURE" "\$@"
 EOF

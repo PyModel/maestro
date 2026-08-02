@@ -3,6 +3,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOOP="$ROOT/hooks/implementer-loop.sh"
+WATCHDOG="$ROOT/hooks/implementer-watchdog.sh"
 DISCUSSION="$ROOT/hooks/discussion-loop.sh"
 FIXTURE="$ROOT/tests/fixtures/fake-companion.mjs"
 TEST_ROOT=$(mktemp -d /tmp/maestro-liveness.XXXXXXXX)
@@ -66,6 +67,7 @@ mkdir -p "$SHIM" "$(dirname "$COMPANION")" "$TEST_HOME/.codex"
 : > "$COMPANION"
 {
   printf '#!/usr/bin/env bash\n'
+  printf 'if [ "${1:-}" = "-e" ]; then exec "%s" "$@"; fi\n' "$REAL_NODE"
   printf 'shift\n'
   printf 'exec "%s" "%s" "$@"\n' "$REAL_NODE" "$FIXTURE"
 } > "$SHIM/node"
@@ -324,6 +326,7 @@ t3_write_cancel_poisons() {
   status_empty > "$race_state/status.json"
   {
     printf '#!/usr/bin/env bash\n'
+    printf 'if [ "${1:-}" = "-e" ]; then exec "%s" "$@"; fi\n' "$REAL_NODE"
     printf 'shift\n'
     printf 'if [ "${1:-}" = "status" ] && [ "${2:-}" = "--all" ] && [ "${3:-}" = "--json" ]; then\n'
     printf '  mv -f "$MAESTRO_TEST_LATE_POISON" "$MAESTRO_TEST_LATE_LOCK/metadata"\n'
@@ -435,7 +438,7 @@ t5_poison_blocks_acquire() {
 t6_clear_lease_works_and_refuses() {
   local repo="$TEST_ROOT/deadline-repo" state="$TEST_ROOT/clear-state"
   local refuse_repo metadata pid
-  local wedge_repo wedge_lock healthy_repo healthy_lock healthy_pid healthy_now
+  local wedge_repo wedge_lock fresh_wedge_repo fresh_wedge_lock healthy_repo healthy_lock healthy_pid healthy_now
   mkdir -p "$state"
   status_empty > "$state/empty.json"
   set -m
@@ -479,6 +482,7 @@ t6_clear_lease_works_and_refuses() {
   wedge_repo=$(new_repo clear-wedge-repo)
   wedge_lock="$wedge_repo/.git/maestro-write.lock"
   mkdir -p "$wedge_lock"
+  touch -t 202001010000 "$wedge_lock"
   set -m
   (
     cd "$wedge_repo" &&
@@ -494,6 +498,24 @@ t6_clear_lease_works_and_refuses() {
   grep -q 'structurally invalid orphan' "$state/wedge-output" &&
     grep -Fq "$wedge_lock" "$state/wedge-output" ||
     { echo "wedge clear output omitted what was removed"; return 1; }
+
+  fresh_wedge_repo=$(new_repo clear-fresh-wedge-repo)
+  fresh_wedge_lock="$fresh_wedge_repo/.git/maestro-write.lock"
+  mkdir -p "$fresh_wedge_lock"
+  set -m
+  (
+    cd "$fresh_wedge_repo" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" MAESTRO_TEST_STATUS="$state/empty.json" \
+        bash "$LOOP" --clear-lease
+  ) > "$state/fresh-wedge-output" 2>&1 &
+  pid=$!
+  set +m
+  wait_bounded "$pid" 4
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "fresh wedge clear hung"; return 1; }
+  [ "$WAIT_RC" -eq 11 ] || { echo "fresh wedge clear rc=$WAIT_RC want 11"; return 1; }
+  [ -d "$fresh_wedge_lock" ] || { echo "fresh initializing lock was cleared"; return 1; }
+  grep -q 'may still be initializing' "$state/fresh-wedge-output" ||
+    { echo "fresh initializing refusal missing"; return 1; }
 
   healthy_repo=$(new_repo clear-healthy-repo)
   healthy_lock="$healthy_repo/.git/maestro-write.lock"
@@ -622,6 +644,36 @@ t8_verifier_boundaries() {
   [ "$ownership" = 1 ] ||
     { echo "write_lock_is_owner returned ${ownership:-no result} inside verifier, want non-zero"; return 1; }
   [ "$WAIT_RC" -eq 0 ] || { echo "verifier lease check rc=$WAIT_RC want 0"; return 1; }
+
+  repo=$(new_repo verifier-success-reap-repo)
+  state="$TEST_ROOT/verifier-success-reap-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  status_empty > "$state/status.json"
+  verify="sleep 60 & child=\$!; printf '%s\\n' \"\$child\" > '$state/child.pid'; exit 0"
+  set -m
+  (
+    cd "$repo" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_PHASE=completed \
+        MAESTRO_TEST_RESULT='RESULT: DONE' \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify "$verify" \
+          --max-iters 1 --poll 2
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  wait_bounded "$pid" 7
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "successful verifier reap exceeded 7s bound"; return 1; }
+  [ "$WAIT_RC" -eq 0 ] || { echo "successful verifier reap rc=$WAIT_RC want 0"; return 1; }
+  child=$(sed -n '1p' "$state/child.pid" 2>/dev/null)
+  [ -n "$child" ] || { echo "successful verifier child pid missing"; return 1; }
+  if kill -0 "$child" 2>/dev/null; then
+    kill -KILL "$child" 2>/dev/null || :
+    echo "successful verifier child $child survived VERIFIED_DONE"
+    return 1
+  fi
 }
 
 t9_terminal_at_deadline_harvests() {
@@ -655,6 +707,334 @@ t9_terminal_at_deadline_harvests() {
     { echo "result missing: $(tr '\n' ' ' < "$state/calls.log")"; return 1; }
 }
 
+t10_watchdog_signal_is_terminal() {
+  local repo state pid tasks cancels metadata
+  repo=$(new_repo watchdog-signal-repo)
+  state="$TEST_ROOT/watchdog-signal-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  : > "$state/job.log"
+  status_running_job task-fake0000-aaaaaa true > "$state/status.json"
+  set -m
+  (
+    cd "$repo" &&
+      exec env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_PHASE=running \
+        MAESTRO_TEST_LOGFILE="$state/job.log" \
+        MAESTRO_TEST_LOG_GROWTH=1 \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash "$WATCHDOG" --file "$TEST_ROOT/plan.md" 30 1
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  for _ in $(seq 1 100); do
+    grep -q '^status task-fake0000-aaaaaa --json$' "$state/calls.log" && break
+    sleep 0.05
+  done
+  grep -q '^status task-fake0000-aaaaaa --json$' "$state/calls.log" ||
+    { kill -KILL "$pid" 2>/dev/null || :; echo "watchdog never reached polling"; return 1; }
+  kill -TERM "$pid" || return 1
+  wait_bounded "$pid" 8
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "signalled watchdog did not exit"; return 1; }
+  [ "$WAIT_RC" -eq 125 ] || { echo "rc=$WAIT_RC want 125: $(tr '\n' ' ' < "$state/output")"; return 1; }
+  tasks=$(grep -c '^task ' "$state/calls.log" || true)
+  cancels=$(grep -c '^cancel task-fake0000-aaaaaa$' "$state/calls.log" || true)
+  [ "$tasks" -eq 1 ] || { echo "task starts=$tasks want 1"; return 1; }
+  [ "$cancels" -eq 1 ] || { echo "cancel attempts=$cancels want 1"; return 1; }
+  metadata="$repo/.git/maestro-write.lock/metadata"
+  [ -f "$metadata" ] || { echo "signalled watchdog released its lease"; return 1; }
+  grep -qx 'quiescence=unconfirmed' "$metadata" ||
+    { echo "signalled watchdog did not poison lease"; return 1; }
+}
+
+t11_loop_signal_is_terminal() {
+  local repo state pid tasks cancels metadata
+  repo=$(new_repo loop-signal-repo)
+  state="$TEST_ROOT/loop-signal-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  : > "$state/job.log"
+  status_running_job task-fake0000-aaaaaa true > "$state/status.json"
+  set -m
+  (
+    cd "$repo" &&
+      exec env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_PHASE=running \
+        MAESTRO_TEST_LOGFILE="$state/job.log" \
+        MAESTRO_TEST_LOG_GROWTH=1 \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify true \
+          --max-iters 2 --max-idle 30 --poll 1
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  for _ in $(seq 1 100); do
+    grep -q '^status task-fake0000-aaaaaa --json$' "$state/calls.log" && break
+    sleep 0.05
+  done
+  grep -q '^status task-fake0000-aaaaaa --json$' "$state/calls.log" ||
+    { kill -KILL "$pid" 2>/dev/null || :; echo "loop watchdog never reached polling"; return 1; }
+  kill -TERM "$pid" || return 1
+  wait_bounded "$pid" 8
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "signalled loop did not exit"; return 1; }
+  [ "$WAIT_RC" -eq 11 ] || { echo "rc=$WAIT_RC want 11: $(tr '\n' ' ' < "$state/output")"; return 1; }
+  tasks=$(grep -c '^task ' "$state/calls.log" || true)
+  cancels=$(grep -c '^cancel task-fake0000-aaaaaa$' "$state/calls.log" || true)
+  [ "$tasks" -eq 1 ] || { echo "task starts=$tasks want 1"; return 1; }
+  [ "$cancels" -eq 1 ] || { echo "cancel attempts=$cancels want 1"; return 1; }
+  metadata="$repo/.git/maestro-write.lock/metadata"
+  [ -f "$metadata" ] && grep -qx 'quiescence=unconfirmed' "$metadata" ||
+    { echo "signalled loop did not retain poisoned lease"; return 1; }
+}
+
+t12_loop_signal_reaps_verifier() {
+  local repo state pid child
+  repo=$(new_repo verifier-signal-repo)
+  state="$TEST_ROOT/verifier-signal-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  status_empty > "$state/status.json"
+  verify="sleep 60 & child=\$!; printf '%s\\n' \"\$child\" > '$state/child.pid'; wait \"\$child\""
+  set -m
+  (
+    cd "$repo" &&
+      exec env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_PHASE=completed \
+        MAESTRO_TEST_RESULT='RESULT: DONE' \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify "$verify" \
+          --max-iters 1 --poll 1
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  for _ in $(seq 1 100); do
+    [ -s "$state/child.pid" ] && break
+    sleep 0.05
+  done
+  [ -s "$state/child.pid" ] ||
+    { kill -KILL "$pid" 2>/dev/null || :; echo "verifier never started"; return 1; }
+  child=$(sed -n '1p' "$state/child.pid")
+  kill -TERM "$pid" || return 1
+  wait_bounded "$pid" 8
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "loop signal during verifier did not exit"; return 1; }
+  [ "$WAIT_RC" -eq 11 ] || { echo "rc=$WAIT_RC want 11"; return 1; }
+  if kill -0 "$child" 2>/dev/null; then
+    kill -KILL "$child" 2>/dev/null || :
+    echo "verifier child $child survived loop TERM"
+    return 1
+  fi
+}
+
+t13_prelaunch_generation_fence() {
+  local repo state pid metadata temp tasks token
+  repo=$(new_repo prelaunch-fence-repo)
+  state="$TEST_ROOT/prelaunch-fence-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  status_empty > "$state/status.json"
+  set -m
+  (
+    cd "$repo" &&
+      exec env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_HELP_DELAY=3 \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash "$WATCHDOG" --file "$TEST_ROOT/plan.md" 30 1
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  for _ in $(seq 1 100); do
+    grep -q '^--help$' "$state/calls.log" && break
+    sleep 0.05
+  done
+  grep -q '^--help$' "$state/calls.log" ||
+    { kill -KILL "$pid" 2>/dev/null || :; echo "watchdog never entered compatibility probe"; return 1; }
+  metadata="$repo/.git/maestro-write.lock/metadata"
+  [ -f "$metadata" ] || { kill -KILL "$pid" 2>/dev/null || :; echo "lease metadata missing"; return 1; }
+  temp="$metadata.successor"
+  sed 's/^token=.*/token=successor-token/' "$metadata" > "$temp" || return 1
+  mv -f "$temp" "$metadata" || return 1
+  wait_bounded "$pid" 8
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "prelaunch fence watchdog hung"; return 1; }
+  [ "$WAIT_RC" -eq 11 ] || { echo "rc=$WAIT_RC want 11: $(tr '\n' ' ' < "$state/output")"; return 1; }
+  tasks=$(grep -c '^task ' "$state/calls.log" || true)
+  [ "$tasks" -eq 0 ] || { echo "lost owner launched $tasks task(s)"; return 1; }
+  token=$(sed -n 's/^token=//p' "$metadata" | head -1)
+  [ "$token" = successor-token ] || { echo "successor token changed to $token"; return 1; }
+}
+
+t14_midpoint_warning_continues_same_job() {
+  local repo state pid warnings tasks
+  repo=$(new_repo budget-midpoint-repo)
+  state="$TEST_ROOT/budget-midpoint-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  status_empty > "$state/status.json"
+  # Pin verification consumes the first phase; leave five running poll samples before completion.
+  printf 'running\nrunning\nrunning\nrunning\nrunning\nrunning\ncompleted\n' > "$state/phases"
+  set -m
+  (
+    cd "$repo" &&
+      exec env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_PHASE_FILE="$state/phases" \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        MAESTRO_MAX_DISPATCH_SEC=8 \
+        bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify true \
+          --max-iters 1 --max-idle 30 --poll 1
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  wait_bounded "$pid" 11
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "midpoint completion exceeded bound"; return 1; }
+  [ "$WAIT_RC" -eq 0 ] || { echo "rc=$WAIT_RC want 0: $(tr '\n' ' ' < "$state/output")"; return 1; }
+  warnings=$(grep -c '^MAESTRO_BUDGET: .*continuing to the 8s hard ceiling' "$state/output" || true)
+  tasks=$(grep -c '^task ' "$state/calls.log" || true)
+  [ "$warnings" -eq 1 ] || { echo "midpoint warnings=$warnings want 1"; return 1; }
+  [ "$tasks" -eq 1 ] || { echo "task starts=$tasks want 1"; return 1; }
+  ! grep -q '^cancel ' "$state/calls.log" || { echo "healthy midpoint job was cancelled"; return 1; }
+}
+
+t15_startup_consumes_dispatch_budget() {
+  local repo state pid statuses
+  repo=$(new_repo budget-startup-repo)
+  state="$TEST_ROOT/budget-startup-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  : > "$state/job.log"
+  status_empty > "$state/status.json"
+  set -m
+  (
+    cd "$repo" &&
+      exec env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_TASK_DELAY=3 \
+        MAESTRO_TEST_JOB_PHASE=running \
+        MAESTRO_TEST_LOGFILE="$state/job.log" \
+        MAESTRO_TEST_LOG_GROWTH=1 \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        MAESTRO_MAX_DISPATCH_SEC=2 \
+        bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify true \
+          --max-iters 1 --max-idle 30 --poll 1
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  wait_bounded "$pid" 8
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "startup-budget case exceeded bound"; return 1; }
+  [ "$WAIT_RC" -eq 11 ] || { echo "rc=$WAIT_RC want 11"; return 1; }
+  statuses=$(grep -c '^status task-fake0000-aaaaaa --json$' "$state/calls.log" || true)
+  # One status call verifies the pin; the first poll must then hit the already-spent budget.
+  [ "$statuses" -eq 2 ] || { echo "status calls=$statuses want 2 (pin check + one poll)"; return 1; }
+  grep -q 'MAESTRO_RECOVERY: UNREPORTED_PARTIAL.*reason=deadline' "$state/output" ||
+    { echo "deadline recovery marker missing"; return 1; }
+}
+
+t16_observed_cancellation_is_terminal() {
+  local repo state pid tasks cancels metadata
+  repo=$(new_repo observed-cancel-repo)
+  state="$TEST_ROOT/observed-cancel-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  status_empty > "$state/status.json"
+  set -m
+  (
+    cd "$repo" &&
+      exec env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_PHASE=cancelled \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify true \
+          --max-iters 2 --poll 1
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  wait_bounded "$pid" 8
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "observed cancellation loop hung"; return 1; }
+  [ "$WAIT_RC" -eq 11 ] || { echo "rc=$WAIT_RC want 11: $(tr '\n' ' ' < "$state/output")"; return 1; }
+  tasks=$(grep -c '^task ' "$state/calls.log" || true)
+  cancels=$(grep -c '^cancel ' "$state/calls.log" || true)
+  [ "$tasks" -eq 1 ] || { echo "task starts=$tasks want 1"; return 1; }
+  [ "$cancels" -eq 0 ] || { echo "observed cancellation issued $cancels redundant cancel(s)"; return 1; }
+  metadata="$repo/.git/maestro-write.lock/metadata"
+  grep -qx 'quiescence=unconfirmed' "$metadata" 2>/dev/null &&
+    grep -qx 'unconfirmed_reason=cancelled-observed' "$metadata" 2>/dev/null ||
+    { echo "observed cancellation poison missing"; return 1; }
+}
+
+t17_malformed_status_counts_as_status_loss() {
+  local repo state pid statuses metadata
+  repo=$(new_repo malformed-status-repo)
+  state="$TEST_ROOT/malformed-status-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  status_empty > "$state/status.json"
+  set -m
+  (
+    cd "$repo" &&
+      exec env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_STATUS_RAW='{malformed' \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        MAESTRO_MAX_DISPATCH_SEC=8 \
+        bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify true \
+          --max-iters 2 --poll 1
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  wait_bounded "$pid" 7
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "malformed status did not take bounded status-loss path"; return 1; }
+  [ "$WAIT_RC" -eq 11 ] || { echo "rc=$WAIT_RC want 11"; return 1; }
+  statuses=$(grep -c '^status task-fake0000-aaaaaa --json$' "$state/calls.log" || true)
+  [ "$statuses" -eq 5 ] || { echo "status calls=$statuses want 5 (pin + four failed polls)"; return 1; }
+  metadata="$repo/.git/maestro-write.lock/metadata"
+  grep -qx 'unconfirmed_reason=status-lost' "$metadata" 2>/dev/null ||
+    { echo "malformed status was not classified as status-lost"; return 1; }
+}
+
+t18_invalid_polling_args_fail_before_launch() {
+  local repo state rc tasks
+  repo=$(new_repo invalid-polling-args-repo)
+  state="$TEST_ROOT/invalid-polling-args-state"
+  mkdir -p "$state"
+  status_empty > "$state/status.json"
+
+  for invocation in \
+    "watchdog-max-idle|bash '$WATCHDOG' --file '$TEST_ROOT/plan.md' bogus 1" \
+    "watchdog-poll|bash '$WATCHDOG' --file '$TEST_ROOT/plan.md' 30 0" \
+    "loop-max-idle|bash '$LOOP' --plan '$TEST_ROOT/plan.md' --verify true --max-idle bogus" \
+    "loop-poll|bash '$LOOP' --plan '$TEST_ROOT/plan.md' --verify true --poll 0"; do
+    name=${invocation%%|*}
+    command=${invocation#*|}
+    : > "$state/calls.log"
+    (
+      cd "$repo" || exit 1
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_PHASE=completed \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash -c "$command"
+    ) > "$state/$name.out" 2>&1
+    rc=$?
+    [ "$rc" -eq 3 ] || { echo "$name rc=$rc want 3"; return 1; }
+    tasks=$(grep -c '^task ' "$state/calls.log" || true)
+    [ "$tasks" -eq 0 ] || { echo "$name launched $tasks task(s)"; return 1; }
+    [ ! -d "$repo/.git/maestro-write.lock" ] || { echo "$name acquired a write lease"; return 1; }
+  done
+
+  (
+    cd "$repo" || exit 1
+    env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+      bash "$LOOP" --clear-lease --plan "$TEST_ROOT/plan.md" --verify true
+  ) > "$state/clear-mixed.out" 2>&1
+  rc=$?
+  [ "$rc" -eq 3 ] || { echo "mixed clear/execution rc=$rc want 3"; return 1; }
+  grep -q 'mutually exclusive' "$state/clear-mixed.out" ||
+    { echo "mixed clear/execution error is unclear"; return 1; }
+}
+
 check() {
   local fn="$1" label="$2" detail
   if detail=$("$fn" 2>&1); then
@@ -674,5 +1054,14 @@ check t6_clear_lease_works_and_refuses "clear-lease clears safely and refuses a 
 check t7_read_only_deadline_no_lease "read-only deadline creates no write lease"
 check t8_verifier_boundaries "verifier deadline bounds the process group and verifier does not own the lease"
 check t9_terminal_at_deadline_harvests "terminal job is harvested at the dispatch deadline"
+check t10_watchdog_signal_is_terminal "watchdog TERM poisons, cancels once, and cannot redispatch"
+check t11_loop_signal_is_terminal "loop TERM poisons, cancels once, and exits blocked"
+check t12_loop_signal_reaps_verifier "loop TERM reaps the active verifier process group"
+check t13_prelaunch_generation_fence "ownership is rechecked immediately before write launch"
+check t14_midpoint_warning_continues_same_job "midpoint warning continues the same productive job"
+check t15_startup_consumes_dispatch_budget "startup time consumes the hard dispatch budget"
+check t16_observed_cancellation_is_terminal "observed write cancellation poisons and cannot redispatch"
+check t17_malformed_status_counts_as_status_loss "malformed nonempty status follows bounded status loss"
+check t18_invalid_polling_args_fail_before_launch "invalid polling args and mixed clear mode fail before launch"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

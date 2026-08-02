@@ -191,6 +191,77 @@ EOF
     { echo "injected lease was poisoned"; return 1; }
 }
 
+t9_failed_start_cannot_publish_a_task_id() (
+  local output rc
+  companion_pin() { printf 'gpt-5.6-sol\thigh\thigh\n'; }
+  companion_call() {
+    printf 'transport failed after allocating task-phantom0-aaaaaa\n'
+    return 9
+  }
+  output=$(companion_start "$FIXTURE" objective)
+  rc=$?
+  [ "$rc" -eq 3 ] || { echo "rc=$rc want 3, output=${output:-empty}"; return 1; }
+  [ -z "$output" ] || { echo "failed launch published task id: $output"; return 1; }
+)
+
+t10_dispatch_budget_resolution() (
+  local output rc
+  unset MAESTRO_MAX_DISPATCH_SEC
+  [ "$(companion_dispatch_budget write)" = 2400 ] ||
+    { echo "unset write budget is not 2400"; return 1; }
+  [ "$(companion_dispatch_budget read)" = 1200 ] ||
+    { echo "unset read budget is not 1200"; return 1; }
+  [ "$(MAESTRO_MAX_DISPATCH_SEC=7 companion_dispatch_budget write)" = 7 ] ||
+    { echo "explicit write budget was changed"; return 1; }
+  output=$(MAESTRO_MAX_DISPATCH_SEC=bogus companion_dispatch_budget write 3>&1); rc=$?
+  [ "$rc" -eq 0 ] || { echo "invalid budget rc=$rc"; return 1; }
+  case "$output" in
+    *MAESTRO_POLL*bogus*1200s*1200) ;;
+    *) echo "invalid budget fallback/warning missing: $output"; return 1 ;;
+  esac
+)
+
+t11_idle_uses_elapsed_time_not_poll_count() (
+  local log="$TEST_ROOT/slow-status.log" reason="$TEST_ROOT/slow-status.reason"
+  local started elapsed rc
+  : > "$log"
+  unset MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_ACQUIRED
+  companion_call() {
+    sleep 2
+    printf '{"status":"running","logFile":"%s"}\n' "$log"
+  }
+  companion_cancel_job() {
+    printf '%s\n' "$3" > "$reason"
+    return 124
+  }
+  started=$SECONDS
+  companion_poll "$FIXTURE" task-slowstatus-aaaaaa 2 1 >/dev/null 2>&1
+  rc=$?
+  elapsed=$((SECONDS - started))
+  [ "$rc" -eq 124 ] || { echo "rc=$rc want 124"; return 1; }
+  [ "$(cat "$reason")" = idle ] || { echo "cancel reason=$(cat "$reason") want idle"; return 1; }
+  [ "$elapsed" -le 7 ] || { echo "idle cancellation took ${elapsed}s; configured idle wall time was 2s"; return 1; }
+)
+
+t12_status_call_is_clipped_to_hard_dispatch_budget() (
+  local output="$TEST_ROOT/hard-status-bound.out" calls="$TEST_ROOT/hard-status-calls.log"
+  local started elapsed rc
+  : > "$calls"
+  unset MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_ACQUIRED
+  started=$SECONDS
+  MAESTRO_TEST_CALL_LOG="$calls" \
+    MAESTRO_TEST_STATUS_HANG=4 \
+    MAESTRO_COMPANION_TIMEOUT_SEC=5 \
+    MAESTRO_MAX_DISPATCH_SEC=2 \
+    companion_poll "$FIXTURE" task-hardbound-aaaaaa 60 1 > "$output" 2>&1 3>&1
+  rc=$?
+  elapsed=$((SECONDS - started))
+  [ "$rc" -eq 124 ] || { echo "rc=$rc want read-only deadline 124"; return 1; }
+  [ "$elapsed" -le 4 ] || { echo "elapsed=${elapsed}s exceeded the 2s hard budget by an unbounded status call"; return 1; }
+  grep -q '^cancel task-hardbound-aaaaaa$' "$calls" || { echo "deadline did not cancel the job"; return 1; }
+  grep -q 'reason=deadline' "$output" || { echo "hard bound was not classified as deadline"; return 1; }
+)
+
 check() {
   local fn="$1" label="$2" detail
   if detail=$("$fn" 2>&1); then
@@ -209,5 +280,9 @@ check t5_repo_digest_survives_refactor "bounded repository digest still returns 
 check t6_poll_hanging_status_is_bounded "poll loop bounds repeated hanging statuses"
 check t7_fast_status_has_no_one_second_floor "five fast status calls finish under two seconds"
 check t8_t6_scrubs_an_inherited_lease "t6 scrubs an inherited write lease"
+check t9_failed_start_cannot_publish_a_task_id "failed start cannot publish a phantom task id"
+check t10_dispatch_budget_resolution "dispatch budgets resolve by mode and preserve explicit values"
+check t11_idle_uses_elapsed_time_not_poll_count "idle timeout uses elapsed wall time, not configured poll counts"
+check t12_status_call_is_clipped_to_hard_dispatch_budget "status calls cannot extend the hard dispatch budget by their full timeout"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

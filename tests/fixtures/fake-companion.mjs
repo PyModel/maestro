@@ -19,7 +19,20 @@ function growLog() {
   }
 }
 
+function nextSequenceValue(file, fallback) {
+  if (!file) return fallback;
+  const values = fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
+  if (values.length === 0) return fallback;
+  fs.writeFileSync(file, values.slice(1).join("\n"), "utf8");
+  return values[0];
+}
+
 if (command === "--help") {
+  appendCall("--help");
+  const delay = Number(process.env.MAESTRO_TEST_HELP_DELAY ?? "0");
+  if (delay > 0) {
+    await new Promise((resolve) => setTimeout(resolve, delay * 1000));
+  }
   console.log(`Usage:
   node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]`);
   process.exit(0);
@@ -39,7 +52,8 @@ if (command === "task") {
   if (delay > 0) {
     await new Promise((resolve) => setTimeout(resolve, delay * 1000));
   }
-  process.exit(0);
+  const taskExit = Number(process.env.MAESTRO_TEST_TASK_EXIT ?? "0");
+  process.exit(Number.isInteger(taskExit) ? taskExit : 1);
 }
 
 if (command === "status" && args[0] === "--all" && args[1] === "--json") {
@@ -48,6 +62,12 @@ if (command === "status" && args[0] === "--all" && args[1] === "--json") {
   const statusFile = process.env.MAESTRO_TEST_STATUS;
   if (!statusFile) {
     process.exit(1);
+  }
+  const ownerSession = process.env.MAESTRO_TEST_STATUS_SESSION_ID;
+  const requestedSession = process.env.CODEX_COMPANION_SESSION_ID;
+  if (ownerSession && requestedSession && requestedSession !== ownerSession) {
+    console.log(JSON.stringify({ running: [], latestFinished: null }));
+    process.exit(0);
   }
   const value = fs.readFileSync(statusFile, "utf8");
   console.log(value.trim() === "BROKEN" ? "{malformed" : value);
@@ -61,7 +81,14 @@ if (command === "status" && args.at(-1) === "--json") {
   if (hang > 0) {
     await new Promise((resolve) => setTimeout(resolve, hang * 1000));
   }
-  const status = process.env.MAESTRO_TEST_JOB_PHASE ?? "completed";
+  if (process.env.MAESTRO_TEST_JOB_STATUS_RAW !== undefined) {
+    console.log(process.env.MAESTRO_TEST_JOB_STATUS_RAW);
+    process.exit(0);
+  }
+  const status = nextSequenceValue(
+    process.env.MAESTRO_TEST_JOB_PHASE_FILE,
+    process.env.MAESTRO_TEST_JOB_PHASE ?? "completed"
+  );
   const value = {
     id: args[0],
     status,

@@ -342,3 +342,181 @@ for this project, so there was no monitor to go stale; what was observed was bac
 notification timing. The monitor stays unchanged. Staleness today is already decided by process
 identity plus companion job liveness, never by log growth — `MAX_IDLE` cancels the *dispatch*
 (`lib-companion.sh:1028-1041`) and never marks a lease stale.
+
+## Audit remediation fix plan — 2026-08-02
+
+Source: 20-agent repository audit, independent reproductions, and the real 20-minute budget incident.
+The tier order is binding: complete and verify higher tiers before lower tiers. Each checkbox is one
+scoped plan/commit unless it explicitly names a test-first substep. Do not bundle the tiers into one
+dispatch. Budget research:
+`docs/superpowers/specs/2026-08-02-dispatch-budget-resilience-research.md`.
+
+Completed in one ordered working-tree pass with focused RED→GREEN regressions per seam, then verified
+by `bash tests/run.sh` → `SUMMARY: 15 passed, 0 failed`. No live installation was performed.
+
+### Tier 1 — exclusive ownership and launch integrity
+
+Everything that can let two writers touch one tree, or record a job that never started.
+
+- [x] **Make stale reclaim token-conditioned and atomic; stabilize process identity.** This is the
+  exclusive-ownership core of open Plan B2. Re-read the lease generation token immediately before
+  reclaim, then atomically rename/claim that exact generation before deleting it; a competing reclaimer
+  that loses the rename must retry or block, never return success. Revalidate the token at every
+  metadata publish, stale break, clear, release, dispatch, and verification boundary. Pin `LC_ALL=C`
+  and `TZ=UTC0` on both `ps -o lstart=` calls (or replace both with one epoch-based identity), rather
+  than comparing locale/TZ-dependent strings (`hooks/lib-companion.sh` around lines 591, 679, 753).
+  Heartbeat expiry only makes a lease a reclaim candidate: a live-or-unknown owner PGID or global
+  companion writer still blocks reclaim. Acceptance: only one of two simultaneous reclaimers acquires;
+  SIGSTOP → expiry/reclaim → SIGCONT leaves the old token unable to publish, dispatch, verify, or
+  delete; changing `TZ` cannot steal a live lease.
+
+- [x] **Make companion writer liveness repository-global, with a session-aware test first.** Extend
+  `tests/fixtures/fake-companion.mjs` to model `CODEX_COMPANION_SESSION_ID`, then prove RED that session B
+  cannot see session A's writer. Only then change the production adapter so repository safety queries
+  deliberately strip/set that variable and never trust session-filtered `status --all`
+  (`hooks/lib-companion.sh` around lines 433-524). Malformed or unavailable global status fails closed.
+  Acceptance: the fixture distinguishes sessions; A starts a writer; B observes it and cannot clear or
+  acquire the lease. **The current fixture has no session concept, so this fix is unverified unless the
+  fixture lands first.**
+
+- [x] **Reject phantom launches.** Capture `companion_call` stdout/stderr and status separately; check
+  its status before extracting a task ID (`hooks/lib-companion.sh` around lines 1052-1058). A failed
+  start may print task-shaped text but must return failure, publish no job ID, and never enter polling.
+  Add the adversarial fixture case before the implementation.
+
+### Tier 2 — signal, process, and budget containment
+
+Kill paths that can leave a live writer behind, then safely enlarge the healthy-write budget.
+
+- [x] **Make watchdog termination poison and cancel exactly once.** HUP/INT/TERM in
+  `hooks/implementer-watchdog.sh` around lines 43-53 must stage poison before attempting companion
+  cancellation, retain the lease whenever quiescence is unknown, and return the outer loop's terminal
+  write-cancellation status rather than generic rc 4. The loop must not redispatch. Acceptance: killing
+  only the watchdog yields one task, one bounded cancel attempt, a retained poisoned lease, and
+  `BLOCKED`.
+
+- [x] **Reap the verifier process group on every terminal path.** Track the verifier PGID and terminate
+  the group after success as well as timeout, failure, and supervisor interruption
+  (`hooks/implementer-loop.sh` around lines 315-341). Acceptance: a verifier that backgrounds a child
+  and exits 0 leaves no child alive after `VERIFIED_DONE`.
+
+- [x] **Fence lease acquisition through job publication.** Close the watchdog's acquire-fast-path to
+  `companion_start` window (roughly lines 72-157): immediately before launch, prove the same token still
+  owns the lease and is not poisoned. Losing ownership or receiving a signal must prevent launch.
+  Acceptance: a deterministic pause/reclaim in that window starts zero jobs from the old watchdog.
+
+- [x] **Make long writes resilient without weakening the hard stop.** After the three cleanup fixes
+  above, implement the researched policy: unset write ceiling 2400s, read-only ceiling 1200s, valid
+  explicit `MAESTRO_MAX_DISPATCH_SEC=N` remains exact, invalid input warns and falls back to 1200s. Use
+  Bash `SECONDS`, start timing before `companion_start`, and emit one halfway warning while continuing
+  the same turn. Idle and status-loss paths remain faster; terminal state still wins at the ceiling.
+  Every write cancellation, including companion-observed `cancelled|canceled`, must poison, return 125,
+  retain the lease, and end `BLOCKED` with `MAESTRO_RECOVERY: UNREPORTED_PARTIAL`; never auto-resume or
+  dispatch a replacement. Acceptance: a productive scaled job crosses midpoint and completes; a chatty
+  job dies at the hard ceiling; external cancellation starts no second task.
+
+### Tier 3 — transactional installer ownership
+
+This precedes parsing fixes because current behavior can irreversibly destroy user bytes.
+
+- [x] **Make managed-file updates ownership-aware and transactional.** Record the exact bytes/hash from
+  the last successful install. If a destination diverges, refuse to overwrite it rather than replacing
+  the only `.maestro.bak`; update known-owned files through temp+rename. On uninstall, delete a hook only
+  when its bytes still equal the recorded managed version, matching the existing rules/skills safety
+  model (`install.mjs` around lines 24-30; `uninstall.mjs` around lines 29-31). Preserve same-named user
+  hooks and support version-A install/version-B uninstall.
+
+- [x] **Replace substring ownership with explicit settings identity.** Validate the complete settings
+  schema before touching files; reject a non-object `hooks` value such as `{"hooks":[]}`. Register and
+  remove only commands carrying Maestro's exact marker/identity, never basename substrings
+  (`install.mjs` around lines 140-159). Publish settings atomically. Acceptance: foreign similarly
+  named commands survive; malformed settings fail before mutation; interrupted and repeated
+  install/uninstall cycles preserve user bytes.
+
+### Tier 4 — strict protocol and authorization framing
+
+These paths are bounded by local `--verify`, so they follow writer and installer safety.
+
+- [x] **Parse result records as framed control data.** Anchor `RESULT:` to a complete line, accept only
+  defined tokens, and use the last anchored record rather than the first prefix match
+  (`hooks/implementer-watchdog.sh` around line 174; `hooks/implementer-loop.sh` around line 282).
+  `DONEISH`, quoted prose, and trailing junk are not terminal records. Treat nonempty malformed
+  companion status as bounded status loss, never as a healthy poll. Add deterministic tests for
+  multiple records, conflicting earlier prose, and malformed status.
+
+- [x] **Carry failed verification evidence into the next dispatch.** Reorder the rc handling around
+  `hooks/implementer-loop.sh:284` so the generic nonzero pre-check cannot shadow the evidence-carrying
+  branch around lines 367-372. Acceptance: a unique `RESULT: FAILED` report from iteration one appears
+  in iteration two's prompt and is not replaced by a generic retry.
+
+- [x] **Make model pinning truthful and permission-preserving.** Preserve `config.toml` mode, check every
+  write/rename status before printing success, publish model plus both efforts atomically, and parse only
+  true top-level TOML keys; indented tables, nested keys, and multiline strings cannot spoof the
+  preamble (`hooks/codex-model-select.sh`). Acceptance: `0600` stays `0600`; an unwritable target fails
+  nonzero without a success message; a TOML parser observes the same pin that `--pin` reports.
+
+- [x] **Scope gate authorization to the exact task/session.** Remove the ≤24-character approval-prefix
+  carryover, fail closed instead of assigning `sid='default'` on malformed payloads, and make the
+  nonlocal-negation guard apply consistently. Add regressions for `ok fix auth bug`, malformed payload
+  after an approved turn, and nonlocal negation. Keep the documented old-subagent provenance limitation
+  explicit where the harness supplies no agent fields.
+
+### Tier 5 — diagnostics and ergonomics
+
+Real defects, but lower risk because provenance is diagnostic and the edit gate is documented as
+workflow discipline rather than a security boundary.
+
+- [x] **Hash actual bytes and isolate broken worktree records.** Use `git hash-object --no-filters` so
+  clean filters neither hide materialized changes nor execute during observation. Skip/prune one invalid
+  worktree record without suspending digest observation for healthy roots. Define nested untracked Git
+  repository behavior and serialize baseline publication with lease handoff.
+
+- [x] **Harden discussion identity and terminal parsing.** Replace lossy slugs (`proj-a`/`proj_a`) with
+  canonical path plus hash. Do not interpret quoted marker text or content headings as control flow;
+  require deterministic terminal-marker precedence. Make stale locks recoverable and check transcript
+  writes before reporting success.
+
+- [x] **Address overlapping repositories and low-trust path exemptions.** Define one ownership domain
+  for superproject/submodule overlaps so both cannot acquire write leases. Canonicalize existing paths
+  and reject symlink/nonexistent-path tricks before applying gate scratch/non-code exemptions. Add the
+  overlap and symlink-target regressions without representing the gate as a security sandbox.
+
+- [x] **Correct consequential documentation drift after behavior lands.** Synchronize suite count,
+  watchdog exit contracts, contention behavior, timeout defaults, debate/implementation effort, and MCP
+  availability. Documentation follows verified runtime behavior; it does not promise lower-tier fixes
+  early.
+
+## Residual audit closure — continuation 2026-08-02
+
+Source: findings from the same 20-agent audit that were outside, or only partially closed by, the
+binding Tier 1–5 list. Execution plan: `/tmp/maestro-continuation-fixes.md`.
+
+- [x] Reject invalid polling/idle values before lease acquisition or task launch; make clear-only mode
+  mutually exclusive with execution options; measure idle from elapsed monotonic time.
+- [x] Clip lock-wait and dispatch poll sleeps to their remaining caps.
+- [x] Parse compact/pretty repository-global writer JSON strictly; scope `--write` help detection to
+  the task synopsis; select the highest semantic companion cache version.
+- [x] Retry read-only status loss without retrying idle/deadline cancellation.
+- [x] Reject unexpressible implementation max/ultra tiers, pass every wrapper-supported debate or
+  implementation effort explicitly, and serialize concurrent selector reads/writes.
+- [x] Detect only top-level TOML `web_search`; reject unknown installer options; preserve ask-on-start
+  off; keep identical managed-file identity; roll back ordinary late install failures.
+- [x] Remove the `shasum` runtime dependency; publish provenance logs without following symlinks; keep
+  orphan baseline publication inside the stale-generation claim.
+- [x] Refuse to clear a fresh metadata-less initialization lease; retain recovery for old orphans.
+- [x] Move direct-edit authorization out of forgeable `/tmp` state into owner-private, mode/content-checked
+  session markers, remove them on uninstall, and keep executable files gated regardless of extension.
+- [x] Eliminate false-green submodule setup, host Git-identity dependence, and nested process-group
+  leaks from the test runner.
+- [x] Synchronize role-specific effort, fresh-pin, MCP, watchdog rc, digest timeout, and suite-count
+  guidance.
+- [x] Final full-suite/syntax/ShellCheck/diff verification.
+
+### Residual closure acceptance — met
+
+- `bash tests/run.sh` → `SUMMARY: 16 passed, 0 failed`
+- Bash and Node syntax checks → pass
+- `git diff --check` → pass
+- ShellCheck warning inventory → only the established dynamic-source (`SC1090`) and deliberate
+  cross-function state (`SC2034`) classes
+- Process leak scan after the nested-timeout regression → empty

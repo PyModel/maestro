@@ -34,7 +34,7 @@ Ordered, concrete, with the design decisions already made. Reference real line n
 Where a step has a failure mode that a plausible implementation walks into, say so inline: *"a nested child that inherited FD 3 must NOT re-dup it — that redirects progress back into the parent's capture pipe and re-creates the bug."*
 
 ### 4. Constraints
-Project conventions, things not to touch, and **facts you researched** so the implementer never needs to look them up (it has no web access):
+Project conventions, things not to touch, and **facts you researched** so the implementer normally needs no lookup (built-in web search is disabled; configured MCP tools remain available but are capped and stall-prone):
 
 - Style to match — *"this file parses JSON with sed/grep on purpose; do not add jq."*
 - Interfaces that must not change — output prefixes, exit codes, function signatures other code parses.
@@ -62,7 +62,7 @@ The converged design, **the losing alternatives, and why they lost**. This is th
 ## Evidence discipline
 
 - **Quote, never paraphrase.** Paste actual output, actual diffs, actual JSON. A paraphrased error is a hypothesis wearing a fact's clothes.
-- **Embed researched facts.** You have web and MCP access; the implementer does not. A plan that requires no lookups cannot stall on one.
+- **Embed researched facts.** You have web and MCP access; the implementer has no built-in web search but may use configured MCP tools for at most two version-sensitive lookups. A plan that requires no lookups cannot stall on one.
 - **Distinguish verified from assumed.** If a claim is inference, label it. The implementer cannot tell your certainty from your prose.
 
 ## Notes for the implementer
