@@ -3,7 +3,7 @@
 # dispatcher dies -> lease retained -> job writes -> job dies -> [window] -> later dispatch steals
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LIB="$ROOT/hooks/lib-companion.sh"
+LIB="$ROOT/hooks/lib-write-lease.sh"
 D=$(mktemp -d /tmp/orphan.XXXXXX); trap 'rm -rf "$D"' EXIT
 
 REAL_NODE=$(node -p 'process.execPath')

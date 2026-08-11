@@ -64,6 +64,8 @@ install.sh
 model-selector.sh
 preflight.sh
 lease.sh
+job-lock.sh
+scout.sh
 liveness.sh
 stop-report.sh
 bounded-calls.sh

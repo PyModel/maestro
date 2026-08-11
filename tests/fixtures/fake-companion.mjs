@@ -40,6 +40,21 @@ if (command === "--help") {
 
 if (command === "task") {
   appendCall(`task ${args.join(" ")}`);
+  if (process.env.MAESTRO_TEST_LEASE_TOKEN_LOG &&
+      process.env.MAESTRO_TEST_LEASE_METADATA) {
+    const metadata = fs.readFileSync(
+      process.env.MAESTRO_TEST_LEASE_METADATA,
+      "utf8"
+    );
+    const token = metadata.match(/^token=(.*)$/m)?.[1] ?? "missing";
+    const reclaim = fs.existsSync(
+      process.env.MAESTRO_TEST_LEASE_METADATA.replace(/\/metadata$/, "/.reclaim")
+    ) ? 1 : 0;
+    fs.appendFileSync(
+      process.env.MAESTRO_TEST_LEASE_TOKEN_LOG,
+      `token=${token} reclaim=${reclaim}\n`
+    );
+  }
   if (process.env.MAESTRO_TEST_ARGV) {
     fs.writeFileSync(
       process.env.MAESTRO_TEST_ARGV,
@@ -47,7 +62,17 @@ if (command === "task") {
       "utf8"
     );
   }
-  console.log("Started task-fake0000-aaaaaa");
+  const taskId = process.env.MAESTRO_TEST_TASK_ID ?? nextSequenceValue(
+    process.env.MAESTRO_TEST_TASK_ID_FILE,
+    "task-fake0000-aaaaaa"
+  );
+  if (process.env.MAESTRO_TEST_JOB_START_LOG) {
+    fs.appendFileSync(
+      process.env.MAESTRO_TEST_JOB_START_LOG,
+      `${Date.now()}\t${taskId}\n`
+    );
+  }
+  console.log(`Started ${taskId}`);
   const delay = Number(process.env.MAESTRO_TEST_TASK_DELAY ?? "0");
   if (delay > 0) {
     await new Promise((resolve) => setTimeout(resolve, delay * 1000));
@@ -59,6 +84,16 @@ if (command === "task") {
 if (command === "status" && args[0] === "--all" && args[1] === "--json") {
   appendCall("status --all --json");
   growLog();
+  if (process.env.MAESTRO_TEST_UNPUBLISHED_SECOND_WRITER) {
+    console.log(JSON.stringify({
+      running: [{
+        id: process.env.MAESTRO_TEST_UNPUBLISHED_SECOND_WRITER,
+        write: true
+      }],
+      latestFinished: null
+    }));
+    process.exit(0);
+  }
   const statusFile = process.env.MAESTRO_TEST_STATUS;
   if (!statusFile) {
     process.exit(1);
@@ -78,17 +113,23 @@ if (command === "status" && args.at(-1) === "--json") {
   appendCall(`status ${args.join(" ")}`);
   growLog();
   const hang = Number(process.env.MAESTRO_TEST_STATUS_HANG ?? "0");
+  if (hang > 0 && process.env.MAESTRO_TEST_STATUS_PID_FILE) {
+    fs.writeFileSync(process.env.MAESTRO_TEST_STATUS_PID_FILE, `${process.pid}\n`);
+  }
   if (hang > 0) {
     await new Promise((resolve) => setTimeout(resolve, hang * 1000));
   }
   if (process.env.MAESTRO_TEST_JOB_STATUS_RAW !== undefined) {
     console.log(process.env.MAESTRO_TEST_JOB_STATUS_RAW);
-    process.exit(0);
+    process.exit(Number(process.env.MAESTRO_TEST_JOB_STATUS_EXIT ?? "0"));
   }
-  const status = nextSequenceValue(
-    process.env.MAESTRO_TEST_JOB_PHASE_FILE,
-    process.env.MAESTRO_TEST_JOB_PHASE ?? "completed"
-  );
+  const terminalFlag = process.env.MAESTRO_TEST_JOB_TERMINAL_FLAG;
+  const status = terminalFlag
+    ? (fs.existsSync(terminalFlag) ? "completed" : "running")
+    : nextSequenceValue(
+        process.env.MAESTRO_TEST_JOB_PHASE_FILE,
+        process.env.MAESTRO_TEST_JOB_PHASE ?? "completed"
+      );
   const value = {
     id: args[0],
     status,
@@ -101,13 +142,13 @@ if (command === "status" && args.at(-1) === "--json") {
     value.logFile = process.env.MAESTRO_TEST_LOGFILE;
   }
   console.log(JSON.stringify(value));
-  process.exit(0);
+  process.exit(Number(process.env.MAESTRO_TEST_JOB_STATUS_EXIT ?? "0"));
 }
 
 if (command === "result") {
   appendCall(`result ${args.join(" ")}`);
   console.log(process.env.MAESTRO_TEST_RESULT ?? "RESULT: DONE");
-  process.exit(0);
+  process.exit(Number(process.env.MAESTRO_TEST_RESULT_EXIT ?? "0"));
 }
 
 if (command === "cancel") {

@@ -77,7 +77,9 @@ The loop never ends in prose. Every run finishes on a machine-readable state:
 | `11` | **BLOCKED** | Missing access, a destructive step, lease contention, or an unconfirmed cancelled writer | Surface it; never improvise around it |
 | `12` | **STUCK** | Hit the iteration cap without verification | Read the attempts log, re-plan — don't just raise the cap |
 
-These codes describe `implementer-loop.sh`. A directly invoked single-shot watchdog uses rc `125` plus `MAESTRO_FINAL: WATCHDOG POISONED` when cancellation leaves quiescence unconfirmed; the outer loop translates that condition to `BLOCKED`/11.
+These codes describe `implementer-loop.sh`. The peer single-shot adapter uses rc `125` plus `MAESTRO_FINAL: WATCHDOG POISONED` for the same unconfirmed Write turn cancellation; `implementer-loop.sh` maps that outcome to `BLOCKED`/11.
+
+One Implementation run acquires one Lease interval across every Write turn and local Verification transaction, then releases or retains it once at the terminal state. The peer watchdog adapter acquires the same interval for its single Write turn.
 
 Write contention waits without arrival ordering only while the current lease has a confirmed release path. `MAESTRO_LOCK_WAIT_SEC` caps the wait (default 300 seconds; `0` disables it), and `MAESTRO_LOCK_WAIT_POLL_SEC` controls polling (default 5 seconds, minimum 1); invalid values disable waiting.
 
@@ -85,23 +87,30 @@ Foreground write supervisors update a separate lease heartbeat every `MAESTRO_LO
 
 `MAESTRO_MAX_DISPATCH_SEC` is a hard ceiling: unset write jobs get 2400 seconds and read-only discussions get 1200; an explicit valid value is used exactly, while invalid input warns and falls back to 1200. Startup consumes this budget, poll sleeps are clipped to the nearest deadline, and one halfway warning continues the same job without claiming progress or creating a checkpoint. Idle time uses elapsed monotonic time rather than configured poll counts. `--max-idle` and `--poll` must be positive integers and are rejected before any lease or task starts. The local verifier has its own process-group deadline (`MAESTRO_VERIFY_TIMEOUT_SEC`, default 900 seconds), and `MAESTRO_COMPANION_TIMEOUT_SEC` bounds each companion call (default 120 seconds). Four consecutive empty **or malformed** statuses, or the hard ceiling during status loss, cancel and fail closed. Read-only status loss consumes its configured retry allowance; idle/deadline cancellation does not. A write cancellation—including one reported externally by the companion—poisons and retains the lease, ends the loop as `BLOCKED`, emits `UNREPORTED_PARTIAL` at the hard ceiling, and never starts a replacement writer. Once no Codex job is writing, recover with `bash hooks/implementer-loop.sh --clear-lease` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`). A metadata-less lease younger than five seconds is treated as an owner still initializing, not an orphan to clear.
 
+All Maestro companion dispatches serialize for their full job lifetime on a per-workspace job lock; after confirming a stale lock's recorded job is terminal, recover with `bash hooks/implementer-loop.sh --clear-job-lock` (installed: `bash ~/.claude/hooks/implementer-loop.sh --clear-job-lock`).
+
+A separately pinned scout runs cheap read-only repository reconnaissance through that same serialized companion job lock and fails closed when its scout pin is absent or invalid.
+
 On every SessionStart source, the hook appends a validated `MAESTRO_SESSION_ID` export to `$CLAUDE_ENV_FILE`. The value is attribution only: the token, PID/process-start identity, and companion job liveness remain the ownership checks. A missing or invalid value is recorded as `unknown`; the session appears in lease metadata, contention/poison messages, and provenance records.
 
 ## Components
 
-Installed under `~/.claude`, plus one shared library they source.
+Installed under `~/.claude`; the entry adapters share focused lifecycle libraries.
 
 | File | Role |
 |---|---|
 | **`session-start.mjs`** | Opens each session with model plus separate debate/write effort picks. Resumed sessions get a status line instead of a re-ask. |
 | **`codex-model-select.sh`** | Serializes concurrent selectors and transactionally pins model plus debate/implementation effort, preserving config modes and top-level TOML scope. |
 | **`codex-mcp-check.sh`** | Shows exactly which MCP servers your background Codex jobs inherit, env keys masked. |
-| **`implementer-loop.sh`** | The autonomous heart: dispatch → parse `RESULT` → re-verify **locally** → feed failure evidence back in. Bounded by `--max-iters` and a verifier deadline. |
-| **`discussion-loop.sh`** | Read-only debate with collision-resistant workspace identity, private transcripts, sidecar turn state, and stale-lock recovery. |
-| **`implementer-watchdog.sh`** | Single dispatch with `--write`; idle or absolute cancellation poisons and retains its write lease. |
+| **`implementer-loop.sh`** | Implementation run adapter: one Lease interval across repeated Write turns and local Verification transactions, with failure evidence fed back. Bounded by `--max-iters` and a verifier deadline. |
+| **`discussion-loop.sh`** | Explicitly read-only Discussion turns with collision-resistant workspace identity, private transcripts, sidecar turn state, and stale-lock recovery. |
+| **`implementer-watchdog.sh`** | Peer single-shot adapter for one Write turn; it does not sit inside the loop adapter. |
 | **`orchestrator-inject.mjs`** | Resets the direct-edit flag per task; states the loop only when the prompt carries a code/design signal. |
 | **`orchestrator-gate.mjs`** | Blocks the orchestrator's `Edit`/`Write`/`MultiEdit` on source files. |
-| **`lib-companion.sh`** | Shared library: the write lease, provenance detection, companion resolution. |
+| **`lib-process.sh`** | Bounded process-group execution, output capture, lifecycle tick callbacks, and interruption. |
+| **`lib-companion.sh`** | Companion transport and polling with explicit read/write mode and caller-owned result, profile, and evidence files. |
+| **`lib-write-lease.sh`** | Lease interval ownership, repository digest, provenance, poison, release, and operator recovery. |
+| **`lib-write-turn.sh`** | One deep Write turn interface shared by both implementation adapters. |
 
 Plus the behavioral specs: **`orchestrator-implementer.md`** (read every session) and **`coding-discipline.md`** (useful standalone).
 

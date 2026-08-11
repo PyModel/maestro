@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Maestro autonomous implementation loop.
-# Wraps implementer-watchdog.sh in a bounded, evidence-fed, self-verifying loop:
-# dispatch the plan → parse the RESULT → on DONE, re-run the verification command
-# LOCALLY (a claim is not proof) → on failure, append the actual failing output
-# to the next dispatch so Codex never repeats an approach blind. Loops until the
-# task is verifiably implemented, needs human input, or hits the iteration cap.
+# Owns the bounded retry policy around the shared Write turn module: dispatch the
+# plan → parse RESULT → on DONE, run one local Verification transaction → feed
+# actual failure evidence into the next turn. It stops only when the task is
+# verified, needs human input, or reaches the iteration cap. Adapters stay peers.
 #
 # This is the default dispatch path for "keep going until it is done" work.
 # It needs no babysitting between iterations — the only exits are the states below.
@@ -13,6 +12,7 @@
 #   implementer-loop.sh --plan <plan-file> --verify "<command>"
 #                       [--max-iters N] [--max-idle S] [--poll S]
 #   implementer-loop.sh --clear-lease
+#   implementer-loop.sh --clear-job-lock
 #
 #   --plan       the five-part plan file (same contract as the watchdog --file)
 #   --verify     command run LOCALLY after every RESULT: DONE claim. Exit 0 = pass.
@@ -20,6 +20,7 @@
 #   --max-iters  cap on dispatch rounds (default 4). 0 is prohibited — an
 #                unbounded write loop is a runaway, not autonomy.
 #   --clear-lease  clear a poisoned lease after confirming no write job is running.
+#   --clear-job-lock  clear a stale companion job lock after confirming its job is terminal.
 #
 # MAESTRO_MAX_DISPATCH_SEC caps each Codex dispatch (unset write default 2400;
 # read-only callers default 1200; explicit valid values are exact).
@@ -34,85 +35,121 @@
 #                  escalate; do not just raise --max-iters)
 #             3  = bad args / could not start
 set -uo pipefail
+umask 077
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-WATCHDOG="$HERE/implementer-watchdog.sh"
-# shellcheck source=lib-companion.sh
-. "$HERE/lib-companion.sh"
+# shellcheck source=lib-write-turn.sh
+. "$HERE/lib-write-turn.sh"
 progress_init
 
 FINAL_STATE="INTERRUPTED"
 FINAL_RC=4
-ATTEMPTS=""; DISPATCH=""; ERRF=""; OUTF=""; VOUTF=""; WATCHDOG_PID=""; VERIFY_PID=""
-terminate_process_group() {
-  local pid="$1" ticks=0
-  [ -n "$pid" ] || return 0
-  kill -TERM -"$pid" 2>/dev/null || :
-  while kill -0 -"$pid" 2>/dev/null && [ "$ticks" -lt 50 ]; do
-    sleep 0.1
-    ticks=$((ticks + 1))
-  done
-  kill -KILL -"$pid" 2>/dev/null || :
+ATTEMPTS=""; DISPATCH=""; ERRF=""; OUTF=""; VOUTF=""; VFACT=""
+_loop_positive_integer() {
+  case "${1-}" in
+    ''|*[!0-9]*) return 1 ;;
+    *) [ "$((10#$1))" -ge 1 ] ;;
+  esac
 }
+
+verification_fact_write() { # file state rc
+  local file="$1" state="$2" rc="$3" tmp="${1}.new"
+  {
+    printf 'state=%s\n' "$state"
+    printf 'rc=%s\n' "$rc"
+  } > "$tmp" && mv -f "$tmp" "$file"
+}
+
+verification_fact_value() { # file field
+  local file="$1" field="$2"
+  case "$field" in state|rc) ;; *) return 1 ;; esac
+  sed -n "s/^${field}=//p" "$file" 2>/dev/null | head -1
+}
+
+_verification_tick() {
+  _write_lease_turn_event tick unknown verification \
+    "$_MAESTRO_VERIFICATION_FACT" "$_MAESTRO_VERIFICATION_OUTPUT" || :
+}
+
+verification_transaction_run() { # command timeout output-file fact-file
+  local command="$1" timeout="$2" output="$3" fact="$4"
+  local stderr="${4}.stderr" command_rc_file="${4}.command-rc"
+  local process_rc rc state timed_out=0
+  : > "$output" || return 3
+  rm -f "$fact" "${fact}.new" "$stderr" "$command_rc_file" || return 3
+  _MAESTRO_VERIFICATION_FACT=$fact
+  _MAESTRO_VERIFICATION_OUTPUT=$output
+  process_run_bounded "$timeout" MAESTRO_VERIFY _verification_tick \
+    "$output" "$stderr" -- \
+    bash -c '
+      exec 3>&-
+      bash -c "$1"
+      rc=$?
+      printf "%s\n" "$rc" > "$2"
+      exit "$rc"
+    ' _ "$command" "$command_rc_file"
+  process_rc=$?
+  if [ "$process_rc" -eq 125 ] && [ ! -f "$command_rc_file" ]; then
+    timed_out=1
+  fi
+  [ ! -s "$stderr" ] || cat "$stderr" >> "$output"
+  if [ -f "$command_rc_file" ]; then
+    rc=$(sed -n '1p' "$command_rc_file")
+  else
+    rc=$process_rc
+  fi
+  rm -f "$stderr" "$command_rc_file"
+  if ! _write_lease_turn_event guard unknown verification "$fact" "$output"; then
+    verification_fact_write "$fact" lease-lost 11 ||
+      progress "LOOP_WARNING: could not write verification fact $fact; using in-process state=lease-lost rc=11."
+    return 11
+  fi
+  if [ "$timed_out" -eq 1 ]; then
+    verification_fact_write "$fact" timed-out 124 ||
+      progress "LOOP_WARNING: could not write verification fact $fact; using in-process state=timed-out rc=124."
+    return 124
+  fi
+  state=failed
+  [ "$rc" -ne 0 ] || state=passed
+  verification_fact_write "$fact" "$state" "$rc" ||
+    progress "LOOP_WARNING: could not write verification fact $fact; using in-process state=$state rc=$rc."
+  return "$rc"
+}
+
 maestro_finish() {
   FINAL_STATE="$1"
   FINAL_RC="$2"
   exit "$FINAL_RC"
 }
 maestro_interrupt() {
-  local signal="$1" reason target="" writers="" companion="" metadata=""
+  local signal="$1" rc result evidence temp
   trap : HUP INT TERM
-  case "$signal" in
-    HUP) reason="signal-hup" ;;
-    INT) reason="signal-int" ;;
-    TERM) reason="signal-term" ;;
-    *) reason="signal" ;;
-  esac
-  if [ -n "$VERIFY_PID" ]; then
-    terminate_process_group "$VERIFY_PID"
-    VERIFY_PID=""
+  if [ -z "$OUTF" ]; then
+    temp=$(mktemp /tmp/maestro-loopout.XXXXXXXX) && OUTF=$temp
   fi
-  if write_lock_is_owner; then
-    MAESTRO_LOCK_RETAIN=1
-    metadata="${MAESTRO_LOCK_DIR:-}/metadata"
-    target=$(write_lock_metadata_value "$metadata" job_id)
-    [ "$target" = unknown ] && target=""
-    companion=$(companion_resolve 2>/dev/null) || companion=""
-    if [ -z "$target" ] && [ -n "$companion" ]; then
-      writers=$(companion_workspace_writers "$companion" 2>/dev/null) || writers=""
-      target=$(printf '%s\n' "$writers" | awk '$2 == "true" { print $1; exit }')
-    fi
-    if [ -n "$target" ] && [ -n "$companion" ]; then
-      companion_cancel_job "$companion" "$target" "$reason" "loop-signal-handler"
-    else
-      write_lock_poison "${target:-unknown}" "$reason" || :
-      if [ -e "$MAESTRO_LOCK_DIR/metadata.new" ]; then
-        mv -f "$MAESTRO_LOCK_DIR/metadata.new" "$MAESTRO_LOCK_DIR/metadata" 2>/dev/null || :
-      fi
-      progress "LOOP_STATE: BLOCKED — interrupted before a companion job id was confirmed; lease retained"
-    fi
-    if [ -n "$WATCHDOG_PID" ]; then
-      kill -KILL -"$WATCHDOG_PID" 2>/dev/null || :
-    fi
-    maestro_finish "BLOCKED" 11
+  if [ -z "$ERRF" ]; then
+    temp=$(mktemp /tmp/maestro-looperr.XXXXXXXX) && ERRF=$temp
   fi
-  if [ -n "$WATCHDOG_PID" ]; then
-    kill -KILL -"$WATCHDOG_PID" 2>/dev/null || :
+  result=${OUTF:-/dev/null}
+  evidence=${ERRF:-/dev/stderr}
+  write_turn_interrupt "$signal" "$result" "$evidence"
+  rc=$?
+  if [ "$rc" -eq 125 ]; then
+    progress "LOOP_STATE: BLOCKED — interrupted before writer quiescence could be confirmed; lease retained"
+    maestro_finish BLOCKED 11
   fi
-  maestro_finish "INTERRUPTED" 4
+  maestro_finish INTERRUPTED 4
 }
 cleanup() {
   trap - EXIT HUP INT TERM
-  if [ -n "$VERIFY_PID" ]; then
-    terminate_process_group "$VERIFY_PID"
-    VERIFY_PID=""
-  fi
   [ -n "$ATTEMPTS" ] && rm -f "$ATTEMPTS"
   [ -n "$DISPATCH" ] && rm -f "$DISPATCH"
   [ -n "$ERRF" ] && rm -f "$ERRF"
   [ -n "$OUTF" ] && rm -f "$OUTF"
   [ -n "$VOUTF" ] && rm -f "$VOUTF"
-  write_lock_release
+  [ -n "$VFACT" ] && rm -f "$VFACT" "${VFACT}.new" \
+    "${VFACT}.stderr" "${VFACT}.command-rc"
+  write_lease_end "${ERRF:-/dev/null}" || :
   progress "MAESTRO_FINAL: LOOP $FINAL_STATE rc=$FINAL_RC"
   exit "$FINAL_RC"
 }
@@ -121,7 +158,8 @@ trap 'maestro_interrupt HUP' HUP
 trap 'maestro_interrupt INT' INT
 trap 'maestro_interrupt TERM' TERM
 
-PLAN=""; VERIFY=""; MAX_ITERS=4; MAX_IDLE=300; POLL=20; CLEAR_LEASE=0; EXECUTION_OPTIONS=0
+PLAN=""; VERIFY=""; MAX_ITERS=4; MAX_IDLE=300; POLL=20
+CLEAR_LEASE=0; CLEAR_JOB_LOCK=0; EXECUTION_OPTIONS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --plan)
@@ -141,15 +179,22 @@ while [ $# -gt 0 ]; do
       POLL="$2"; EXECUTION_OPTIONS=1; shift 2 ;;
     --clear-lease)
       CLEAR_LEASE=1; shift ;;
+    --clear-job-lock)
+      CLEAR_JOB_LOCK=1; shift ;;
     *) echo "LOOP_ERROR: unknown argument: $1" >&2; maestro_finish "FAILED" 3 ;;
   esac
 done
 
-if [ "$CLEAR_LEASE" -eq 1 ] && [ "$EXECUTION_OPTIONS" -eq 1 ]; then
-  echo "LOOP_ERROR: --clear-lease is mutually exclusive with execution options" >&2
+if [ "$CLEAR_LEASE" -eq 1 ] && [ "$CLEAR_JOB_LOCK" -eq 1 ]; then
+  echo "LOOP_ERROR: --clear-lease and --clear-job-lock are mutually exclusive" >&2
   maestro_finish "FAILED" 3
 fi
-if [ "$CLEAR_LEASE" -eq 0 ]; then
+if { [ "$CLEAR_LEASE" -eq 1 ] || [ "$CLEAR_JOB_LOCK" -eq 1 ]; } &&
+  [ "$EXECUTION_OPTIONS" -eq 1 ]; then
+  echo "LOOP_ERROR: recovery options are mutually exclusive with execution options" >&2
+  maestro_finish "FAILED" 3
+fi
+if [ "$CLEAR_LEASE" -eq 0 ] && [ "$CLEAR_JOB_LOCK" -eq 0 ]; then
   case "$MAX_ITERS" in ''|*[!0-9]*)
     echo "LOOP_ERROR: --max-iters must be a positive integer" >&2
     maestro_finish "FAILED" 3 ;;
@@ -158,7 +203,8 @@ if [ "$CLEAR_LEASE" -eq 0 ]; then
     echo "LOOP_ERROR: --max-iters must be >= 1 (0 is prohibited)" >&2
     maestro_finish "FAILED" 3
   fi
-  if ! companion_poll_bounds_valid "$MAX_IDLE" "$POLL"; then
+  if ! _loop_positive_integer "$MAX_IDLE" ||
+    ! _loop_positive_integer "$POLL"; then
     echo "LOOP_ERROR: --max-idle and --poll must be positive integers" >&2
     maestro_finish "FAILED" 3
   fi
@@ -167,155 +213,40 @@ if [ "$CLEAR_LEASE" -eq 0 ]; then
   POLL=$((10#$POLL))
 fi
 
-if [ "$CLEAR_LEASE" -eq 1 ]; then
-  lock_path=$(write_lock_path) || {
-    echo "LOOP_ERROR: could not resolve the write lock path" >&2
+if [ "$CLEAR_JOB_LOCK" -eq 1 ]; then
+  CLEAR_WORK=$(mktemp -d "${TMPDIR:-/tmp}/maestro-clear-job-lock.XXXXXX") ||
     maestro_finish "FAILED" 3
-  }
-  if [ ! -d "$lock_path" ]; then
-    progress "MAESTRO_LOCK: there is no write lease to clear at $lock_path"
-    maestro_finish "CLEARED" 0
-  fi
+  CLEAR_RESULT="$CLEAR_WORK/result"
+  CLEAR_EVIDENCE="$CLEAR_WORK/evidence"
+  job_lock_clear "$CLEAR_RESULT" "$CLEAR_EVIDENCE"
+  clear_rc=$?
+  [ ! -s "$CLEAR_EVIDENCE" ] || cat "$CLEAR_EVIDENCE" >&2
+  rm -rf "$CLEAR_WORK"
+  case "$clear_rc" in
+    0) maestro_finish "CLEARED" 0 ;;
+    11) maestro_finish "BLOCKED" 11 ;;
+    *) maestro_finish "FAILED" "$clear_rc" ;;
+  esac
+fi
 
-  metadata="$lock_path/metadata"
-  staged_metadata="$lock_path/metadata.new"
-  heartbeat="$lock_path/heartbeat"
-  orphan=0
-  stale_heartbeat=0
-  if [ ! -e "$metadata" ] && [ ! -e "$staged_metadata" ]; then
-    lock_mtime=$(write_lock_path_mtime_epoch "$lock_path") || {
-      progress "MAESTRO_LOCK: refusing to clear — metadata is absent and lock age is unconfirmed (lock: $lock_path)"
-      maestro_finish "BLOCKED" 11
-    }
-    now=$(date +%s)
-    lock_age=$((now - lock_mtime))
-    [ "$lock_age" -ge 0 ] || lock_age=0
-    if [ "$lock_age" -lt 5 ]; then
-      progress "MAESTRO_LOCK: refusing to clear — metadata is absent but the ${lock_age}s-old lease may still be initializing (lock: $lock_path); retry after 5s"
-      maestro_finish "BLOCKED" 11
-    fi
-    orphan=1
-    poisoned_job=unknown
-    poisoned_reason=missing-metadata
-    poisoned_session=unknown
-  else
-    poison_metadata="$metadata"
-    quiescence=$(write_lock_metadata_value "$poison_metadata" quiescence)
-    if [ "$quiescence" != "unconfirmed" ] &&
-      [ -e "$staged_metadata" ]; then
-      poison_metadata="$staged_metadata"
-      quiescence=unconfirmed
-    fi
-    if [ "$quiescence" != "unconfirmed" ]; then
-      owner_token=$(write_lock_metadata_value "$metadata" token)
-      owner_job=$(write_lock_metadata_value "$metadata" job_id)
-      owner_job=${owner_job:-unknown}
-      owner_session=$(write_lock_metadata_value "$metadata" session_id)
-      owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
-      owner_pid=$(write_lock_metadata_value "$metadata" pid)
-      owner_start=$(write_lock_metadata_value "$metadata" process_start)
-      started_epoch=$(write_lock_metadata_value "$metadata" started_epoch)
-      malformed=0
-      case "$owner_pid" in
-        ''|*[!0-9]*) malformed=1 ;;
-      esac
-      if [ -z "$owner_token" ] || [ "$malformed" -eq 1 ]; then
-        progress "MAESTRO_LOCK: refusing to clear — write lease metadata is malformed; owner cannot be identified; failing closed (lock: $lock_path)"
-        maestro_finish "BLOCKED" 11
-      fi
-      heartbeat_stale=$(write_lock_heartbeat_stale_sec)
-      heartbeat_note=""
-      case "$started_epoch" in
-        ''|*[!0-9]*) ;;
-        *)
-          if [ "$heartbeat_stale" -ne 0 ]; then
-            now=$(date +%s)
-            heartbeat_effective=$started_epoch
-            heartbeat_epoch=$(write_lock_heartbeat_epoch "$lock_path" "$owner_token")
-            case "$heartbeat_epoch" in
-              ''|*[!0-9]*) ;;
-              *)
-                [ "$heartbeat_epoch" -gt "$heartbeat_effective" ] &&
-                  heartbeat_effective=$heartbeat_epoch
-                ;;
-            esac
-            heartbeat_age=$((now - heartbeat_effective))
-            [ "$heartbeat_age" -lt 0 ] && heartbeat_age=0
-            if [ "$heartbeat_age" -gt "$heartbeat_stale" ]; then
-              stale_heartbeat=1
-            else
-              heartbeat_note="; heartbeat ${heartbeat_age}s old"
-            fi
-          fi
-          ;;
-      esac
-      if [ "$stale_heartbeat" -eq 0 ]; then
-        progress "MAESTRO_LOCK: refusing to clear — write lease is healthy and not this command's to clear (job=$owner_job session=${owner_session:-unknown} pid=$owner_pid, lock: $lock_path)${heartbeat_note}"
-        maestro_finish "BLOCKED" 11
-      fi
-      if kill -0 "$owner_pid" 2>/dev/null; then
-        current_start=$(write_lock_process_start "$owner_pid")
-        if [ -z "$current_start" ] || [ -z "$owner_start" ] ||
-          [ "$owner_start" = unavailable ] || [ "$current_start" = "$owner_start" ]; then
-          progress "MAESTRO_LOCK: refusing to clear — heartbeat is stale but the recorded owner process is still alive or its identity is unconfirmed (job=$owner_job session=${owner_session:-unknown} pid=$owner_pid, lock: $lock_path)"
-          maestro_finish "BLOCKED" 11
-        fi
-      fi
-      poisoned_job=$owner_job
-      poisoned_session=$owner_session
-    fi
-    if [ "$stale_heartbeat" -eq 0 ]; then
-      poisoned_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
-      poisoned_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-      poisoned_session=$(write_lock_metadata_value "$poison_metadata" session_id)
-      poisoned_session=$(MAESTRO_SESSION_ID="${poisoned_session:-}" write_lock_session_id)
-    fi
-  fi
-
-  writers=$(write_lock_workspace_writers)
-  writers_rc=$?
-  running_job=""
-  if [ "$writers_rc" -eq 0 ]; then
-    running_job=$(printf '%s\n' "$writers" |
-      awk '$2 == "true" { print $1; exit }')
-  fi
-  if [ "$writers_rc" -eq 4 ] || [ -n "$running_job" ]; then
-    progress "MAESTRO_LOCK: refusing to clear — a write-capable job is still running (${running_job:-unknown}) session=${poisoned_session:-unknown}"
-    maestro_finish "BLOCKED" 11
-  fi
-
-  if [ "$orphan" -eq 1 ]; then
-    progress "MAESTRO_LOCK: clearing structurally invalid orphan write lease (lock: $lock_path, removing: every entry under $lock_path, then $lock_path)"
-    if ! find "$lock_path" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null ||
-      ! rmdir "$lock_path" 2>/dev/null; then
-      progress "MAESTRO_LOCK: failed to clear structurally invalid orphan write lease at $lock_path"
-      maestro_finish "BLOCKED" 11
-    fi
-  elif [ "$stale_heartbeat" -eq 1 ]; then
-    progress "MAESTRO_LOCK: clearing a write lease whose heartbeat went stale (job=$owner_job session=${owner_session:-unknown} last_heartbeat=${heartbeat_age}s ago, lock: $lock_path)"
-  elif [ -e "$staged_metadata" ]; then
-    progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path, removing: $staged_metadata)"
-  else
-    progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path)"
-  fi
-  if [ "$orphan" -eq 0 ]; then
-    if ! rm -f "$metadata" "$heartbeat" 2>/dev/null ||
-      ! rm -rf "$staged_metadata" 2>/dev/null ||
-      ! rmdir "$lock_path" 2>/dev/null; then
-      if [ "$stale_heartbeat" -eq 1 ]; then
-        progress "MAESTRO_LOCK: failed to clear stale-heartbeat write lease at $lock_path session=${owner_session:-unknown}"
-      else
-        progress "MAESTRO_LOCK: failed to clear poisoned write lease at $lock_path session=${poisoned_session:-unknown}"
-      fi
-      maestro_finish "BLOCKED" 11
-    fi
-  fi
-  maestro_finish "CLEARED" 0
+if [ "$CLEAR_LEASE" -eq 1 ]; then
+  CLEAR_WORK=$(mktemp -d "${TMPDIR:-/tmp}/maestro-clear-lease.XXXXXX") ||
+    maestro_finish "FAILED" 3
+  CLEAR_RESULT="$CLEAR_WORK/result"
+  CLEAR_EVIDENCE="$CLEAR_WORK/evidence"
+  write_lease_clear "$CLEAR_RESULT" "$CLEAR_EVIDENCE"
+  clear_rc=$?
+  [ ! -s "$CLEAR_EVIDENCE" ] || cat "$CLEAR_EVIDENCE" >&2
+  rm -rf "$CLEAR_WORK"
+  case "$clear_rc" in
+    0) maestro_finish "CLEARED" 0 ;;
+    11) maestro_finish "BLOCKED" 11 ;;
+    *) maestro_finish "FAILED" "$clear_rc" ;;
+  esac
 fi
 
 [ -n "$PLAN" ] && [ -f "$PLAN" ] || { echo "LOOP_ERROR: --plan <file> required and must exist" >&2; maestro_finish "FAILED" 3; }
 [ -n "$VERIFY" ] || { echo "LOOP_ERROR: --verify \"<command>\" required — RESULT: DONE is a claim, not proof" >&2; maestro_finish "FAILED" 3; }
-[ -f "$WATCHDOG" ] || { echo "LOOP_ERROR: implementer-watchdog.sh not found next to this script" >&2; maestro_finish "FAILED" 3; }
 
 VERIFY_TIMEOUT="${MAESTRO_VERIFY_TIMEOUT_SEC-900}"
 verify_timeout_invalid=0
@@ -328,7 +259,7 @@ if [ "$verify_timeout_invalid" -eq 1 ]; then
   VERIFY_TIMEOUT=900
 fi
 
-write_lock_acquire
+write_lease_begin "${ERRF:-/dev/null}"
 lock_rc=$?
 if [ "$lock_rc" -ne 0 ]; then
   [ "$lock_rc" -eq 11 ] && maestro_finish "BLOCKED" 11
@@ -339,6 +270,7 @@ ATTEMPTS=$(mktemp /tmp/maestro-attempts.XXXXXXXX)
 ERRF=$(mktemp /tmp/maestro-looperr.XXXXXXXX)
 OUTF=$(mktemp /tmp/maestro-loopout.XXXXXXXX)
 VOUTF=$(mktemp /tmp/maestro-verify.XXXXXXXX)
+VFACT=$(mktemp /tmp/maestro-verify-fact.XXXXXXXX)
 
 i=0
 while [ "$i" -lt "$MAX_ITERS" ]; do
@@ -357,18 +289,9 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
 
   progress "LOOP: iteration $i/$MAX_ITERS — dispatching to Codex"
   : > "$ERRF"
-  if ! write_lock_is_owner; then
-    progress "LOOP_STATE: BLOCKED — this loop no longer holds the write lease; stopping before re-dispatching"
-    maestro_finish "BLOCKED" 11
-  fi
   : > "$OUTF"
-  set -m
-  bash "$WATCHDOG" --file "$DISPATCH" "$MAX_IDLE" "$POLL" > "$OUTF" 2>"$ERRF" &
-  WATCHDOG_PID=$!
-  set +m
-  wait "$WATCHDOG_PID"
+  write_turn_run "$DISPATCH" "$MAX_IDLE" "$POLL" "$OUTF" "$ERRF"
   rc=$?
-  WATCHDOG_PID=""
   OUT=$(cat "$OUTF")
   cat "$ERRF" >&2
   rm -f "$DISPATCH"; DISPATCH=""
@@ -379,18 +302,20 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
   fi
 
   if [ "$rc" -eq 125 ]; then
-    MAESTRO_LOCK_RETAIN=1
     printf '%s\n' "$OUT"
     progress "LOOP_STATE: BLOCKED after $i iteration(s) — write lease retained because turn quiescence was never confirmed; clear it with --clear-lease once no Codex job is writing."
     maestro_finish "BLOCKED" 11
   fi
 
-  STATE=$(companion_result_state "$OUT")
+  case "$rc" in
+    0) STATE=DONE ;;
+    10) STATE=NEEDS_ANSWERS ;;
+    11) STATE=BLOCKED ;;
+    4) STATE=FAILED ;;
+    *) STATE="" ;;
+  esac
 
-  if { [ "$rc" -eq 124 ] || [ "$rc" -ne 0 ]; } &&
-    ! { [ "$rc" -eq 10 ] && [ "$STATE" = "NEEDS_ANSWERS" ]; } &&
-    ! { [ "$rc" -eq 11 ] && [ "$STATE" = "BLOCKED" ]; } &&
-    ! { [ "$rc" -eq 4 ] && [ "$STATE" = "FAILED" ]; }; then
+  if [ -z "$STATE" ]; then
     kind="failed"; [ "$rc" -eq 124 ] && kind="hung"
     printf '\n## Attempt %s — job %s before producing a result\n%s\n' "$i" "$kind" \
       "$(tail -n 40 "$ERRF")" >> "$ATTEMPTS"
@@ -417,56 +342,28 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
       maestro_finish "BLOCKED" 11 ;;
     DONE)
       progress "LOOP: RESULT: DONE on iteration $i — verifying locally: $VERIFY"
-      # Close FD 3 so verifier progress re-points to stdout and lands in VOUT instead of the operator channel.
-      : > "$VOUTF"
-      set -m
-      env -u MAESTRO_LOCK_ACQUIRED -u MAESTRO_LOCK_TOKEN -u MAESTRO_LOCK_DIR \
-        bash -c "$VERIFY" > "$VOUTF" 2>&1 3>&- &
-      vpid=$!
-      VERIFY_PID=$vpid
-      vstarted=$(date +%s)
-      vtimed_out=0
-      while kill -0 "$vpid" 2>/dev/null; do
-        vtotal=$(( $(date +%s) - vstarted ))
-        if [ "$vtotal" -ge "$VERIFY_TIMEOUT" ]; then
-          vtimed_out=1
-          break
-        fi
-        sleep 1
-        write_lock_heartbeat_write
-      done
-      if [ "$vtimed_out" -eq 1 ]; then
-        kill -TERM -"$vpid" 2>/dev/null || :
-        vwait=0
-        while kill -0 -"$vpid" 2>/dev/null && [ "$vwait" -lt 5 ]; do
-          sleep 1
-          vwait=$((vwait + 1))
-        done
-        kill -KILL -"$vpid" 2>/dev/null || :
-      fi
-      wait "$vpid" 2>/dev/null
+      verification_transaction_run "$VERIFY" "$VERIFY_TIMEOUT" "$VOUTF" "$VFACT"
       vrc=$?
-      # A verifier shell can exit while leaving background children in its process
-      # group. Reap that group on every path before trusting success or retrying.
-      if kill -0 -"$vpid" 2>/dev/null; then
-        terminate_process_group "$vpid"
+      vstate=$(verification_fact_value "$VFACT" state)
+      if [ -z "$vstate" ]; then
+        case "$vrc" in
+          0) vstate=passed ;;
+          11) vstate=lease-lost ;;
+          124) vstate=timed-out ;;
+          *) vstate=failed ;;
+        esac
       fi
-      VERIFY_PID=""
-      set +m
-      if ! write_lock_is_owner; then
+      if [ "$vstate" = lease-lost ]; then
         progress "LOOP_STATE: BLOCKED — this loop no longer holds the write lease; stopping before re-dispatching"
         maestro_finish "BLOCKED" 11
       fi
       VOUT=$(cat "$VOUTF")
-      if [ "$vtimed_out" -eq 1 ]; then
-        vrc=124
-      fi
-      if [ "$vrc" -eq 0 ]; then
+      if [ "$vstate" = passed ]; then
         printf '%s\n' "$OUT"
         progress "LOOP_STATE: VERIFIED_DONE after $i iteration(s) — local verification passed."
         maestro_finish "VERIFIED_DONE" 0
       fi
-      if [ "$vtimed_out" -eq 1 ]; then
+      if [ "$vstate" = timed-out ]; then
         printf '\n## Attempt %s — claimed DONE but LOCAL verification timed out after %ss (exit %s): %s\n%s\n' \
           "$i" "$VERIFY_TIMEOUT" "$vrc" "$VERIFY" \
           "$(printf '%s' "$VOUT" | tail -n 60)" >> "$ATTEMPTS"
@@ -477,12 +374,13 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
         progress "LOOP: iteration $i claimed DONE but verification failed (exit $vrc) — re-dispatching with the output"
       fi
       ;;
-    FAILED|"")
-      label="RESULT: FAILED"
-      [ -z "$STATE" ] && label="no RESULT line (treated as FAILED)"
-      printf '\n## Attempt %s — %s\n%s\n' "$i" "$label" \
-        "$(printf '%s' "$OUT" | tail -n 80)" >> "$ATTEMPTS"
-      progress "LOOP: iteration $i $label — re-dispatching with the evidence"
+    FAILED)
+      {
+        printf '\n## Attempt %s — RESULT: FAILED\n' "$i"
+        [ -z "$OUT" ] || printf '%s\n' "$OUT" | tail -n 80
+        [ ! -s "$ERRF" ] || tail -n 40 "$ERRF"
+      } >> "$ATTEMPTS"
+      progress "LOOP: iteration $i RESULT: FAILED — re-dispatching with the evidence"
       ;;
   esac
 done

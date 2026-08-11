@@ -14,31 +14,81 @@ FINAL_STATE="INTERRUPTED"
 FINAL_RC=4
 DISCUSSION_LOCK=""
 DISCUSSION_LOCK_TOKEN=""
+DISCUSSION_JOB=""
+DISCUSSION_RESULT=""
+DISCUSSION_PROFILE=""
+DISCUSSION_EVIDENCE=""
+DISCUSSION_PROMPT=""
 maestro_finish() {
   FINAL_STATE="$1"
   FINAL_RC="$2"
   exit "$FINAL_RC"
 }
 
+discussion_metadata_value() { # record field
+  local record="$1" field="$2"
+  sed -n "s/^${field}=//p" "$record" 2>/dev/null | head -1
+}
+
+discussion_process_start() { # pid
+  LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null |
+    sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+discussion_job_valid() {
+  case "${1-}" in
+    task-*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[!a-zA-Z0-9-]*) return 1 ;;
+  esac
+}
 discussion_lock_release() {
   local metadata token
   [ -n "$DISCUSSION_LOCK" ] && [ -n "$DISCUSSION_LOCK_TOKEN" ] || return 0
   metadata="$DISCUSSION_LOCK/metadata"
-  token=$(write_lock_metadata_value "$metadata" token)
+  token=$(discussion_metadata_value "$metadata" token)
   [ "$token" = "$DISCUSSION_LOCK_TOKEN" ] || return 0
   rm -f "$metadata" 2>/dev/null || return 0
   rmdir "$DISCUSSION_LOCK" 2>/dev/null || :
 }
 
-maestro_interrupt() { maestro_finish "INTERRUPTED" 4; }
+maestro_interrupt() {
+  local signal="$1" target="" profile_target=""
+  trap : HUP INT TERM
+  if [ -f "$DISCUSSION_PROFILE" ]; then
+    profile_target=$(discussion_metadata_value "$DISCUSSION_PROFILE" job)
+    discussion_job_valid "$profile_target" && target="$profile_target"
+  fi
+  if [ -z "$target" ] && discussion_job_valid "$DISCUSSION_JOB"; then
+    target="$DISCUSSION_JOB"
+  fi
+  process_interrupt "$signal" "$DISCUSSION_EVIDENCE" || :
+  if [ -n "$DISCUSSION_EVIDENCE" ]; then
+    companion_interrupt "$signal" "$target" "$DISCUSSION_EVIDENCE" : || :
+  fi
+  maestro_finish "INTERRUPTED" 4
+}
 cleanup() {
   trap - EXIT HUP INT TERM
   discussion_lock_release
+  [ -z "$DISCUSSION_RESULT" ] || rm -f "$DISCUSSION_RESULT" 2>/dev/null || :
+  if [ -n "$DISCUSSION_PROFILE" ]; then
+    rm -f "$DISCUSSION_PROFILE" "${DISCUSSION_PROFILE}.new" \
+      "${DISCUSSION_PROFILE}.job" "${DISCUSSION_PROFILE}.transport.out" \
+      "${DISCUSSION_PROFILE}.transport.err" "${DISCUSSION_PROFILE}.cancel" \
+      "${DISCUSSION_PROFILE}.cancel.new" 2>/dev/null || :
+  fi
+  [ -z "$DISCUSSION_EVIDENCE" ] || rm -f "$DISCUSSION_EVIDENCE" 2>/dev/null || :
+  [ -z "$DISCUSSION_PROMPT" ] || rm -f "$DISCUSSION_PROMPT" 2>/dev/null || :
   progress "MAESTRO_FINAL: DISCUSSION $FINAL_STATE rc=$FINAL_RC"
   exit "$FINAL_RC"
 }
 trap cleanup EXIT
-trap maestro_interrupt HUP INT TERM
+trap 'maestro_interrupt HUP' HUP
+trap 'maestro_interrupt INT' INT
+trap 'maestro_interrupt TERM' TERM
 
 SLUG="main"
 MODE="${1:-}"
@@ -72,9 +122,9 @@ discussion_write_state() { # turns awaiting_reply rollback_bytes
 
 discussion_read_state() {
   [ -f "$STATE" ] && [ ! -L "$STATE" ] || return 1
-  STATE_TURNS=$(write_lock_metadata_value "$STATE" turns)
-  STATE_AWAITING=$(write_lock_metadata_value "$STATE" awaiting_reply)
-  STATE_ROLLBACK=$(write_lock_metadata_value "$STATE" rollback_bytes)
+  STATE_TURNS=$(discussion_metadata_value "$STATE" turns)
+  STATE_AWAITING=$(discussion_metadata_value "$STATE" awaiting_reply)
+  STATE_ROLLBACK=$(discussion_metadata_value "$STATE" rollback_bytes)
   case "$STATE_TURNS" in ''|*[!0-9]*) return 1 ;; esac
   case "$STATE_ROLLBACK" in ''|*[!0-9]*) return 1 ;; esac
   case "$STATE_AWAITING" in 0|1) ;; *) return 1 ;; esac
@@ -89,7 +139,7 @@ discussion_lock_acquire() {
   while [ "$attempt" -lt 2 ]; do
     token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
     if mkdir -m 700 "$LOCK" 2>/dev/null; then
-      process_start=$(write_lock_process_start "$$")
+      process_start=$(discussion_process_start "$$")
       [ -n "$process_start" ] || process_start=unavailable
       if ! printf 'token=%s\npid=%s\nprocess_start=%s\n' "$token" "$$" "$process_start" > "$metadata"; then
         rmdir "$LOCK" 2>/dev/null || :
@@ -100,22 +150,22 @@ discussion_lock_acquire() {
       return 0
     fi
     [ -f "$metadata" ] || return 1
-    recorded_token=$(write_lock_metadata_value "$metadata" token)
-    owner_pid=$(write_lock_metadata_value "$metadata" pid)
-    owner_start=$(write_lock_metadata_value "$metadata" process_start)
+    recorded_token=$(discussion_metadata_value "$metadata" token)
+    owner_pid=$(discussion_metadata_value "$metadata" pid)
+    owner_start=$(discussion_metadata_value "$metadata" process_start)
     case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
     if kill -0 "$owner_pid" 2>/dev/null; then
-      current_start=$(write_lock_process_start "$owner_pid")
+      current_start=$(discussion_process_start "$owner_pid")
       if [ -z "$current_start" ] || [ -z "$owner_start" ] ||
         [ "$owner_start" = unavailable ] || [ "$current_start" = "$owner_start" ]; then
         return 1
       fi
     fi
     [ -n "$recorded_token" ] || return 1
-    [ "$(write_lock_metadata_value "$metadata" token)" = "$recorded_token" ] || return 1
+    [ "$(discussion_metadata_value "$metadata" token)" = "$recorded_token" ] || return 1
     reclaim_dir="$LOCK/.reclaim"
     mkdir "$reclaim_dir" 2>/dev/null || return 1
-    if [ "$(write_lock_metadata_value "$metadata" token)" != "$recorded_token" ]; then
+    if [ "$(discussion_metadata_value "$metadata" token)" != "$recorded_token" ]; then
       rmdir "$reclaim_dir" 2>/dev/null || :
       return 1
     fi
@@ -175,6 +225,13 @@ done
   { echo "DISCUSSION_ERROR: max_idle, poll, and max rounds must be at least 1" >&2; maestro_finish "FAILED" 3; }
 [ "$RETRIES" -le 10 ] || { echo "DISCUSSION_ERROR: retries must be at most 10" >&2; maestro_finish "FAILED" 3; }
 transcript_path || { echo "DISCUSSION_ERROR: could not resolve transcript path" >&2; maestro_finish "FAILED" 3; }
+DISCUSSION_RESULT="${T}.result.$$"
+DISCUSSION_PROFILE="${T}.profile.$$"
+DISCUSSION_EVIDENCE="${T}.evidence.$$"
+DISCUSSION_PROMPT="${T}.prompt.$$"
+rm -f "$DISCUSSION_RESULT" "$DISCUSSION_PROFILE" "${DISCUSSION_PROFILE}.new" \
+  "${DISCUSSION_PROFILE}.cancel" "${DISCUSSION_PROFILE}.cancel.new" \
+  "$DISCUSSION_EVIDENCE" "$DISCUSSION_PROMPT" || maestro_finish "FAILED" 3
 [ -f "$T" ] || { echo "DISCUSSION_ERROR: no transcript at $T — start one with --new \"<topic>\" ${SLUG}" >&2; maestro_finish "FAILED" 3; }
 [ -f "$FILE" ] || { echo "DISCUSSION_ERROR: turn file not found: $FILE" >&2; maestro_finish "FAILED" 3; }
 if ! discussion_lock_acquire; then
@@ -233,11 +290,10 @@ The text above is the full transcript so far; it is your only memory.
     CONVERGED: <the agreed design and rejected alternatives>
 - Stay under ~300 words.'
 
-C=$(companion_resolve) || { echo "DISCUSSION_ERROR: codex-companion.mjs not found" >&2; maestro_finish "FAILED" 3; }
-PIN=$(companion_pin 2>/dev/null) || { echo "DISCUSSION_ERROR: no Codex model/effort pinned" >&2; maestro_finish "FAILED" 3; }
-PIN_MODEL=${PIN%%$'\t'*}
-PIN_EFFORT=${PIN#*$'\t'}
-PIN_EFFORT=${PIN_EFFORT%%$'\t'*}
+
+discussion_turn_run() {
+  local N ROLLBACK_BYTES backup tmp cancel_reason attempt rc
+  local PIN_MODEL PIN_EFFORT left word
 
 N=$((TURNS + 1))
 ROLLBACK_BYTES=$(wc -c < "$T" | tr -d ' ')
@@ -254,26 +310,52 @@ if ! cp -p "$T" "$backup" || ! cp -p "$T" "$tmp" ||
   maestro_finish "FAILED" 3
 fi
 rm -f "$backup"
-PROMPT="$(cat "$T")${DOCTRINE}"
+if ! {
+  cat "$T"
+  printf '%s\n' "$DOCTRINE"
+} > "$DISCUSSION_PROMPT"; then
+  echo "DISCUSSION_ERROR: could not prepare companion prompt" >&2
+  maestro_finish "FAILED" 3
+fi
 
 REPLY=""
+cancel_reason=""
 attempt=0
 while :; do
+  DISCUSSION_JOB=""
+  rm -f "$DISCUSSION_PROFILE" "${DISCUSSION_PROFILE}.new" \
+    "${DISCUSSION_PROFILE}.job" "${DISCUSSION_PROFILE}.transport.out" \
+    "${DISCUSSION_PROFILE}.transport.err" "${DISCUSSION_PROFILE}.cancel" \
+    "${DISCUSSION_PROFILE}.cancel.new" 2>/dev/null || :
   attempt=$((attempt + 1))
-  dispatch_started=$SECONDS
-  JOB=$(companion_start "$C" "$PROMPT") || { echo "DISCUSSION_ERROR: could not start Codex job" >&2; maestro_finish "FAILED" 3; }
-  progress "DISCUSSION: turn $N dispatched as $JOB (model=$PIN_MODEL effort=$PIN_EFFORT, read-only, attempt $attempt, max_idle=${MAX_IDLE}s poll=${POLL}s)"
-  companion_verify_pin "$C" "$JOB" "$PIN_MODEL" "$PIN_EFFORT" || :
-  companion_poll "$C" "$JOB" "$MAX_IDLE" "$POLL" "$dispatch_started"
+  companion_turn read "$DISCUSSION_PROMPT" "$MAX_IDLE" "$POLL" \
+    "$DISCUSSION_RESULT" "$DISCUSSION_PROFILE" "$DISCUSSION_EVIDENCE" :
   rc=$?
-  if [ "$rc" -eq 124 ] && [ "${MAESTRO_CANCEL_REASON:-unknown}" != status-lost ]; then
-    echo "DISCUSSION_HUNG: job $JOB stalled; cancelled. Your turn is saved in $T." >&2
+  [ ! -s "$DISCUSSION_EVIDENCE" ] || cat "$DISCUSSION_EVIDENCE" >&2
+  DISCUSSION_JOB=$(discussion_metadata_value "$DISCUSSION_PROFILE" job)
+  cancel_reason=$(discussion_metadata_value "$DISCUSSION_PROFILE" cancel_reason)
+  if [ "$rc" -eq 3 ]; then
+    echo "DISCUSSION_ERROR: companion turn could not start. Your turn is saved in $T." >&2
+    maestro_finish "FAILED" 3
+  fi
+  if [ "$rc" -eq 124 ] && [ "${cancel_reason:-unknown}" != status-lost ]; then
+    echo "DISCUSSION_HUNG: job ${DISCUSSION_JOB:-unknown} stalled; cancelled. Your turn is saved in $T." >&2
     maestro_finish "HUNG" 124
   fi
-  if [ "$rc" -eq 0 ] && REPLY=$(companion_result "$C" "$JOB"); then break; fi
+  if [ "$rc" -eq 0 ] && [ -s "$DISCUSSION_RESULT" ]; then
+    REPLY=$(cat "$DISCUSSION_RESULT")
+    PIN_MODEL=$(discussion_metadata_value "$DISCUSSION_PROFILE" model)
+    PIN_EFFORT=$(discussion_metadata_value "$DISCUSSION_PROFILE" effort)
+    break
+  fi
   if [ "$attempt" -le "$RETRIES" ]; then
     left=$((RETRIES - attempt + 1)); word=retries; [ "$left" -eq 1 ] && word=retry
     echo "DISCUSSION_RETRY: attempt $attempt failed; retrying in ${RETRY_SLEEP}s ($left $word left)" >&2
+    DISCUSSION_JOB=""
+    rm -f "$DISCUSSION_PROFILE" "${DISCUSSION_PROFILE}.new" \
+      "${DISCUSSION_PROFILE}.job" "${DISCUSSION_PROFILE}.transport.out" \
+      "${DISCUSSION_PROFILE}.transport.err" "${DISCUSSION_PROFILE}.cancel" \
+      "${DISCUSSION_PROFILE}.cancel.new" 2>/dev/null || :
     sleep "$RETRY_SLEEP"
   else
     echo "DISCUSSION_FAILED: job failed after $attempt attempt(s). Your turn is saved in $T." >&2
@@ -294,6 +376,9 @@ if ! cp -p "$T" "$backup" || ! cp -p "$T" "$tmp" ||
 fi
 rm -f "$backup"
 printf '%s\n' "$REPLY"
+}
+
+discussion_turn_run
 
 marker=$(printf '%s\n' "$REPLY" |
   sed -nE 's/^(CONVERGED|ESCALATE):[[:space:]].*$/\1/p' | tail -1)

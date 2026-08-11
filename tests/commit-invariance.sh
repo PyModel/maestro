@@ -3,7 +3,7 @@
 # unattributed writes, and migrate without manufacturing a gap.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LIB="$ROOT/hooks/lib-companion.sh"
+LIB="$ROOT/hooks/lib-write-lease.sh"
 D=$(mktemp -d /tmp/commitinv.XXXXXX); trap 'rm -rf "$D"' EXIT
 
 REAL_NODE=$(node -p 'process.execPath')

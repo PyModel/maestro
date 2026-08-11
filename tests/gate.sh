@@ -327,5 +327,21 @@ payload=$(gate_payload "$FAKEHOME/repo/tool.json")
 check_gate 41 "executable file cannot use a non-code extension exemption" 2 "$payload" "$FAKEHOME"
 pass 41 "executable files remain source-gated regardless of extension"
 
+rm -f "$FLAG"
+payload=$(gate_payload "/work/repo/src/app.ts")
+if output=$(printf '%s' "$payload" |
+  HOME="$FAKEHOME" "$NODE" "$GATE" 2>&1); then
+  rc=0
+else
+  rc=$?
+fi
+[ "$rc" -eq 2 ] ||
+  fail 42 "source gate guidance returned rc=$rc, want 2"
+case "$output" in
+  *implementer-loop.sh*implementer-watchdog.sh*) ;;
+  *) fail 42 "source gate guidance omitted the default loop or peer fallback: $output" ;;
+esac
+pass 42 "source gate directs blocked edits to the default loop and peer fallback"
+
 echo "VERIFY PASS: gate payloads, canonical paths, private subagent/session scoping, override semantics, model setup, and bounded autonomy framing"
 exit 0

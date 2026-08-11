@@ -76,25 +76,24 @@ export PREFLIGHT_LOG="$LOG"
 run_start() {
   local stub=$1
   local mode=${2:-read}
+  local job_file="$D/start.job" stdout="$D/start.stdout"
   : > "$LOG"
   : > "$ERR"
+  rm -f "$job_file" "$stdout"
   if [ "$mode" = "write" ]; then
     mkdir -p "$D/lease"
     printf 'token=preflight-token\npid=%s\nprocess_start=unavailable\njob_id=unknown\nsession_id=preflight\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' \
       "$$" > "$D/lease/metadata"
     export MAESTRO_LOCK_ACQUIRED=1 MAESTRO_LOCK_TOKEN=preflight-token MAESTRO_LOCK_DIR="$D/lease"
-    if OUTPUT=$(companion_start "$D/$stub.cjs" "hello" write 2>"$ERR"); then
-      RC=0
-    else
-      RC=$?
-    fi
+    companion_start "$D/$stub.cjs" "hello" write gpt-5.6-sol high : \
+      "$job_file" "$stdout" "$ERR" 2>> "$ERR"
+    RC=$?
   else
-    if OUTPUT=$(companion_start "$D/$stub.cjs" "hello" 2>"$ERR"); then
-      RC=0
-    else
-      RC=$?
-    fi
+    companion_start "$D/$stub.cjs" "hello" read gpt-5.6-sol high : \
+      "$job_file" "$stdout" "$ERR" 2>> "$ERR"
+    RC=$?
   fi
+  OUTPUT=$(cat "$job_file" 2>/dev/null)
 }
 
 run_start drifted write

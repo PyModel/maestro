@@ -42,20 +42,101 @@ milliseconds_now() {
   esac
 }
 
-# shellcheck source=../hooks/lib-companion.sh
-source "$ROOT/hooks/lib-companion.sh"
+# shellcheck source=../hooks/lib-write-lease.sh
+source "$ROOT/hooks/lib-write-lease.sh"
 progress_init
+
+t0_process_module_contract() (
+  local out="$TEST_ROOT/process-contract.out"
+  local err="$TEST_ROOT/process-contract.err"
+  local rc
+  [ -f "$ROOT/hooks/lib-process.sh" ] ||
+    { echo "hooks/lib-process.sh is missing"; return 1; }
+  # shellcheck source=../hooks/lib-process.sh
+  source "$ROOT/hooks/lib-process.sh"
+  process_run_bounded 2 TEST_PROCESS : "$out" "$err" -- \
+    bash -c 'printf "process-out\n"; printf "process-err\n" >&2; exit 37'
+  rc=$?
+  [ "$rc" -eq 37 ] || { echo "rc=$rc want 37"; return 1; }
+  [ "$(cat "$out")" = process-out ] || { echo "stdout file mismatch"; return 1; }
+  [ "$(cat "$err")" = process-err ] || { echo "stderr file mismatch"; return 1; }
+)
+
+t0b_companion_module_contract() (
+  local prompt="$TEST_ROOT/companion-contract.prompt"
+  local result="$TEST_ROOT/companion-contract.result"
+  local profile="$TEST_ROOT/companion-contract.profile"
+  local evidence="$TEST_ROOT/companion-contract.evidence" rc
+  declare -F companion_turn >/dev/null &&
+    declare -F companion_interrupt >/dev/null &&
+    declare -F companion_writers >/dev/null ||
+    { echo "narrow companion interface missing"; return 1; }
+  printf 'objective\n' > "$prompt"
+  companion_turn inferred "$prompt" 2 1 "$result" "$profile" "$evidence" :
+  rc=$?
+  [ "$rc" -eq 3 ] || { echo "invalid explicit mode rc=$rc want 3"; return 1; }
+  companion_turn write "$prompt" 2 1 "$result" "$profile" "$evidence" :
+  rc=$?
+  [ "$rc" -eq 3 ] || { echo "write without lifecycle rc=$rc want 3"; return 1; }
+  [ ! -e "$result" ] && [ ! -e "$profile" ] && [ ! -e "$evidence" ] ||
+    { echo "invalid mode or lifecycle mutated caller-owned files"; return 1; }
+)
+
+t0c_failed_started_publication_cancels_job() (
+  local prompt="$TEST_ROOT/publication-failure.prompt"
+  local result="$TEST_ROOT/publication-failure.result"
+  local profile="$TEST_ROOT/publication-failure.profile"
+  local evidence="$TEST_ROOT/publication-failure.evidence"
+  local calls="$TEST_ROOT/publication-failure.calls" rc
+  companion_resolve() { printf '%s' "$FIXTURE"; }
+  companion_pin() { printf 'gpt-5.6-sol\thigh\thigh\n'; }
+  reject_started() {
+    [ "$1" != started ]
+  }
+  printf 'objective\n' > "$prompt"
+  : > "$calls"
+  export MAESTRO_TEST_CALL_LOG="$calls"
+  companion_turn write "$prompt" 2 1 "$result" "$profile" "$evidence" \
+    reject_started
+  rc=$?
+  [ "$rc" -eq 125 ] || { echo "publication failure rc=$rc want 125"; return 1; }
+  [ "$(grep -c '^cancel task-fake0000-aaaaaa$' "$calls")" -eq 1 ] ||
+    { echo "unpublished job was not cancelled exactly once"; return 1; }
+  grep -q '^job=task-fake0000-aaaaaa$' "$profile" ||
+    { echo "profile omitted unpublished job"; return 1; }
+  grep -q '^cancel_reason=launch-publication-failed$' "$profile" ||
+    { echo "profile omitted publication failure"; return 1; }
+)
+
+t0d_read_interrupt_never_cancels_unknown_writer() (
+  local evidence="$TEST_ROOT/read-interrupt.evidence"
+  local calls="$TEST_ROOT/read-interrupt.calls"
+  local status="$TEST_ROOT/read-interrupt.status" rc
+  companion_resolve() { printf '%s' "$FIXTURE"; }
+  printf '%s\n' '{"running":[{"id":"task-writer00-aaaaaa","write":true}],"latestFinished":null}' > "$status"
+  : > "$calls"
+  export MAESTRO_TEST_CALL_LOG="$calls"
+  export MAESTRO_TEST_STATUS="$status"
+  companion_interrupt TERM "" "$evidence" :
+  rc=$?
+  [ "$rc" -eq 124 ] || { echo "read interrupt rc=$rc want 124"; return 1; }
+  ! grep -q '^cancel ' "$calls" ||
+    { echo "read interrupt cancelled an unknown repository writer"; return 1; }
+)
 
 t1_hanging_status_is_bounded() {
   local timeout="${MAESTRO_COMPANION_TIMEOUT_SEC-2}"
   local output="$TEST_ROOT/hanging-status.out" pid started elapsed limit
+  local call_out="$TEST_ROOT/hanging-status.stdout"
+  local call_err="$TEST_ROOT/hanging-status.stderr"
   limit=$((timeout + 3))
   started=$(date +%s)
   set -m
   (
     export MAESTRO_COMPANION_TIMEOUT_SEC="$timeout"
     export MAESTRO_TEST_STATUS_HANG=6
-    companion_verify_pin "$FIXTURE" task-bounded0-aaaaaa gpt-5.6-sol high
+    companion_verify_pin "$FIXTURE" task-bounded0-aaaaaa \
+      gpt-5.6-sol high : "$call_out" "$call_err"
   ) > "$output" 2>&1 3>&1 &
   pid=$!
   set +m
@@ -72,11 +153,12 @@ t1_hanging_status_is_bounded() {
 }
 
 t2_timeout_reaps_process_group() {
-  local output="$TEST_ROOT/reap.out" child_file="$TEST_ROOT/child.pid"
+  local output="$TEST_ROOT/reap.out" error="$TEST_ROOT/reap.err"
+  local child_file="$TEST_ROOT/child.pid"
   local child rc elapsed=0
-  run_bounded 1 TEST_REAP bash -c \
+  process_run_bounded 1 TEST_REAP : "$output" "$error" -- bash -c \
     'sleep 30 & child=$!; printf "%s\n" "$child" > "$1"; wait "$child"' \
-    _ "$child_file" > "$output" 2>&1 3>&1
+    _ "$child_file"
   rc=$?
   [ "$rc" -eq 125 ] || { echo "rc=$rc want 125"; return 1; }
   [ -s "$child_file" ] || { echo "wrapped child pid missing"; return 1; }
@@ -93,30 +175,35 @@ t2_timeout_reaps_process_group() {
 }
 
 t3_run_bounded_returns_wrapped_rc() {
-  local output rc
-  output=$(run_bounded 2 TEST_RC bash -c 'printf "discarded\n"; exit 37')
+  local output="$TEST_ROOT/process-rc.out" error="$TEST_ROOT/process-rc.err" rc
+  process_run_bounded 2 TEST_RC : "$output" "$error" -- \
+    bash -c 'printf "preserved\n"; exit 37'
   rc=$?
   [ "$rc" -eq 37 ] || { echo "rc=$rc want 37"; return 1; }
-  [ -z "$output" ] || { echo "failed command stdout leaked: $output"; return 1; }
-  output=$(run_bounded 2 TEST_STDOUT printf 'bounded-ok\n')
+  [ "$(cat "$output")" = preserved ] ||
+    { echo "failed command stdout was not preserved"; return 1; }
+  process_run_bounded 2 TEST_STDOUT : "$output" "$error" -- printf 'bounded-ok\n'
   rc=$?
   [ "$rc" -eq 0 ] || { echo "success rc=$rc want 0"; return 1; }
-  [ "$output" = "bounded-ok" ] || { echo "stdout=$output"; return 1; }
+  [ "$(cat "$output")" = bounded-ok ] || { echo "stdout=$(cat "$output")"; return 1; }
 }
 
 t4_invalid_companion_timeout_falls_back() {
-  local output rc
-  output=$(MAESTRO_COMPANION_TIMEOUT_SEC=bogus \
-    companion_call "$FIXTURE" result task-bounded0-aaaaaa 3>&1)
+  local progress rc
+  local call_out="$TEST_ROOT/invalid-timeout.stdout"
+  local call_err="$TEST_ROOT/invalid-timeout.stderr"
+  progress=$(MAESTRO_COMPANION_TIMEOUT_SEC=bogus \
+    companion_call "$call_out" "$call_err" \
+      "$FIXTURE" result task-bounded0-aaaaaa 3>&1)
   rc=$?
   [ "$rc" -eq 0 ] || { echo "rc=$rc want 0"; return 1; }
-  case "$output" in
+  case "$progress" in
     *MAESTRO_COMPANION*bogus*120s*) ;;
-    *) echo "fallback progress missing: $output"; return 1 ;;
+    *) echo "fallback progress missing: $progress"; return 1 ;;
   esac
-  case "$output" in
+  case "$(cat "$call_out")" in
     *"RESULT: DONE"*) ;;
-    *) echo "companion output missing: $output"; return 1 ;;
+    *) echo "companion output missing: $(cat "$call_out")"; return 1 ;;
   esac
 }
 
@@ -133,13 +220,16 @@ t5_repo_digest_survives_refactor() {
 
 t6_poll_hanging_status_is_bounded() {
   local timeout=1 output="$TEST_ROOT/poll-hanging-status.out" pid
-  # This check expects read-only rc=124; an inherited write lease would be poisoned by the fixture job id.
-  unset MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_ACQUIRED
+  local call_out="$TEST_ROOT/poll-hanging-status.stdout"
+  local call_err="$TEST_ROOT/poll-hanging-status.stderr"
+  # Mode is explicit. Inherited Lease interval state must never turn a read poll
+  # into write cancellation.
   set -m
   (
     export MAESTRO_COMPANION_TIMEOUT_SEC="$timeout"
     export MAESTRO_TEST_STATUS_HANG=4
-    companion_poll "$FIXTURE" task-bounded0-aaaaaa 60 1
+    companion_poll "$FIXTURE" task-bounded0-aaaaaa 60 1 \
+      "$SECONDS" read "" : "$call_out" "$call_err"
   ) > "$output" 2>&1 3>&1 &
   pid=$!
   set +m
@@ -154,10 +244,12 @@ t6_poll_hanging_status_is_bounded() {
 
 t7_fast_status_has_no_one_second_floor() {
   local started finished elapsed i
-  unset MAESTRO_TEST_STATUS_HANG
+  local call_out="$TEST_ROOT/fast-status.stdout"
+  local call_err="$TEST_ROOT/fast-status.stderr"
   started=$(milliseconds_now) || return 1
   for i in 1 2 3 4 5; do
-    companion_call "$FIXTURE" status task-bounded0-aaaaaa --json >/dev/null ||
+    companion_call "$call_out" "$call_err" \
+      "$FIXTURE" status task-bounded0-aaaaaa --json ||
       { echo "status call $i failed"; return 1; }
   done
   finished=$(milliseconds_now) || return 1
@@ -167,7 +259,7 @@ t7_fast_status_has_no_one_second_floor() {
     { echo "5 status calls took ${elapsed}ms want under 2000ms"; return 1; }
 }
 
-t8_t6_scrubs_an_inherited_lease() {
+t8_explicit_read_ignores_inherited_lease() {
   local lease="$TEST_ROOT/injected-lease" output="$TEST_ROOT/t6-inherited.out" rc
   mkdir "$lease" || return 1
   cat > "$lease/metadata" <<'EOF' || return 1
@@ -192,16 +284,23 @@ EOF
 }
 
 t9_failed_start_cannot_publish_a_task_id() (
-  local output rc
-  companion_pin() { printf 'gpt-5.6-sol\thigh\thigh\n'; }
+  local job_file="$TEST_ROOT/phantom.job"
+  local call_out="$TEST_ROOT/phantom.stdout"
+  local call_err="$TEST_ROOT/phantom.stderr" output rc
   companion_call() {
-    printf 'transport failed after allocating task-phantom0-aaaaaa\n'
+    printf 'transport failed after allocating task-phantom0-aaaaaa\n' > "$1"
+    : > "$2"
     return 9
   }
-  output=$(companion_start "$FIXTURE" objective)
+  companion_start "$FIXTURE" objective read gpt-5.6-sol high : \
+    "$job_file" "$call_out" "$call_err"
   rc=$?
-  [ "$rc" -eq 3 ] || { echo "rc=$rc want 3, output=${output:-empty}"; return 1; }
-  [ -z "$output" ] || { echo "failed launch published task id: $output"; return 1; }
+  [ "$rc" -eq 3 ] || { echo "rc=$rc want 3"; return 1; }
+  [ ! -s "$job_file" ] || {
+    output=$(cat "$job_file")
+    echo "failed launch published task id: $output"
+    return 1
+  }
 )
 
 t10_dispatch_budget_resolution() (
@@ -223,19 +322,23 @@ t10_dispatch_budget_resolution() (
 
 t11_idle_uses_elapsed_time_not_poll_count() (
   local log="$TEST_ROOT/slow-status.log" reason="$TEST_ROOT/slow-status.reason"
+  local call_out="$TEST_ROOT/slow-status.stdout"
+  local call_err="$TEST_ROOT/slow-status.stderr"
   local started elapsed rc
   : > "$log"
   unset MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_ACQUIRED
   companion_call() {
     sleep 2
-    printf '{"status":"running","logFile":"%s"}\n' "$log"
+    printf '{"status":"running","logFile":"%s"}\n' "$log" > "$1"
+    : > "$2"
   }
   companion_cancel_job() {
     printf '%s\n' "$3" > "$reason"
     return 124
   }
   started=$SECONDS
-  companion_poll "$FIXTURE" task-slowstatus-aaaaaa 2 1 >/dev/null 2>&1
+  companion_poll "$FIXTURE" task-slowstatus-aaaaaa 2 1 \
+    "$SECONDS" read "" : "$call_out" "$call_err" >/dev/null 2>&1
   rc=$?
   elapsed=$((SECONDS - started))
   [ "$rc" -eq 124 ] || { echo "rc=$rc want 124"; return 1; }
@@ -245,6 +348,8 @@ t11_idle_uses_elapsed_time_not_poll_count() (
 
 t12_status_call_is_clipped_to_hard_dispatch_budget() (
   local output="$TEST_ROOT/hard-status-bound.out" calls="$TEST_ROOT/hard-status-calls.log"
+  local call_out="$TEST_ROOT/hard-status.stdout"
+  local call_err="$TEST_ROOT/hard-status.stderr"
   local started elapsed rc
   : > "$calls"
   unset MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_ACQUIRED
@@ -253,13 +358,124 @@ t12_status_call_is_clipped_to_hard_dispatch_budget() (
     MAESTRO_TEST_STATUS_HANG=4 \
     MAESTRO_COMPANION_TIMEOUT_SEC=5 \
     MAESTRO_MAX_DISPATCH_SEC=2 \
-    companion_poll "$FIXTURE" task-hardbound-aaaaaa 60 1 > "$output" 2>&1 3>&1
+    companion_poll "$FIXTURE" task-hardbound-aaaaaa 60 1 \
+      "$SECONDS" read "" : "$call_out" "$call_err" > "$output" 2>&1 3>&1
   rc=$?
   elapsed=$((SECONDS - started))
   [ "$rc" -eq 124 ] || { echo "rc=$rc want read-only deadline 124"; return 1; }
   [ "$elapsed" -le 4 ] || { echo "elapsed=${elapsed}s exceeded the 2s hard budget by an unbounded status call"; return 1; }
   grep -q '^cancel task-hardbound-aaaaaa$' "$calls" || { echo "deadline did not cancel the job"; return 1; }
   grep -q 'reason=deadline' "$output" || { echo "hard bound was not classified as deadline"; return 1; }
+)
+
+t13_cancellation_writes_one_terminal_fact() (
+  local fact="$TEST_ROOT/cancel.fact" events="$TEST_ROOT/cancel.events" rc
+  local call_out="$TEST_ROOT/cancel.stdout"
+  local call_err="$TEST_ROOT/cancel.stderr"
+  unset MAESTRO_CANCEL_REASON MAESTRO_CANCEL_REQUESTED
+  companion_call() { : > "$1"; : > "$2"; return 4; }
+  lifecycle() { printf '%s %s %s\n' "$1" "$2" "$3" >> "$events"; }
+  companion_cancel_job "$FIXTURE" task-cancelfact-aaaaaa deadline /tmp/job.log \
+    read "$fact" lifecycle "$call_out" "$call_err"
+  rc=$?
+  [ "$rc" -eq 124 ] || { echo "rc=$rc want 124"; return 1; }
+  [ -f "$fact" ] || { echo "cancellation fact missing"; return 1; }
+  grep -q '^job=task-cancelfact-aaaaaa$' "$fact" || { cat "$fact"; return 1; }
+  grep -q '^reason=deadline$' "$fact" || { cat "$fact"; return 1; }
+  grep -q '^request=unconfirmed$' "$fact" || { cat "$fact"; return 1; }
+  grep -q '^source=request$' "$fact" || { cat "$fact"; return 1; }
+  [ "$(cat "$events")" = "cancel-begin task-cancelfact-aaaaaa deadline
+cancel-end task-cancelfact-aaaaaa deadline" ] ||
+    { echo "events=$(tr '\n' '|' < "$events")"; return 1; }
+  ! declare -p MAESTRO_CANCEL_REASON MAESTRO_CANCEL_REQUESTED >/dev/null 2>&1 ||
+    { echo "cancellation leaked outcome globals"; return 1; }
+)
+
+t14_nonzero_status_and_result_are_lost() (
+  local output="$TEST_ROOT/nonzero-status.out" calls="$TEST_ROOT/nonzero-status.calls"
+  local call_out="$TEST_ROOT/nonzero-status.stdout"
+  local call_err="$TEST_ROOT/nonzero-status.stderr"
+  local result="$TEST_ROOT/nonzero-result" rc statuses
+  sleep() { command sleep 0.05; }
+  : > "$calls"
+  MAESTRO_TEST_CALL_LOG="$calls" \
+    MAESTRO_TEST_JOB_STATUS_RAW='{"status":"running"}' \
+    MAESTRO_TEST_JOB_STATUS_EXIT=1 \
+    companion_poll "$FIXTURE" task-status-exit-aaaaaa 2 1 \
+      "$SECONDS" read "" : "$call_out" "$call_err" > "$output" 2>&1 3>&1
+  rc=$?
+  [ "$rc" -eq 124 ] || { echo "nonzero status rc=$rc want 124"; return 1; }
+  statuses=$(grep -c '^status task-status-exit-aaaaaa --json$' "$calls" || true)
+  [ "$statuses" -eq 4 ] || { echo "status-loss strikes=$statuses want 4"; return 1; }
+  grep -q 'status-lost' "$output" ||
+    { echo "nonzero status was not classified status-lost"; return 1; }
+
+  MAESTRO_TEST_RESULT='RESULT: DONE' MAESTRO_TEST_RESULT_EXIT=1 \
+    companion_result "$FIXTURE" task-result-exit-aaaaaa : "$result" \
+      "$call_out" "$call_err" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 4 ] || { echo "nonzero result rc=$rc want 4"; return 1; }
+)
+
+t15_capitalized_terminal_status_completes() (
+  local calls="$TEST_ROOT/capitalized.calls"
+  local call_out="$TEST_ROOT/capitalized.stdout"
+  local call_err="$TEST_ROOT/capitalized.stderr" rc statuses
+  sleep() { command sleep 0.05; }
+  : > "$calls"
+  MAESTRO_TEST_CALL_LOG="$calls" MAESTRO_TEST_JOB_PHASE=Completed \
+    companion_poll "$FIXTURE" task-capitalized-aaaaaa 1 1 \
+      "$SECONDS" read "" : "$call_out" "$call_err" >/dev/null 2>&1
+  rc=$?
+  statuses=$(grep -c '^status task-capitalized-aaaaaa --json$' "$calls" || true)
+  [ "$rc" -eq 0 ] || { echo "capitalized status rc=$rc want 0"; return 1; }
+  [ "$statuses" -eq 1 ] || { echo "capitalized status polls=$statuses want 1"; return 1; }
+)
+
+t16_three_segment_job_id_round_trips() (
+  local repo="$TEST_ROOT/three-segment-repo" job_file="$TEST_ROOT/three-segment.job"
+  local call_out="$TEST_ROOT/three-segment.stdout"
+  local call_err="$TEST_ROOT/three-segment.stderr"
+  local result="$TEST_ROOT/three-segment.result" evidence="$TEST_ROOT/three-segment.evidence"
+  local writers="$TEST_ROOT/three-segment.writers" expected=task-2026-08-abcdef job invalid rc
+  git init -q "$repo" || return 1
+  (
+    cd "$repo" || exit 1
+    git config user.email p@p
+    git config user.name p
+    printf 'seed\n' > seed
+    git add seed
+    git commit -q -m init
+  ) || return 1
+  cd "$repo" || exit 1
+  write_lock_workspace_writers() { return 0; }
+  write_lock_acquire unknown >/dev/null 2>&1 || return 1
+  MAESTRO_TEST_TASK_ID="$expected" companion_start "$FIXTURE" objective write \
+    gpt-5.6-sol high : "$job_file" "$call_out" "$call_err" || return 1
+  job=$(cat "$job_file")
+  [ "$job" = "$expected" ] || { echo "extracted job=$job want $expected"; return 1; }
+  MAESTRO_TEST_JOB_PHASE=completed companion_verify_pin "$FIXTURE" "$job" \
+    gpt-5.6-sol high : "$call_out" "$call_err" || return 1
+  _write_lease_turn_event started "$job" dispatch "$result" "$evidence"; rc=$?
+  [ "$rc" -eq 0 ] || { echo "started-event job id rc=$rc want 0"; return 1; }
+  grep -qx "job_id=$expected" "$repo/.git/maestro-write.lock/metadata" ||
+    { echo "started-event did not publish the full id"; return 1; }
+  printf '%s\n' "{\"running\":[{\"id\":\"$expected\",\"write\":true}],\"latestFinished\":null}" \
+    > "$TEST_ROOT/three-segment.status"
+  MAESTRO_TEST_STATUS="$TEST_ROOT/three-segment.status" \
+    companion_workspace_writers "$FIXTURE" "$writers" "$call_err" || return 1
+  [ "$(cat "$writers")" = "$expected"$'\ttrue' ] ||
+    { echo "writer validator rejected or changed the full id"; return 1; }
+  for invalid in task-ABC-def task-bad_id; do
+    _write_lease_turn_event started "$invalid" dispatch "$result" "$evidence"; rc=$?
+    [ "$rc" -eq 3 ] || { echo "started-event accepted invalid id=$invalid"; return 1; }
+    printf '%s\n' "{\"running\":[{\"id\":\"$invalid\",\"write\":true}]}" \
+      > "$TEST_ROOT/three-segment.status"
+    MAESTRO_TEST_STATUS="$TEST_ROOT/three-segment.status" \
+      companion_workspace_writers "$FIXTURE" "$writers" "$call_err" >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 4 ] || { echo "writer validator accepted invalid id=$invalid"; return 1; }
+  done
 )
 
 check() {
@@ -272,6 +488,10 @@ check() {
 }
 
 printf '=== Bounded companion calls verification ===\n'
+check t0_process_module_contract "deep process module owns bounded output and rc"
+check t0b_companion_module_contract "companion interface requires an explicit mode"
+check t0c_failed_started_publication_cancels_job "failed launch publication cancels the unpublished job"
+check t0d_read_interrupt_never_cancels_unknown_writer "read interrupt never cancels an unknown writer"
 check t1_hanging_status_is_bounded "hanging status honors the companion timeout"
 check t2_timeout_reaps_process_group "timeout returns 125 and reaps the process group"
 check t3_run_bounded_returns_wrapped_rc "bounded runner preserves stdout and command rc"
@@ -279,10 +499,14 @@ check t4_invalid_companion_timeout_falls_back "invalid companion timeout falls b
 check t5_repo_digest_survives_refactor "bounded repository digest still returns tree-v2"
 check t6_poll_hanging_status_is_bounded "poll loop bounds repeated hanging statuses"
 check t7_fast_status_has_no_one_second_floor "five fast status calls finish under two seconds"
-check t8_t6_scrubs_an_inherited_lease "t6 scrubs an inherited write lease"
+check t8_explicit_read_ignores_inherited_lease "explicit read mode ignores inherited Lease interval state"
 check t9_failed_start_cannot_publish_a_task_id "failed start cannot publish a phantom task id"
 check t10_dispatch_budget_resolution "dispatch budgets resolve by mode and preserve explicit values"
 check t11_idle_uses_elapsed_time_not_poll_count "idle timeout uses elapsed wall time, not configured poll counts"
 check t12_status_call_is_clipped_to_hard_dispatch_budget "status calls cannot extend the hard dispatch budget by their full timeout"
+check t13_cancellation_writes_one_terminal_fact "cancellation produces one caller-owned terminal fact"
+check t14_nonzero_status_and_result_are_lost "nonzero status and result calls fail closed despite parseable output"
+check t15_capitalized_terminal_status_completes "capitalized terminal status is normalized once"
+check t16_three_segment_job_id_round_trips "three-segment job ids round-trip without truncation"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

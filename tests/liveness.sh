@@ -347,7 +347,7 @@ t3_write_cancel_poisons() {
         MAESTRO_TEST_LATE_POISON="$release_poison" ROOT="$ROOT" \
         bash -c '
           unset MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_ACQUIRED
-          . "$ROOT/hooks/lib-companion.sh"
+          . "$ROOT/hooks/lib-write-lease.sh"
           progress_init
           write_lock_acquire || exit $?
           write_lock_set_job task-release-race
@@ -385,7 +385,7 @@ t3_write_cancel_poisons() {
         MAESTRO_TEST_LATE_POISON="$acquire_poison" ROOT="$ROOT" \
         bash -c '
           unset MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_ACQUIRED
-          . "$ROOT/hooks/lib-companion.sh"
+          . "$ROOT/hooks/lib-write-lease.sh"
           progress_init
           write_lock_acquire
           [ "$?" -eq 11 ]
@@ -548,13 +548,15 @@ t6_clear_lease_works_and_refuses() {
 }
 
 t7_read_only_deadline_no_lease() {
-  local repo state pid
+  local repo state pid inherited
   repo=$(new_repo discussion-repo)
   state="$TEST_ROOT/discussion-state"
-  mkdir -p "$state"
+  inherited="$state/inherited-lease"
+  mkdir -p "$state" "$inherited"
   : > "$state/job.log"
   : > "$state/calls.log"
   status_empty > "$state/status.json"
+  printf 'token=faketoken\npid=1\nprocess_start=x\njob_id=fakejob\nsession_id=fakesess\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1767225600\ndigest_before=unavailable\n' > "$inherited/metadata"
   printf 'Opening turn.\n' > "$state/turn.md"
   (
     cd "$repo" &&
@@ -565,7 +567,7 @@ t7_read_only_deadline_no_lease() {
   (
     cd "$repo" &&
       env HOME="$TEST_HOME" PATH="$TEST_PATH" \
-        MAESTRO_LOCK_TOKEN= \
+        MAESTRO_LOCK_ACQUIRED=1 MAESTRO_LOCK_TOKEN=faketoken MAESTRO_LOCK_DIR="$inherited" \
         MAESTRO_TEST_CALL_LOG="$state/calls.log" \
         MAESTRO_TEST_JOB_PHASE=running \
         MAESTRO_TEST_LOGFILE="$state/job.log" \
@@ -578,10 +580,13 @@ t7_read_only_deadline_no_lease() {
   set +m
   wait_bounded "$pid" 11
   [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "read-only deadline did not fire"; return 1; }
-  [ "$WAIT_RC" -eq 124 ] || { echo "rc=$WAIT_RC want 124"; return 1; }
+  [ "$WAIT_RC" -eq 124 ] ||
+    { echo "rc=$WAIT_RC want 124"; cat "$state/output"; return 1; }
   [ ! -d "$repo/.git/maestro-write.lock" ] &&
     [ ! -d "$repo/.maestro-write.lock" ] ||
     { echo "read-only turn created a write lock"; return 1; }
+  ! grep -q '^quiescence=unconfirmed$' "$inherited/metadata" ||
+    { echo "read-only Discussion turn poisoned inherited Lease interval state"; return 1; }
 }
 
 t8_verifier_boundaries() {
@@ -624,7 +629,7 @@ t8_verifier_boundaries() {
   mkdir -p "$state"
   : > "$state/calls.log"
   status_empty > "$state/status.json"
-  verify=". '$ROOT/hooks/lib-companion.sh'; if write_lock_is_owner; then printf '0\n' > '$state/ownership'; exit 1; else printf '1\n' > '$state/ownership'; fi"
+  verify="if env | grep -Eq '^MAESTRO_LOCK_(TOKEN|DIR|ACQUIRED)='; then printf '0\n' > '$state/ownership'; exit 1; else printf '1\n' > '$state/ownership'; fi"
   set -m
   (
     cd "$repo" &&
@@ -642,7 +647,7 @@ t8_verifier_boundaries() {
   [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "verifier lease check exceeded 7s bound"; return 1; }
   ownership=$(sed -n '1p' "$state/ownership" 2>/dev/null)
   [ "$ownership" = 1 ] ||
-    { echo "write_lock_is_owner returned ${ownership:-no result} inside verifier, want non-zero"; return 1; }
+    { echo "verifier inherited Lease interval capability state=${ownership:-no result}"; return 1; }
   [ "$WAIT_RC" -eq 0 ] || { echo "verifier lease check rc=$WAIT_RC want 0"; return 1; }
 
   repo=$(new_repo verifier-success-reap-repo)
@@ -708,7 +713,7 @@ t9_terminal_at_deadline_harvests() {
 }
 
 t10_watchdog_signal_is_terminal() {
-  local repo state pid tasks cancels metadata
+  local repo state pid child tasks cancels poisons metadata
   repo=$(new_repo watchdog-signal-repo)
   state="$TEST_ROOT/watchdog-signal-state"
   mkdir -p "$state"
@@ -724,28 +729,44 @@ t10_watchdog_signal_is_terminal() {
         MAESTRO_TEST_LOGFILE="$state/job.log" \
         MAESTRO_TEST_LOG_GROWTH=1 \
         MAESTRO_TEST_STATUS="$state/status.json" \
+        MAESTRO_TEST_STATUS_HANG=60 \
+        MAESTRO_TEST_STATUS_PID_FILE="$state/status.pid" \
+        MAESTRO_COMPANION_TIMEOUT_SEC=120 \
         bash "$WATCHDOG" --file "$TEST_ROOT/plan.md" 30 1
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
   for _ in $(seq 1 100); do
-    grep -q '^status task-fake0000-aaaaaa --json$' "$state/calls.log" && break
+    [ -s "$state/status.pid" ] &&
+      grep -q '^status task-fake0000-aaaaaa --json$' "$state/calls.log" && break
     sleep 0.05
   done
-  grep -q '^status task-fake0000-aaaaaa --json$' "$state/calls.log" ||
-    { kill -KILL "$pid" 2>/dev/null || :; echo "watchdog never reached polling"; return 1; }
+  [ -s "$state/status.pid" ] &&
+    grep -q '^status task-fake0000-aaaaaa --json$' "$state/calls.log" ||
+    { kill -KILL "$pid" 2>/dev/null || :; echo "watchdog never entered hanging status call"; return 1; }
+  child=$(sed -n '1p' "$state/status.pid")
   kill -TERM "$pid" || return 1
   wait_bounded "$pid" 8
-  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "signalled watchdog did not exit"; return 1; }
+  [ "$WAIT_TIMED_OUT" -eq 0 ] ||
+    { echo "signalled watchdog did not exit"; return 1; }
   [ "$WAIT_RC" -eq 125 ] || { echo "rc=$WAIT_RC want 125: $(tr '\n' ' ' < "$state/output")"; return 1; }
+  if kill -0 "$child" 2>/dev/null; then
+    kill -KILL "$child" 2>/dev/null || :
+    echo "hanging Companion child $child survived watchdog TERM"
+    return 1
+  fi
   tasks=$(grep -c '^task ' "$state/calls.log" || true)
   cancels=$(grep -c '^cancel task-fake0000-aaaaaa$' "$state/calls.log" || true)
+  poisons=$(grep -c '^quiescence=unconfirmed$' \
+    "$repo/.git/maestro-write.lock/metadata" 2>/dev/null || true)
   [ "$tasks" -eq 1 ] || { echo "task starts=$tasks want 1"; return 1; }
   [ "$cancels" -eq 1 ] || { echo "cancel attempts=$cancels want 1"; return 1; }
+  [ "$poisons" -eq 1 ] || { echo "poison records=$poisons want 1"; return 1; }
   metadata="$repo/.git/maestro-write.lock/metadata"
   [ -f "$metadata" ] || { echo "signalled watchdog released its lease"; return 1; }
-  grep -qx 'quiescence=unconfirmed' "$metadata" ||
-    { echo "signalled watchdog did not poison lease"; return 1; }
+  grep -qx 'quiescence=unconfirmed' "$metadata" &&
+    grep -qx 'unconfirmed_reason=signal-term' "$metadata" ||
+    { echo "signalled watchdog did not record one TERM poison"; return 1; }
 }
 
 t11_loop_signal_is_terminal() {
@@ -790,7 +811,7 @@ t11_loop_signal_is_terminal() {
 }
 
 t12_loop_signal_reaps_verifier() {
-  local repo state pid child
+  local repo state pid child cancels metadata
   repo=$(new_repo verifier-signal-repo)
   state="$TEST_ROOT/verifier-signal-state"
   mkdir -p "$state"
@@ -826,6 +847,16 @@ t12_loop_signal_reaps_verifier() {
     echo "verifier child $child survived loop TERM"
     return 1
   fi
+  cancels=$(grep -c '^cancel ' "$state/calls.log" || true)
+  [ "$cancels" -eq 0 ] ||
+    { echo "verifier signal cancelled the completed writer $cancels time(s)"; return 1; }
+  metadata="$repo/.git/maestro-write.lock/metadata"
+  [ -f "$metadata" ] &&
+    grep -qx 'quiescence=unconfirmed' "$metadata" &&
+    grep -qx 'unconfirmed_reason=signal-term' "$metadata" ||
+    { echo "verifier signal did not retain one exact-generation poison"; return 1; }
+  grep -q 'request=not-attempted source=signal-handler' "$state/output" ||
+    { echo "verifier signal did not record a not-attempted cancellation fact"; return 1; }
 }
 
 t13_prelaunch_generation_fence() {
@@ -1035,6 +1066,49 @@ t18_invalid_polling_args_fail_before_launch() {
     { echo "mixed clear/execution error is unclear"; return 1; }
 }
 
+t19_waiting_contender_signal_does_not_cancel_owner() (
+  local repo state pid rc
+  repo=$(new_repo waiting-signal-repo)
+  state="$TEST_ROOT/waiting-signal-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  status_running_job task-holder00-aaaaaa true > "$state/status.json"
+  cd "$repo" || exit 1
+  . "$ROOT/hooks/lib-write-lease.sh"
+  companion_resolve() { printf '%s' "$FIXTURE"; }
+  progress_init
+  export MAESTRO_TEST_CALL_LOG="$state/calls.log"
+  export MAESTRO_TEST_STATUS="$state/status.json"
+  write_lock_acquire task-holder00-aaaaaa >/dev/null 2>&1 || return 1
+
+  set -m
+  (
+    unset MAESTRO_LOCK_ACQUIRED MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR
+    exec env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+      MAESTRO_LOCK_WAIT_SEC=30 MAESTRO_LOCK_WAIT_POLL_SEC=1 \
+      MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+      MAESTRO_TEST_STATUS="$state/status.json" \
+      bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify true \
+        --max-iters 1 --max-idle 2 --poll 1
+  ) > "$state/output" 2>&1 3>&1 &
+  pid=$!
+  set +m
+  for _ in $(seq 1 100); do
+    grep -q 'waiting for the write lease' "$state/output" && break
+    sleep 0.05
+  done
+  grep -q 'waiting for the write lease' "$state/output" ||
+    { kill -KILL "$pid" 2>/dev/null || :; echo "contender never waited"; return 1; }
+  kill -TERM "$pid" || return 1
+  wait_bounded "$pid" 8
+  rc=$WAIT_RC
+  status_empty > "$state/status.json"
+  write_lock_release >/dev/null 2>&1 || :
+  [ "$rc" -eq 4 ] || { echo "waiting contender signal rc=$rc want 4"; return 1; }
+  ! grep -q '^cancel ' "$state/calls.log" ||
+    { echo "waiting contender cancelled the active lease owner"; return 1; }
+)
+
 check() {
   local fn="$1" label="$2" detail
   if detail=$("$fn" 2>&1); then
@@ -1063,5 +1137,6 @@ check t15_startup_consumes_dispatch_budget "startup time consumes the hard dispa
 check t16_observed_cancellation_is_terminal "observed write cancellation poisons and cannot redispatch"
 check t17_malformed_status_counts_as_status_loss "malformed nonempty status follows bounded status loss"
 check t18_invalid_polling_args_fail_before_launch "invalid polling args and mixed clear mode fail before launch"
+check t19_waiting_contender_signal_does_not_cancel_owner "waiting contender TERM never cancels the active owner"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

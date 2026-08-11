@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Two regressions introduced alongside the materialized-tree digest.
 set -uo pipefail
-LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hooks/lib-companion.sh"
+LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hooks/lib-write-lease.sh"
 D=$(mktemp -d /tmp/planr.XXXXXX); trap 'rm -rf "$D"' EXIT
 
 echo "== 1. the manual operator check always says something =="

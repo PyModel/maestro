@@ -14,6 +14,7 @@ try { payload = JSON.parse(fs.readFileSync(0, 'utf8')); } catch {}
 const HOME = os.homedir();
 const CONF = path.join(HOME, '.codex', 'config.toml');
 const IMPL_EFFORT = path.join(HOME, '.codex', 'maestro-impl-effort');
+const SCOUT_PIN = path.join(HOME, '.codex', 'maestro-scout');
 const ASK = path.join(HOME, '.maestro', 'ask-on-start');
 
 let preamble = '';
@@ -29,6 +30,16 @@ const debateEffort = pinnedDebateEffort || '(Codex default — not pinned)';
 const hasDispatchPin = Boolean(pinnedModel && pinnedDebateEffort);
 let implEffort = 'medium';
 try { implEffort = fs.readFileSync(IMPL_EFFORT, 'utf8').trim() || 'medium'; } catch {}
+let scout = 'unpinned';
+try {
+  const pin = fs.readFileSync(SCOUT_PIN, 'utf8');
+  const scoutModel = pin.match(/^model=([^\n]+)$/m)?.[1];
+  const scoutEffort = pin.match(/^effort=([^\n]+)$/m)?.[1];
+  if (/^[a-zA-Z0-9._-]+$/.test(scoutModel ?? '') &&
+      /^(none|minimal|low|medium|high|xhigh)$/.test(scoutEffort ?? '')) {
+    scout = `${scoutModel}/${scoutEffort}`;
+  }
+} catch {}
 
 const armed = fs.existsSync(ASK);
 const source = payload.source || 'startup';
@@ -62,7 +73,7 @@ if (armed && source !== 'resume') {
   );
 } else {
   process.stdout.write(
-    `Maestro: Codex pin is model=${model}, debate-effort=${debateEffort}, impl-effort=${implEffort}. ` +
+    `Maestro: Codex pin is model=${model}, debate-effort=${debateEffort}, impl-effort=${implEffort}, scout=${scout}. ` +
     'Say "codex model" to change it before starting work' +
     (armed
       ? '.'

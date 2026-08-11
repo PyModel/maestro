@@ -3,7 +3,8 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LIB="$ROOT/hooks/lib-companion.sh"
+LIB="$ROOT/hooks/lib-write-lease.sh"
+LEASE_LIB="$LIB"
 LOOP="$ROOT/hooks/implementer-loop.sh"
 FAKE="$ROOT/tests/fixtures/fake-companion.mjs"
 REAL_NODE=$(node -p 'process.execPath')
@@ -79,6 +80,44 @@ dead_lock() {  # dir job_id
   printf 'token=old\npid=999999\nprocess_start=dead\njob_id=%s\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\n' \
     "$2" > "$1/.maestro-write.lock/metadata"
 }
+
+# ---------------------------------------------------------------- deep Lease interval interface
+t1() (
+  local dir evidence token inherited_rc
+  dir=$(ws deep_lease_interface)
+  evidence="$dir/evidence"
+  [ -f "$LEASE_LIB" ] || { echo "hooks/lib-write-lease.sh is missing"; return 1; }
+  cd "$dir" || exit 1
+  # shellcheck source=../hooks/lib-write-lease.sh
+  . "$LEASE_LIB"
+  companion_resolve() { printf '%s' "$FAKE"; }
+  progress_init
+  declare -F _write_lease_turn_event >/dev/null ||
+    { echo "private Lease interval lifecycle seam missing"; return 1; }
+  declare -F write_lease_clear >/dev/null ||
+    { echo "operator recovery interface missing"; return 1; }
+  status_empty > "$dir/status.json"
+  export MAESTRO_TEST_STATUS="$dir/status.json"
+  write_lease_begin "$evidence" >/dev/null 2>&1 || return 1
+  [ -f "$dir/.maestro-write.lock/metadata" ] ||
+    { echo "Lease interval metadata missing"; return 1; }
+  token=$(sed -n 's/^token=//p' "$dir/.maestro-write.lock/metadata")
+  [ -n "$token" ] || { echo "Lease interval token missing"; return 1; }
+  env MAESTRO_LOCK_WAIT_SEC=0 MAESTRO_LOCK_ACQUIRED=1 \
+    MAESTRO_LOCK_TOKEN="$token" MAESTRO_LOCK_DIR="$dir/.maestro-write.lock" \
+    LEASE_LIB="$LEASE_LIB" bash -c '
+      set -uo pipefail
+      . "$LEASE_LIB"
+      progress_init
+      write_lease_begin /dev/null
+    ' >/dev/null 2>&1
+  inherited_rc=$?
+  [ "$inherited_rc" -eq 11 ] ||
+    { echo "inherited token fallback rc=$inherited_rc want 11"; return 1; }
+  write_lease_end "$evidence" >/dev/null 2>&1 || return 1
+  [ ! -e "$dir/.maestro-write.lock" ] ||
+    { echo "Lease interval survived safe end"; return 1; }
+)
 
 # ---------------------------------------------------------------- step 2
 # Live dispatcher must block WITHOUT querying the companion.
@@ -757,7 +796,7 @@ t32() (
   now=$(date +%s)
   mkdir -p "$lock"
   printf 'token=stale-writer\npid=%s\nprocess_start=old\njob_id=task-stale-writer\nsession_id=session-stale-writer\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
-    "$$" "$((now - 5))" > "$lock/metadata"
+    99999999 "$((now - 5))" > "$lock/metadata"
   printf 'token=stale-writer\nepoch=%s\n' "$((now - 5))" > "$lock/heartbeat"
   status_running_job task-running-writer true > "$status"
   out=$(run_clear_lease "$dir" "$status" 1 2>&1); rc=$?
@@ -778,7 +817,7 @@ t33() (
   now=$(date +%s)
   mkdir -p "$lock"
   printf 'token=stale-empty\npid=%s\nprocess_start=old\njob_id=task-stale-empty\nsession_id=session-stale-empty\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
-    "$$" "$((now - 5))" > "$lock/metadata"
+    99999999 "$((now - 5))" > "$lock/metadata"
   printf 'token=stale-empty\nepoch=%s\n' "$((now - 5))" > "$lock/heartbeat"
   status_empty > "$status"
   out=$(run_clear_lease "$dir" "$status" 1 2>&1); rc=$?
@@ -880,15 +919,16 @@ t36() (
 # ---------------------------------------------------------------- step 37
 # Repository safety must see writers from every companion session.
 t37() (
-  local dir writers rc; dir=$(ws cross_session_writer)
+  local dir writers="" rc; dir=$(ws cross_session_writer)
   status_running_job task-session-a-writer true > "$dir/status.json"
   cd "$dir" || exit 1
   . "$LIB"
+  companion_resolve() { printf '%s' "$FAKE"; }
   progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   export MAESTRO_TEST_STATUS_SESSION_ID=session-a
   export CODEX_COMPANION_SESSION_ID=session-b
-  writers=$(companion_workspace_writers "$FAKE"); rc=$?
+  write_lock_workspace_writers writers; rc=$?
   [ "$rc" -eq 0 ] || { echo "global status rc=$rc want 0"; return 1; }
   printf '%s\n' "$writers" | awk '$1 == "task-session-a-writer" && $2 == "true" { found = 1 } END { exit !found }' ||
     { echo "session B could not see session A writer: ${writers:-empty}"; return 1; }
@@ -922,13 +962,15 @@ t38() (
 # ---------------------------------------------------------------- step 39
 # A stale heartbeat is not permission to clear a still-live recorded owner.
 t39() (
-  local dir lock status out rc now owner_start; dir=$(ws clear_stale_live_owner)
+  local dir lock status out rc now owner_start ps_shim; dir=$(ws clear_stale_live_owner)
   lock="$dir/.maestro-write.lock"
   status="$dir/status.json"
   now=$(date +%s)
-  owner_start=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$$" 2>/dev/null |
-    sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-  [ -n "$owner_start" ] || { echo "could not read test owner identity"; return 1; }
+  owner_start='Mon Jan  1 00:00:00 2026'
+  ps_shim="$TEST_ROOT/clear-shim"
+  mkdir -p "$ps_shim"
+  printf '#!/bin/sh\nprintf "%%s\\n" %q\n' "$owner_start" > "$ps_shim/ps"
+  chmod +x "$ps_shim/ps"
   mkdir -p "$lock"
   printf 'token=stale-live\npid=%s\nprocess_start=%s\njob_id=task-stale-live\nsession_id=session-stale-live\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
     "$$" "$owner_start" "$((now - 5))" > "$lock/metadata"
@@ -1046,30 +1088,237 @@ t41() (
 # ---------------------------------------------------------------- step 42
 # Repository-global writer parsing accepts valid compact JSON and rejects bad entries.
 t42() (
-  local dir output rc; dir=$(ws compact_writer_status)
+  local dir output result evidence rc; dir=$(ws compact_writer_status)
   cd "$dir" || exit 1
   . "$LIB"
   progress_init
+  companion_resolve() { printf '%s' "$FAKE"; }
+  result="$dir/writers.result"
+  evidence="$dir/writers.evidence"
   printf '%s\n' '{"running":[],"latestFinished":null}' > "$dir/status.json"
   export MAESTRO_TEST_STATUS="$dir/status.json"
-  output=$(companion_workspace_writers "$FAKE"); rc=$?
+  companion_writers "$result" "$evidence"; rc=$?
+  output=$(cat "$result")
   [ "$rc" -eq 0 ] && [ -z "$output" ] ||
     { echo "compact empty status rc=$rc output=${output:-empty}"; return 1; }
 
   printf '%s\n' '{"running":[{"id":"task-compact0-aaaaaa","write":true}],"latestFinished":null}' > "$dir/status.json"
-  output=$(companion_workspace_writers "$FAKE"); rc=$?
+  companion_writers "$result" "$evidence"; rc=$?
+  output=$(cat "$result")
   [ "$rc" -eq 0 ] || { echo "compact writer status rc=$rc"; return 1; }
   [ "$output" = $'task-compact0-aaaaaa\ttrue' ] ||
     { echo "compact writer output=$output"; return 1; }
 
   printf '%s\n' '{"running":[{"id":"task-bad0000-aaaaaa"}]}' > "$dir/status.json"
-  companion_workspace_writers "$FAKE" >/dev/null 2>&1; rc=$?
+  companion_writers "$result" "$evidence" >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 4 ] || { echo "malformed writer entry rc=$rc want 4"; return 1; }
 )
 
+# ---------------------------------------------------------------- step 43
+# Operator recovery removes only the generation it inspected.
+t43() (
+  local dir lock result evidence rc token; dir=$(ws clear_generation_fence)
+  lock="$dir/.maestro-write.lock"
+  result="$dir/clear.result"
+  evidence="$dir/clear.evidence"
+  cd "$dir" || exit 1
+  . "$LEASE_LIB"
+  progress_init
+  mkdir "$lock"
+  printf 'token=first\npid=999999\nprocess_start=dead\njob_id=task-first00-aaaaaa\nsession_id=test\nstarted_epoch=1\nquiescence=unconfirmed\nunconfirmed_job=task-first00-aaaaaa\nunconfirmed_reason=deadline\n' > "$lock/metadata"
+  write_lock_workspace_writers() {
+    printf 'token=second\npid=999999\nprocess_start=dead\njob_id=task-second0-aaaaaa\nsession_id=test\nstarted_epoch=1\nquiescence=unconfirmed\nunconfirmed_job=task-second0-aaaaaa\nunconfirmed_reason=deadline\n' > "$lock/metadata"
+    return 0
+  }
+  write_lease_clear "$result" "$evidence"; rc=$?
+  [ "$rc" -eq 11 ] || { echo "generation change clear rc=$rc want 11"; return 1; }
+  token=$(sed -n 's/^token=//p' "$lock/metadata")
+  [ "$token" = second ] || { echo "new generation was modified"; return 1; }
+  [ ! -d "$lock/.reclaim" ] || { echo "failed clear left generation claim"; return 1; }
+)
+
+# ---------------------------------------------------------------- step 44
+# Poison alone does not authorize clearing a live supervisor generation.
+t44() (
+  local dir lock result evidence start rc; dir=$(ws clear_live_owner)
+  lock="$dir/.maestro-write.lock"
+  result="$dir/clear.result"
+  evidence="$dir/clear.evidence"
+  cd "$dir" || exit 1
+  . "$LEASE_LIB"
+  progress_init
+  mkdir "$lock"
+  start=$(write_lock_process_start "$$")
+  printf 'token=live\npid=%s\nprocess_start=%s\njob_id=task-live0000-aaaaaa\nsession_id=test\nstarted_epoch=1\nquiescence=unconfirmed\nunconfirmed_job=task-live0000-aaaaaa\nunconfirmed_reason=deadline\n' \
+    "$$" "${start:-unavailable}" > "$lock/metadata"
+  write_lock_workspace_writers() { return 0; }
+  write_lease_clear "$result" "$evidence"; rc=$?
+  [ "$rc" -eq 11 ] || { echo "live owner clear rc=$rc want 11"; return 1; }
+  [ -f "$lock/metadata" ] || { echo "live owner generation was removed"; return 1; }
+)
+
+# ---------------------------------------------------------------- review finding 1
+t45_publication_temp_does_not_wedge_steal() (
+  local dir lock rc
+  dir=$(ws publication_temps)
+  lock="$dir/.maestro-write.lock"
+  status_empty > "$dir/status.json"
+  mkdir -p "$lock"
+  printf 'token=old\npid=99999999\nprocess_start=dead\njob_id=task-stale-temp-aaaaaa\nsession_id=test\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' \
+    > "$lock/metadata"
+  : > "$lock/heartbeat.tmp.deadtoken"
+  cd "$dir" || exit 1
+  . "$LIB"
+  companion_resolve() { printf '%s' "$FAKE"; }
+  progress_init
+  export MAESTRO_TEST_STATUS="$dir/status.json"
+  write_lock_acquire task-after-temp-aaaaaa >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ] || { echo "stale temp steal rc=$rc want 0"; return 1; }
+  [ -f "$lock/metadata" ] || { echo "steal left a metadata-less lock"; return 1; }
+  write_lock_release >/dev/null 2>&1
+)
+
+t46_publication_temp_does_not_wedge_release() (
+  local dir lock
+  dir=$(ws release_publication_temp)
+  lock="$dir/.maestro-write.lock"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  write_lock_workspace_writers() { return 0; }
+  write_lock_acquire task-release-temp-aaaaaa >/dev/null 2>&1 || return 1
+  : > "$lock/metadata.tmp.deadtoken"
+  write_lock_release >/dev/null 2>&1
+  [ ! -d "$lock" ] || { echo "publication temp wedged normal release"; return 1; }
+)
+
+# Unknown entries remain a loud release failure.
+t47_unknown_lock_entry_is_not_deleted() (
+  local dir lock
+  dir=$(ws unknown_lock_entry)
+  lock="$dir/.maestro-write.lock"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  write_lock_workspace_writers() { return 0; }
+  write_lock_acquire task-unknown-entry-aaaaaa >/dev/null 2>&1 || return 1
+  : > "$lock/not-a-publication-temp"
+  write_lock_release >/dev/null 2>&1
+  [ -f "$lock/not-a-publication-temp" ] ||
+    { echo "release deleted an unknown lock entry"; return 1; }
+  [ -d "$lock" ] || { echo "release hid the unknown-entry failure"; return 1; }
+)
+
+# ---------------------------------------------------------------- review finding 4
+t48_prelaunch_interrupt_releases_without_poison() (
+  local repo shim marker output plan pid rc count real_git
+  repo="$TEST_ROOT/prelaunch-interrupt-repo"
+  shim="$TEST_ROOT/prelaunch-interrupt-shim"
+  marker="$TEST_ROOT/prelaunch-interrupt.marker"
+  output="$TEST_ROOT/prelaunch-interrupt.output"
+  plan="$repo/plan.md"
+  real_git=$(command -v git)
+  mkdir -p "$repo" "$shim" || return 1
+  git init -q "$repo" || return 1
+  (
+    cd "$repo" || exit 1
+    git config user.email p@p
+    git config user.name p
+    printf 'seed\n' > seed
+    printf 'Objective: interrupt before launch.\n' > plan.md
+    git add seed plan.md
+    git commit -q -m init
+  ) || return 1
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [ "${1:-}" = hash-object ] && [ "${2:-}" = --no-filters ] && [ "${3:-}" = --stdin ]; then' \
+    '  : > "$MAESTRO_TEST_DIGEST_MARKER"' \
+    '  sleep 5' \
+    'fi' \
+    'exec "$MAESTRO_TEST_REAL_GIT" "$@"' > "$shim/git" || return 1
+  chmod +x "$shim/git" || return 1
+  set -m
+  (
+    cd "$repo" &&
+      exec env PATH="$shim:$PATH" MAESTRO_TEST_REAL_GIT="$real_git" \
+        MAESTRO_TEST_DIGEST_MARKER="$marker" MAESTRO_LOCK_WAIT_SEC=0 \
+        bash "$LOOP" --plan "$plan" --verify true --max-iters 1
+  ) > "$output" 2>&1 3>&1 &
+  pid=$!
+  set +m
+  count=0
+  while [ ! -e "$marker" ] && [ "$count" -lt 100 ]; do
+    sleep 0.05
+    count=$((count + 1))
+  done
+  [ -e "$marker" ] ||
+    { kill -KILL "$pid" 2>/dev/null || :; echo "digest window was not reached"; return 1; }
+  kill -TERM "$pid" || return 1
+  wait "$pid"; rc=$?
+  [ "$rc" -eq 4 ] || { echo "prelaunch signal rc=$rc want 4: $(tr '\n' ' ' < "$output")"; return 1; }
+  grep -qx 'MAESTRO_FINAL: LOOP INTERRUPTED rc=4' "$output" ||
+    { echo "INTERRUPTED final missing: $(tr '\n' ' ' < "$output")"; return 1; }
+  ! grep -q 'lease retained' "$output" ||
+    { echo "prelaunch signal falsely claimed retained poison"; return 1; }
+  [ ! -d "$repo/.git/maestro-write.lock" ] ||
+    { echo "prelaunch signal left the lease directory"; return 1; }
+)
+
+# ---------------------------------------------------------------- review finding 7
+t49_digest_recurses_through_nested_repositories() (
+  local repo nested deeper before after
+  repo="$TEST_ROOT/recursive-digest-repo"
+  nested="$repo/nested-a"
+  deeper="$nested/nested-b"
+  git init -q "$repo" || return 1
+  git init -q "$nested" || return 1
+  git init -q "$deeper" || return 1
+  for root in "$repo" "$nested" "$deeper"; do
+    (
+      cd "$root" || exit 1
+      git config user.email p@p
+      git config user.name p
+      printf 'seed\n' > seed
+      git add seed
+      git commit -q -m init
+    ) || return 1
+  done
+  cd "$repo" || exit 1
+  . "$LIB"
+  before=$(repo_digest) || return 1
+  printf 'changed\n' > "$deeper/seed"
+  after=$(repo_digest) || return 1
+  [ "$before" != "$after" ] ||
+    { echo "digest ignored a change in a doubly nested repository"; return 1; }
+)
+
+# ---------------------------------------------------------------- review finding 10
+t50_effective_poison_state_is_shared() (
+  local dir lock metadata selected quiescence
+  dir=$(ws effective_poison)
+  lock="$dir/.maestro-write.lock"
+  metadata="$lock/metadata"
+  mkdir -p "$lock"
+  printf 'token=base\nquiescence=confirmed\n' > "$metadata"
+  cd "$dir" || exit 1
+  . "$LIB"
+  write_lock_effective_poison "$lock" "$metadata" selected quiescence || return 1
+  [ "$selected" = "$metadata" ] && [ "$quiescence" = confirmed ] ||
+    { echo "base poison state path=$selected quiescence=$quiescence"; return 1; }
+  printf 'token=base\nquiescence=unconfirmed\n' > "$lock/metadata.new"
+  write_lock_effective_poison "$lock" "$metadata" selected quiescence || return 1
+  [ "$selected" = "$lock/metadata.new" ] && [ "$quiescence" = unconfirmed ] ||
+    { echo "staged poison state path=$selected quiescence=$quiescence"; return 1; }
+)
+
 printf '=== Plan F green-phase verification ===\n'
-for t in t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t16 t17 \
-  t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 t29 t30 t31 t32 t33 t34 t35 t36 t37 t38 t39 t40 t41 t42; do
+for t in t1 t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t16 t17 \
+  t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 t29 t30 t31 t32 t33 t34 t35 t36 t37 t38 t39 t40 t41 t42 t43 t44 \
+  t45_publication_temp_does_not_wedge_steal \
+  t46_publication_temp_does_not_wedge_release \
+  t47_unknown_lock_entry_is_not_deleted \
+  t48_prelaunch_interrupt_releases_without_poison \
+  t49_digest_recurses_through_nested_repositories \
+  t50_effective_poison_state_is_shared; do
   msg=$($t 2>&1) && ok "$t" || bad "$t" "${msg:-no detail}"
 done
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

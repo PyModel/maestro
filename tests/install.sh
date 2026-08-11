@@ -240,18 +240,32 @@ t10_reinstall_preserves_disabled_session_prompt() {
 }
 
 t11_identical_reinstall_keeps_managed_file_identity() {
-  local home first second hook before after
+  local home first second before after name identity path
   home=$(new_home reinstall-idempotent)
   first="$home/first.out"
   second="$home/second.out"
   printf '{}\n' > "$home/.claude/settings.json"
   run_install "$home" "$first" || { cat "$first"; return 1; }
-  hook="$home/.claude/hooks/lib-companion.sh"
-  before=$(file_identity "$hook") || return 1
+  before=$(
+    for name in lib-process.sh lib-companion.sh lib-write-lease.sh lib-write-turn.sh; do
+      path="$home/.claude/hooks/$name"
+      [ -f "$path" ] || { echo "$name was not installed" >&2; exit 1; }
+      identity=$(file_identity "$path") || exit 1
+      printf '%s=%s\n' "$name" "$identity"
+    done
+  ) || return 1
   sleep 1
   run_install "$home" "$second" || { cat "$second"; return 1; }
-  after=$(file_identity "$hook") || return 1
-  [ "$after" = "$before" ] || { echo "identical reinstall replaced hook ($before -> $after)"; return 1; }
+  after=$(
+    for name in lib-process.sh lib-companion.sh lib-write-lease.sh lib-write-turn.sh; do
+      path="$home/.claude/hooks/$name"
+      [ -f "$path" ] || { echo "$name was not installed" >&2; exit 1; }
+      identity=$(file_identity "$path") || exit 1
+      printf '%s=%s\n' "$name" "$identity"
+    done
+  ) || return 1
+  [ "$after" = "$before" ] ||
+    { echo "identical reinstall replaced a managed library"; return 1; }
 }
 
 t12_late_install_failure_rolls_back_managed_files() {

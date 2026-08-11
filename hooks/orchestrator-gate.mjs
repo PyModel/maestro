@@ -96,10 +96,11 @@ try {
 
   const blockMessage =
     "ORCHESTRATOR GATE (source code): you are the planner/reviewer, not the implementer.\n" +
-    "Write a plan file and dispatch it to Codex instead:\n" +
-    "  bash ~/.claude/hooks/implementer-watchdog.sh --file <plan-file>\n" +
-    "The watchdog appends the implementer contract itself — do not retype it. This is the\n" +
-    "only implementation entry point — do not spawn a subagent to write code either.\n" +
+    "Write a plan file and dispatch it through the autonomous loop:\n" +
+    "  bash ~/.claude/hooks/implementer-loop.sh --plan <plan-file> --verify \"<verify command>\"\n" +
+    "Single-shot fallback: bash ~/.claude/hooks/implementer-watchdog.sh --file <plan-file>\n" +
+    "Both append the implementer contract themselves. These are the only implementation\n" +
+    "entry points — do not spawn a subagent to write code either.\n" +
     "Details: ~/.claude/rules/orchestrator-implementer.md\n" +
     "If Codex is unreachable or the change is genuinely trivial, STOP and ask the user\n" +
     'whether you may edit it directly ("edit it yourself" opens this gate for the task).';

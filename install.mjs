@@ -28,11 +28,12 @@ const withWorkflow = cliArgs.includes('--with-workflow');
 
 const HOOK_FILES = [
   'orchestrator-inject.mjs', 'orchestrator-gate.mjs', 'maestro-policy.mjs', 'session-start.mjs',
-  'implementer-watchdog.sh', 'implementer-loop.sh', 'discussion-loop.sh',
-  'lib-companion.sh', 'codex-model-select.sh', 'codex-mcp-check.sh',
+  'implementer-watchdog.sh', 'implementer-loop.sh', 'discussion-loop.sh', 'scout.sh',
+  'lib-process.sh', 'lib-job-lock.sh', 'lib-companion.sh', 'lib-write-lease.sh', 'lib-write-turn.sh',
+  'codex-model-select.sh', 'codex-mcp-check.sh',
 ];
 const EXECUTABLE_HOOKS = new Set([
-  'implementer-watchdog.sh', 'implementer-loop.sh', 'discussion-loop.sh',
+  'implementer-watchdog.sh', 'implementer-loop.sh', 'discussion-loop.sh', 'scout.sh',
   'codex-model-select.sh', 'codex-mcp-check.sh',
 ]);
 

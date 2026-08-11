@@ -158,6 +158,127 @@ EOF
   [ "$retries" -eq 2 ] || { echo "retry messages=$retries want 2"; return 1; }
 }
 
+t5_signal_cancels_and_pending_turn_recovers() {
+  local repo turn output calls job_log pid rc transcript retry_out i=0
+  repo="$TEST_ROOT/signal-repo"
+  new_repo "$repo"
+  run_new "$repo" signal "$TEST_ROOT/signal-new.out" || return 1
+  transcript=$(transcript_from "$TEST_ROOT/signal-new.out")
+  turn="$TEST_ROOT/signal-turn.md"
+  output="$TEST_ROOT/signal-turn.out"
+  calls="$TEST_ROOT/signal-calls.log"
+  job_log="$TEST_ROOT/signal-job.log"
+  retry_out="$TEST_ROOT/signal-retry.out"
+  printf 'interrupt this read turn\n' > "$turn"
+  : > "$calls"
+  : > "$job_log"
+  (
+    cd "$repo" || exit 1
+    exec env HOME="$HOME_DIR" PATH="$TEST_PATH" \
+      MAESTRO_TEST_CALL_LOG="$calls" \
+      MAESTRO_TEST_JOB_PHASE=running \
+      MAESTRO_TEST_LOGFILE="$job_log" \
+      MAESTRO_TEST_STATUS="$TEST_ROOT/status.json" \
+      bash "$DISCUSSION" --turn "$turn" signal 30 1
+  ) > "$output" 2>&1 &
+  pid=$!
+  while ! grep -q '^CODEX: started task-fake0000-aaaaaa ' "$output" 2>/dev/null &&
+    [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$i" -lt 50 ] || { echo "read turn never started"; return 1; }
+  kill -TERM "$pid" 2>/dev/null || return 1
+  wait "$pid"
+  rc=$?
+  [ "$rc" -eq 4 ] || { echo "signal rc=$rc want 4"; return 1; }
+  [ "$(grep -c '^cancel task-fake0000-aaaaaa$' "$calls" || true)" -eq 1 ] ||
+    { echo "signal did not cancel exactly once"; return 1; }
+  [ ! -d "$transcript.lock" ] || { echo "signal left transcript lock"; return 1; }
+  grep -q '^awaiting_reply=1$' "$transcript.state" ||
+    { echo "signal did not leave recoverable pending state"; return 1; }
+  run_turn "$repo" "$turn" signal $'STANCE: AGREE\nCONTINUE' "$retry_out" ||
+    { cat "$retry_out"; return 1; }
+  [ "$(grep -c '^### Claude (turn ' "$transcript")" -eq 1 ] ||
+    { echo "pending turn recovery duplicated the Claude turn"; return 1; }
+  [ "$(grep -c '^### Codex (turn ' "$transcript")" -eq 1 ] ||
+    { echo "recovered turn did not persist exactly one reply"; return 1; }
+}
+
+t6_signal_during_retry_cancels_current_job() {
+  local repo turn output calls task_ids phases pid rc i=0
+  repo="$TEST_ROOT/retry-signal-repo"
+  new_repo "$repo"
+  run_new "$repo" retry-signal "$TEST_ROOT/retry-signal-new.out" || return 1
+  turn="$TEST_ROOT/retry-signal-turn.md"
+  output="$TEST_ROOT/retry-signal-turn.out"
+  calls="$TEST_ROOT/retry-signal-calls.log"
+  task_ids="$TEST_ROOT/retry-signal-task-ids"
+  phases="$TEST_ROOT/retry-signal-phases"
+  printf 'interrupt the retried read turn\n' > "$turn"
+  printf 'task-oldretry-aaaaaa\ntask-newretry-bbbbbb\n' > "$task_ids"
+  printf 'failed\nfailed\nrunning\nrunning\nrunning\n' > "$phases"
+  : > "$calls"
+  (
+    cd "$repo" || exit 1
+    exec env HOME="$HOME_DIR" PATH="$TEST_PATH" \
+      MAESTRO_DISCUSSION_RETRIES=1 \
+      MAESTRO_RETRY_SLEEP=0 \
+      MAESTRO_TEST_CALL_LOG="$calls" \
+      MAESTRO_TEST_TASK_ID_FILE="$task_ids" \
+      MAESTRO_TEST_JOB_PHASE_FILE="$phases" \
+      MAESTRO_TEST_STATUS="$TEST_ROOT/status.json" \
+      bash "$DISCUSSION" --turn "$turn" retry-signal 30 1
+  ) > "$output" 2>&1 &
+  pid=$!
+  while ! grep -q '^CODEX: started task-newretry-bbbbbb ' \
+    "$output" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  if [ "$i" -ge 100 ]; then
+    kill -KILL "$pid" 2>/dev/null || :
+    echo "retried read turn never started: $(tr '\n' ' ' < "$output")"
+    return 1
+  fi
+  kill -TERM "$pid" 2>/dev/null || return 1
+  wait "$pid"
+  rc=$?
+  [ "$rc" -eq 4 ] || { echo "retry signal rc=$rc want 4"; return 1; }
+  [ "$(grep -c '^cancel task-newretry-bbbbbb$' "$calls" || true)" -eq 1 ] ||
+    { echo "signal did not cancel the current retried job"; return 1; }
+  [ "$(grep -c '^cancel task-oldretry-aaaaaa$' "$calls" || true)" -eq 0 ] ||
+    { echo "signal cancelled the stale prior job"; return 1; }
+}
+
+t7_pre_dispatch_failure_is_terminal() {
+  local repo turn output calls rc starts retries
+  repo="$TEST_ROOT/pre-dispatch-failure-repo"
+  new_repo "$repo"
+  run_new "$repo" pre-dispatch "$TEST_ROOT/pre-dispatch-new.out" || return 1
+  turn="$TEST_ROOT/pre-dispatch-turn.md"
+  output="$TEST_ROOT/pre-dispatch-turn.out"
+  calls="$TEST_ROOT/pre-dispatch-calls.log"
+  printf 'do not retry a launch failure\n' > "$turn"
+  : > "$calls"
+  (
+    cd "$repo" || exit 1
+    env HOME="$HOME_DIR" PATH="$TEST_PATH" \
+      MAESTRO_DISCUSSION_RETRIES=2 \
+      MAESTRO_RETRY_SLEEP=0 \
+      MAESTRO_TEST_CALL_LOG="$calls" \
+      MAESTRO_TEST_TASK_EXIT=9 \
+      MAESTRO_TEST_STATUS="$TEST_ROOT/status.json" \
+      bash "$DISCUSSION" --turn "$turn" pre-dispatch 30 1
+  ) > "$output" 2>&1
+  rc=$?
+  starts=$(grep -c '^task ' "$calls" || true)
+  retries=$(grep -c '^DISCUSSION_RETRY:' "$output" || true)
+  [ "$rc" -eq 3 ] || { echo "launch failure rc=$rc want 3"; return 1; }
+  [ "$starts" -eq 1 ] || { echo "launch attempts=$starts want 1"; return 1; }
+  [ "$retries" -eq 0 ] || { echo "pre-dispatch retries=$retries want 0"; return 1; }
+}
+
 check() {
   local fn="$1" label="$2" detail
   if detail=$("$fn" 2>&1); then ok "$label"; else bad "$label" "${detail:-no detail}"; fi
@@ -168,5 +289,8 @@ check t1_workspace_keys_do_not_collide "workspace transcript keys are collision-
 check t2_content_headings_do_not_control_rounds_and_last_marker_wins "content headings are inert and last terminal marker wins"
 check t3_dead_discussion_lock_is_reclaimed "dead discussion locks are safely reclaimed"
 check t4_status_loss_uses_configured_read_only_retries "read-only status loss consumes configured retries"
+check t5_signal_cancels_and_pending_turn_recovers "read-turn signal cancels once and pending transcript recovers"
+check t6_signal_during_retry_cancels_current_job "retry signal cancels only the current read job"
+check t7_pre_dispatch_failure_is_terminal "pre-dispatch failure exits 3 without retry"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -2,7 +2,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LIB="$ROOT/hooks/lib-companion.sh"
+LIB="$ROOT/hooks/lib-write-lease.sh"
 TEST_ROOT=$(mktemp -d /tmp/maestro-provenance-edge.XXXXXXXX)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 

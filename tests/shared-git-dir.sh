@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LIB="$ROOT/hooks/lib-companion.sh"
+LIB="$ROOT/hooks/lib-write-lease.sh"
 bash -n "$LIB" || { echo "VERIFY FAIL: syntax"; exit 1; }
 
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT

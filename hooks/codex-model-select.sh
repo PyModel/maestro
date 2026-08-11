@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Maestro Codex model + debate/implementation effort selector.
 # Pins top-level model settings in ~/.codex/config.toml and keeps the
-# implementation effort in ~/.codex/maestro-impl-effort.
+# implementation effort in ~/.codex/maestro-impl-effort and the scout pin in
+# ~/.codex/maestro-scout.
 #
 # Usage:
 #   codex-model-select.sh --show
 #   codex-model-select.sh --pin
+#   codex-model-select.sh --scout <model> <effort>
+#   codex-model-select.sh --scout-pin
 #   codex-model-select.sh <model> <debate-effort> [impl-effort]
 #   codex-model-select.sh --ask-on-start on|off|status
 #
@@ -16,6 +19,7 @@ set -uo pipefail
 
 CODEX_CONF="$HOME/.codex/config.toml"
 IMPL_EFFORT_FILE="$HOME/.codex/maestro-impl-effort"
+SCOUT_FILE="$HOME/.codex/maestro-scout"
 MAESTRO_DIR="$HOME/.maestro"
 ASK_FLAG="$MAESTRO_DIR/ask-on-start"
 PIN_LOCK="$HOME/.codex/maestro-pin.lock"
@@ -118,6 +122,51 @@ valid_impl_effort() {
   esac
 }
 
+valid_model() {
+  [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]]
+}
+
+read_scout_pin() { # model-variable effort-variable
+  local model_value="" effort_value=""
+  if [ -f "$SCOUT_FILE" ]; then
+    model_value=$(sed -n 's/^model=//p' "$SCOUT_FILE" | head -1)
+    effort_value=$(sed -n 's/^effort=//p' "$SCOUT_FILE" | head -1)
+  fi
+  printf -v "$1" '%s' "$model_value"
+  printf -v "$2" '%s' "$effort_value"
+}
+
+scout_pin_valid() { # model effort
+  local first second lines
+  [ -f "$SCOUT_FILE" ] || return 1
+  first=$(sed -n '1p' "$SCOUT_FILE")
+  second=$(sed -n '2p' "$SCOUT_FILE")
+  lines=$(wc -l < "$SCOUT_FILE" | tr -d '[:space:]')
+  [ "$lines" = 2 ] && [ "$first" = "model=$1" ] &&
+    [ "$second" = "effort=$2" ] && valid_model "$1" &&
+    valid_impl_effort "$2"
+}
+
+scout_pin() {
+  local model effort howto='codex-model-select.sh --scout <model> <effort>'
+  if [ ! -f "$SCOUT_FILE" ]; then
+    echo "SELECT_ERROR: scout pin is missing; pin with: $howto" >&2
+    return 3
+  fi
+  read_scout_pin model effort
+  if ! scout_pin_valid "$model" "$effort"; then
+    if [ -n "$model" ] && ! valid_model "$model"; then
+      echo "SELECT_ERROR: invalid scout model '$model'; pin with: $howto" >&2
+    elif [ -n "$effort" ] && ! valid_impl_effort "$effort"; then
+      echo "SELECT_ERROR: invalid scout effort '$effort' (expected: none | minimal | low | medium | high | xhigh); pin with: $howto" >&2
+    else
+      echo "SELECT_ERROR: malformed scout pin; pin with: $howto" >&2
+    fi
+    return 3
+  fi
+  printf '%s\t%s\n' "$model" "$effort"
+}
+
 # TOML tables may be indented. Multiline strings are copied/scanned without
 # treating their contents as keys or table headers.
 read_pin() {
@@ -170,7 +219,7 @@ read_impl_effort() {
 }
 
 show() {
-  local M E I
+  local M E I SM SE
   read_pin M E || return 3
   read_impl_effort I
   echo "model=${M:-(not pinned — Codex default)}"
@@ -180,6 +229,16 @@ show() {
     echo "effort=${E:-(not pinned — Codex default)}"
   fi
   echo "impl-effort=$I"
+  if [ ! -f "$SCOUT_FILE" ]; then
+    echo "scout=(not pinned — scout dispatch disabled)"
+  else
+    read_scout_pin SM SE
+    if scout_pin_valid "$SM" "$SE"; then
+      echo "scout=$SM/$SE"
+    else
+      echo "scout=${SM:-?}/${SE:-?} (invalid)"
+    fi
+  fi
   if [ -f "$ASK_FLAG" ]; then echo "ask-on-start=on"; else echo "ask-on-start=off"; fi
 }
 
@@ -331,6 +390,17 @@ publish_pin() { # model debate-effort impl-effort
   return 0
 }
 
+publish_scout_pin() { # model effort
+  local tmp="$SCOUT_FILE.mtmp.$$"
+  mkdir -p "$HOME/.codex" || return 3
+  if ! printf 'model=%s\neffort=%s\n' "$1" "$2" > "$tmp" ||
+    ! chmod 600 "$tmp" || ! mv -f "$tmp" "$SCOUT_FILE"; then
+    rm -f "$tmp" 2>/dev/null || :
+    echo "SELECT_ERROR: could not publish scout pin" >&2
+    return 3
+  fi
+}
+
 case "${1:-}" in
   --show)
     pin_lock_acquire || exit 3
@@ -340,6 +410,25 @@ case "${1:-}" in
     pin_lock_acquire || exit 3
     pin
     exit $? ;;
+  --scout-pin)
+    [ "$#" -eq 1 ] || { echo "usage: codex-model-select.sh --scout-pin" >&2; exit 3; }
+    pin_lock_acquire || exit 3
+    scout_pin
+    exit $? ;;
+  --scout)
+    [ "$#" -eq 3 ] || { echo "usage: codex-model-select.sh --scout <model> <effort>" >&2; exit 3; }
+    pin_lock_acquire || exit 3
+    if ! valid_model "$2"; then
+      echo "SELECT_ERROR: invalid scout model '$2' (expected letters, digits, . _ -)" >&2
+      exit 3
+    fi
+    if ! valid_impl_effort "$3"; then
+      echo "SELECT_ERROR: invalid scout effort '$3' (expected: none | minimal | low | medium | high | xhigh)" >&2
+      exit 3
+    fi
+    publish_scout_pin "$2" "$3" || exit 3
+    echo "SELECT: scout pin updated → model=$2 effort=$3 (applies from the next scout dispatch)"
+    exit 0 ;;
   --ask-on-start)
     case "${2:-}" in
       on)  mkdir -p "$MAESTRO_DIR" && : > "$ASK_FLAG" && echo "ask-on-start=on — the setup prompt fires at each new session" ;;
@@ -349,7 +438,7 @@ case "${1:-}" in
     esac
     exit $? ;;
   ""|--help|-h)
-    echo "usage: codex-model-select.sh --show | --pin | <model> <debate-effort> [impl-effort] | --ask-on-start on|off|status" >&2
+    echo "usage: codex-model-select.sh --show | --pin | --scout <model> <effort> | --scout-pin | <model> <debate-effort> [impl-effort] | --ask-on-start on|off|status" >&2
     exit 3 ;;
 esac
 
@@ -362,7 +451,7 @@ else
   read_impl_effort IMPL_EFFORT
 fi
 
-if ! [[ "$MODEL" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+if ! valid_model "$MODEL"; then
   echo "SELECT_ERROR: invalid model name '$MODEL' (expected e.g. gpt-5.6-sol — letters, digits, . _ -)" >&2
   exit 3
 fi
