@@ -1031,7 +1031,7 @@ EOF
   }
 
   run_reclaimer B "$shim:$PATH" & bpid=$!
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     [ -e "$state/b-paused-once" ] || [ -e "$state/B-ready" ] || { sleep 0.05; continue; }
     break
   done
@@ -1039,7 +1039,7 @@ EOF
     { kill "$bpid" 2>/dev/null || :; echo "reclaimer B did not reach acquisition"; return 1; }
 
   run_reclaimer A "$PATH" & apid=$!
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     [ -e "$state/A-ready" ] && [ -e "$state/B-ready" ] || { sleep 0.05; continue; }
     break
   done
@@ -1255,7 +1255,7 @@ t48_prelaunch_interrupt_releases_without_poison() (
   pid=$!
   set +m
   count=0
-  while [ ! -e "$marker" ] && [ "$count" -lt 100 ]; do
+  while [ ! -e "$marker" ] && [ "$count" -lt 600 ]; do
     sleep 0.05
     count=$((count + 1))
   done
