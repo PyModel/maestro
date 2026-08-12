@@ -1211,14 +1211,23 @@ t47_unknown_lock_entry_is_not_deleted() (
 
 # ---------------------------------------------------------------- review finding 4
 t48_prelaunch_interrupt_releases_without_poison() (
-  local repo shim marker output plan pid rc count real_git
+  local repo shim marker output plan pid rc count real_git t48_home node_shim companion status
   repo="$TEST_ROOT/prelaunch-interrupt-repo"
   shim="$TEST_ROOT/prelaunch-interrupt-shim"
   marker="$TEST_ROOT/prelaunch-interrupt.marker"
   output="$TEST_ROOT/prelaunch-interrupt.output"
   plan="$repo/plan.md"
+  t48_home="$TEST_ROOT/prelaunch-interrupt-home"
+  node_shim="$TEST_ROOT/prelaunch-interrupt-node-shim"
+  companion="$t48_home/.claude/plugins/cache/openai-codex/codex/test/scripts/codex-companion.mjs"
+  status="$TEST_ROOT/prelaunch-interrupt-status.json"
   real_git=$(command -v git)
-  mkdir -p "$repo" "$shim" || return 1
+  mkdir -p "$repo" "$shim" "$node_shim" "$(dirname "$companion")" || return 1
+  ln -sf "$FAKE" "$companion" || return 1
+  printf '#!/usr/bin/env bash\nif [ "${1:-}" = "-e" ]; then exec %q "$@"; fi\nshift\nexec %q %q "$@"\n' \
+    "$REAL_NODE" "$REAL_NODE" "$FAKE" > "$node_shim/node" || return 1
+  chmod +x "$node_shim/node" || return 1
+  status_empty > "$status"
   git init -q "$repo" || return 1
   (
     cd "$repo" || exit 1
@@ -1239,8 +1248,8 @@ t48_prelaunch_interrupt_releases_without_poison() (
   set -m
   (
     cd "$repo" &&
-      exec env PATH="$shim:$PATH" MAESTRO_TEST_REAL_GIT="$real_git" \
-        MAESTRO_TEST_DIGEST_MARKER="$marker" MAESTRO_LOCK_WAIT_SEC=0 \
+      exec env HOME="$t48_home" PATH="$shim:$node_shim:$PATH" MAESTRO_TEST_REAL_GIT="$real_git" \
+        MAESTRO_TEST_DIGEST_MARKER="$marker" MAESTRO_TEST_STATUS="$status" MAESTRO_LOCK_WAIT_SEC=0 \
         bash "$LOOP" --plan "$plan" --verify true --max-iters 1
   ) > "$output" 2>&1 3>&1 &
   pid=$!
