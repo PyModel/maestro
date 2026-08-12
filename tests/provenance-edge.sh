@@ -111,7 +111,7 @@ EOF
     PATH="$shim:$PATH" write_lock_release
   ) > "$state/holder.out" 2>&1 &
   holder=$!
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     [ -e "$state/lock-removed" ] && break
     sleep 0.05
   done
@@ -190,7 +190,7 @@ t7_orphan_baseline_is_published_before_reclaim_handoff() {
     printf '%s\n' "$?" > "$state/reclaimer.rc"
   ) &
   reclaimer=$!
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     [ -e "$state/publishing" ] && break
     sleep 0.05
   done

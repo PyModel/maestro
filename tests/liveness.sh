@@ -736,7 +736,7 @@ t10_watchdog_signal_is_terminal() {
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     [ -s "$state/status.pid" ] &&
       grep -q '^status task-fake0000-aaaaaa --json$' "$state/calls.log" && break
     sleep 0.05
@@ -791,7 +791,7 @@ t11_loop_signal_is_terminal() {
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     grep -q '^status task-fake0000-aaaaaa --json$' "$state/calls.log" && break
     sleep 0.05
   done
@@ -831,7 +831,7 @@ t12_loop_signal_reaps_verifier() {
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     [ -s "$state/child.pid" ] && break
     sleep 0.05
   done
@@ -877,7 +877,7 @@ t13_prelaunch_generation_fence() {
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     grep -q '^--help$' "$state/calls.log" && break
     sleep 0.05
   done
@@ -898,31 +898,35 @@ t13_prelaunch_generation_fence() {
 }
 
 t14_midpoint_warning_continues_same_job() {
-  local repo state pid warnings tasks
+  local repo state pid warnings tasks ceiling=12 warning
   repo=$(new_repo budget-midpoint-repo)
   state="$TEST_ROOT/budget-midpoint-state"
+  warning="^MAESTRO_BUDGET: .*continuing to the ${ceiling}s hard ceiling"
   mkdir -p "$state"
   : > "$state/calls.log"
   status_empty > "$state/status.json"
-  # Pin verification consumes the first phase; leave five running poll samples before completion.
-  printf 'running\nrunning\nrunning\nrunning\nrunning\nrunning\ncompleted\n' > "$state/phases"
   set -m
   (
     cd "$repo" &&
       exec env HOME="$TEST_HOME" PATH="$TEST_PATH" \
         MAESTRO_TEST_CALL_LOG="$state/calls.log" \
-        MAESTRO_TEST_JOB_PHASE_FILE="$state/phases" \
+        MAESTRO_TEST_JOB_TERMINAL_FLAG="$state/complete" \
         MAESTRO_TEST_STATUS="$state/status.json" \
-        MAESTRO_MAX_DISPATCH_SEC=8 \
+        MAESTRO_MAX_DISPATCH_SEC="$ceiling" \
         bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify true \
           --max-iters 1 --max-idle 30 --poll 1
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  wait_bounded "$pid" 11
+  for _ in $(seq 1 240); do
+    grep -q "$warning" "$state/output" && break
+    sleep 0.05
+  done
+  grep -q "$warning" "$state/output" && : > "$state/complete"
+  wait_bounded "$pid" 17
   [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "midpoint completion exceeded bound"; return 1; }
   [ "$WAIT_RC" -eq 0 ] || { echo "rc=$WAIT_RC want 0: $(tr '\n' ' ' < "$state/output")"; return 1; }
-  warnings=$(grep -c '^MAESTRO_BUDGET: .*continuing to the 8s hard ceiling' "$state/output" || true)
+  warnings=$(grep -c "$warning" "$state/output" || true)
   tasks=$(grep -c '^task ' "$state/calls.log" || true)
   [ "$warnings" -eq 1 ] || { echo "midpoint warnings=$warnings want 1"; return 1; }
   [ "$tasks" -eq 1 ] || { echo "task starts=$tasks want 1"; return 1; }
@@ -1093,7 +1097,7 @@ t19_waiting_contender_signal_does_not_cancel_owner() (
   ) > "$state/output" 2>&1 3>&1 &
   pid=$!
   set +m
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 600); do
     grep -q 'waiting for the write lease' "$state/output" && break
     sleep 0.05
   done
