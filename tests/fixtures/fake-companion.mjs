@@ -72,7 +72,7 @@ if (command === "task") {
       `${Date.now()}\t${taskId}\n`
     );
   }
-  console.log(`Started ${taskId}`);
+  console.log(process.env.MAESTRO_TEST_TASK_RESPONSE_RAW ?? `Started ${taskId}`);
   const delay = Number(process.env.MAESTRO_TEST_TASK_DELAY ?? "0");
   if (delay > 0) {
     await new Promise((resolve) => setTimeout(resolve, delay * 1000));
@@ -130,7 +130,7 @@ if (command === "status" && args.at(-1) === "--json") {
         process.env.MAESTRO_TEST_JOB_PHASE_FILE,
         process.env.MAESTRO_TEST_JOB_PHASE ?? "completed"
       );
-  const value = {
+  const job = {
     id: args[0],
     status,
     phase: status === "running" ? "running" : "done",
@@ -139,15 +139,30 @@ if (command === "status" && args.at(-1) === "--json") {
     request: { model: "gpt-5.6-sol", effort: "high" }
   };
   if (process.env.MAESTRO_TEST_LOGFILE) {
-    value.logFile = process.env.MAESTRO_TEST_LOGFILE;
+    job.logFile = process.env.MAESTRO_TEST_LOGFILE;
   }
-  console.log(JSON.stringify(value));
+  console.log(JSON.stringify({ workspaceRoot: process.cwd(), job }));
   process.exit(Number(process.env.MAESTRO_TEST_JOB_STATUS_EXIT ?? "0"));
 }
 
 if (command === "result") {
+  if (process.env.MAESTRO_TEST_MUTATE_JOB_LOCK_METADATA) {
+    const metadata = process.env.MAESTRO_TEST_MUTATE_JOB_LOCK_METADATA;
+    const value = fs.readFileSync(metadata, "utf8");
+    fs.writeFileSync(
+      metadata,
+      value.replace(/^token=.*$/m, "token=foreign-release"),
+      "utf8"
+    );
+  }
   appendCall(`result ${args.join(" ")}`);
-  console.log(process.env.MAESTRO_TEST_RESULT ?? "RESULT: DONE");
+  const result = process.env.MAESTRO_TEST_RESULT_FILE
+    ? fs.readFileSync(process.env.MAESTRO_TEST_RESULT_FILE, "utf8")
+    : process.env.MAESTRO_TEST_RESULT ?? "RESULT: DONE";
+  if (process.env.MAESTRO_TEST_RESULT_STDERR) {
+    console.error(process.env.MAESTRO_TEST_RESULT_STDERR);
+  }
+  console.log(result);
   process.exit(Number(process.env.MAESTRO_TEST_RESULT_EXIT ?? "0"));
 }
 

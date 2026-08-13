@@ -44,7 +44,7 @@ mkrepo() {
     && printf 'ORIGINAL untracked\n' > u.sh \
     && git add s.sh && git commit -q -m init )
 }
-dispatch() { ( cd "$1" && bash "$LOOP" --plan "$D/plan.md" --verify true --max-iters 1 ) 2>&1; }
+dispatch() { ( cd "$1" && bash "$LOOP" --plan "$D/plan.md" --verify true --max-iters 1 --max-idle 2 --poll 1 ) 2>&1; }
 
 # ---- 1. tracked mutation between two dispatches is reported at the SECOND acquisition
 mkrepo "$D/r1"
@@ -93,8 +93,5 @@ for O in "$O2" "$O3" "$O4"; do
   [ "$TRAIL" = "0" ] || { echo "VERIFY FAIL(6): $TRAIL lines after sentinel"; exit 1; }
 done
 
-# ---- 7. regressions
-bash "$ROOT/tests/lease.sh" 2>&1 | tail -1 | grep -qE '[1-9][0-9]* passed, 0 failed' || { echo "VERIFY FAIL(7): lease suite"; exit 1; }
-bash "$ROOT/tests/shared-git-dir.sh" 2>&1 | tail -1 | grep -q 'VERIFY PASS' || { echo "VERIFY FAIL(7): planJ"; exit 1; }
 
 echo "VERIFY PASS: gap detected at acquisition (tracked + untracked content), reported before dispatch, no tautological clean, no false gap, ignored out of scope, sentinel intact"

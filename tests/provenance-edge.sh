@@ -73,13 +73,14 @@ t3_untracked_nested_repository_is_observed() {
 }
 
 t4_release_publishes_baseline_before_handoff() {
-  local repo state shim real_rmdir lock holder contender_out
+  local repo state shim real_mv lock holder contender_out contender_rc
+  local handoff_out handoff_rc
   repo=$(new_repo release-handoff)
   repo=$(cd "$repo" && pwd -P)
   state="$TEST_ROOT/release-handoff-state"
   shim="$state/shim"
   lock="$repo/.git/maestro-write.lock"
-  real_rmdir=$(command -v rmdir)
+  real_mv=$(command -v mv)
   mkdir -p "$shim"
   # Establish a prior completed baseline.
   (
@@ -90,17 +91,21 @@ t4_release_publishes_baseline_before_handoff() {
     write_lock_acquire task-baseline >/dev/null 2>&1 || exit 1
     write_lock_release >/dev/null 2>&1
   ) || return 1
-  cat > "$shim/rmdir" <<EOF
+  cat > "$shim/mv" <<EOF
 #!/usr/bin/env bash
-"$real_rmdir" "\$@"
+"$real_mv" "\$@"
 rc=\$?
 if [ "\$rc" -eq 0 ] && [ "\${1:-}" = "$lock" ]; then
-  : > "$state/lock-removed"
-  while [ ! -e "$state/contender-done" ]; do sleep 0.05; done
+  case "\${2:-}" in
+    "$lock".reclaim.*)
+      : > "$state/lock-moved"
+      while [ ! -e "$state/allow-release" ]; do sleep 0.05; done
+      ;;
+  esac
 fi
 exit "\$rc"
 EOF
-  chmod +x "$shim/rmdir"
+  chmod +x "$shim/mv"
   (
     cd "$repo" || exit 1
     . "$LIB"
@@ -112,21 +117,43 @@ EOF
   ) > "$state/holder.out" 2>&1 &
   holder=$!
   for _ in $(seq 1 600); do
-    [ -e "$state/lock-removed" ] && break
+    [ -e "$state/lock-moved" ] && break
     sleep 0.05
   done
-  [ -e "$state/lock-removed" ] || { kill "$holder" 2>/dev/null || :; echo "holder never removed lock"; return 1; }
+  [ -e "$state/lock-moved" ] ||
+    { kill "$holder" 2>/dev/null || :; echo "holder never moved the released generation"; return 1; }
   contender_out=$(
     cd "$repo" || exit 1
     . "$LIB"
     progress_init
+    export MAESTRO_LOCK_WAIT_SEC=0
     write_lock_workspace_writers() { return 0; }
-    write_lock_acquire task-contender 3>&1 >/dev/null 2>&1
+    write_lock_acquire task-gated-contender 3>&1 >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -ne 0 ] || write_lock_release >/dev/null 2>&1
+    exit "$rc"
   )
-  : > "$state/contender-done"
+  contender_rc=$?
+  : > "$state/allow-release"
   wait "$holder" || return 1
-  if printf '%s\n' "$contender_out" | grep -q 'BASELINE GAP'; then
-    echo "contender observed a false gap during release handoff: $contender_out"
+  [ "$contender_rc" -eq 11 ] ||
+    { echo "contender rc=$contender_rc bypassed the release generation gate: $contender_out"; return 1; }
+  handoff_out=$(
+    cd "$repo" || exit 1
+    . "$LIB"
+    progress_init
+    export MAESTRO_LOCK_WAIT_SEC=0
+    write_lock_workspace_writers() { return 0; }
+    write_lock_acquire task-handoff-contender 3>&1 >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -ne 0 ] || write_lock_release >/dev/null 2>&1
+    exit "$rc"
+  )
+  handoff_rc=$?
+  [ "$handoff_rc" -eq 0 ] ||
+    { echo "handoff contender rc=$handoff_rc: $handoff_out"; return 1; }
+  if printf '%s\n' "$handoff_out" | grep -q 'BASELINE GAP'; then
+    echo "contender observed a false gap after release handoff: $handoff_out"
     return 1
   fi
 }
@@ -170,11 +197,14 @@ t6_provenance_append_never_follows_symlink() {
 
 t7_orphan_baseline_is_published_before_reclaim_handoff() {
   local repo lock state reclaimer contender_rc
+  local generation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   repo=$(new_repo orphan-handoff)
   lock="$repo/.git/maestro-write.lock"
   state="$TEST_ROOT/orphan-handoff-state"
   mkdir -p "$lock" "$state"
-  printf 'token=orphan-token\npid=999999\nprocess_start=dead\njob_id=task-orphan-old\nsession_id=orphan-session\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' > "$lock/metadata"
+  printf '%s\n' "$generation" > "$lock/generation"
+  printf 'token=orphan-token\ngeneration=%s\npid=999999\nprocess_start=dead\njob_id=task-orphan-old\nsession_id=orphan-session\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' \
+    "$generation" > "$lock/metadata"
   (
     cd "$repo" || exit 1
     . "$LIB"

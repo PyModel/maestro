@@ -36,8 +36,20 @@ maestro_interrupt() {
 }
 
 cleanup() {
+  local release_rc=0
   trap - EXIT HUP INT TERM
-  write_lease_end "${EVIDENCE_FILE:-/dev/null}" || :
+  write_lease_end "${EVIDENCE_FILE:-/dev/null}"
+  release_rc=$?
+  if [ "$release_rc" -ne 0 ]; then
+    case "$FINAL_RC" in
+      11|125) ;;
+      *)
+        FINAL_STATE=BLOCKED
+        FINAL_RC=11
+        progress "WATCHDOG_RELEASE: completion downgraded to BLOCKED because the write lease could not be released safely"
+        ;;
+    esac
+  fi
   [ -z "$WORK" ] || rm -rf "$WORK" 2>/dev/null || :
   progress "MAESTRO_FINAL: WATCHDOG $FINAL_STATE rc=$FINAL_RC"
   exit "$FINAL_RC"

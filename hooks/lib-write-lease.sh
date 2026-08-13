@@ -20,9 +20,11 @@ _MAESTRO_WRITE_LEASE_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # proof that this shell owns the repository write interval.
 MAESTRO_LOCK_TOKEN=""
 MAESTRO_LOCK_DIR=""
+MAESTRO_LOCK_IDENTITY=""
 MAESTRO_LOCK_ACQUIRED=0
 _MAESTRO_WRITE_LEASE_RETAIN=0
-export -n MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_ACQUIRED 2>/dev/null || :
+export -n MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_IDENTITY \
+  MAESTRO_LOCK_ACQUIRED 2>/dev/null || :
 repo_digest() {
   local inside worktrees roots root_list digest material tracked untracked paths entries
   local regular_paths hashes link_output link_rc path type mode contents worktree nested_list candidate nested_top
@@ -306,7 +308,7 @@ provenance_log_append() { # path record
 
 write_lock_metadata_value() {
   local metadata="$1" field="$2"
-  sed -n "s/^${field}=//p" "$metadata" 2>/dev/null | head -1
+  sed -n "s/^${field}=//p" "$metadata" 19>&- 2>/dev/null | head -1 19>&-
 }
 
 write_lock_remove_publication_temps() { # lock-dir
@@ -314,36 +316,64 @@ write_lock_remove_publication_temps() { # lock-dir
   rm -f "$lock_dir"/metadata.tmp.* "$lock_dir"/heartbeat.tmp.* 2>/dev/null
 }
 
-write_lock_publish_metadata() {   # lock_dir token record
-  local lock_dir="$1" token="$2" record="$3" metadata temp recorded_token
-  metadata="$lock_dir/metadata"
-  temp="$lock_dir/metadata.tmp.$token"
-  [ ! -d "$lock_dir/.reclaim" ] || return 1
-  if [ -f "$metadata" ]; then
-    recorded_token=$(write_lock_metadata_value "$metadata" token)
-    [ "$recorded_token" = "$token" ] || return 1
-  fi
-  printf '%s\n' "$record" > "$temp" || return 1
-  if [ -d "$lock_dir/.reclaim" ]; then
-    rm -f "$temp" 2>/dev/null || :
-    return 1
-  fi
-  if [ -f "$metadata" ]; then
-    recorded_token=$(write_lock_metadata_value "$metadata" token)
-    if [ "$recorded_token" != "$token" ]; then
-      rm -f "$temp" 2>/dev/null || :
-      return 1
-    fi
-  fi
-  if mv -f "$temp" "$metadata"; then
+write_lock_unknown_entry() { # lock-dir output-variable
+  local lock_dir="$1" output_var="$2" entry base
+  printf -v "$output_var" '%s' ""
+  for entry in "$lock_dir"/* "$lock_dir"/.[!.]* "$lock_dir"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    base=${entry##*/}
+    case "$base" in
+      generation|metadata|metadata.new|heartbeat|metadata.tmp.*|heartbeat.tmp.*) continue ;;
+    esac
+    printf -v "$output_var" '%s' "$entry"
     return 0
-  fi
-  rm -f "$temp" 2>/dev/null || :
+  done
   return 1
 }
 
+write_lock_publish_metadata() {   # lock_dir identity token record
+  local lock_dir="$1" identity="$2" token="$3" record="$4"
+  local metadata temp recorded_token
+  metadata="$lock_dir/metadata"
+  temp="$lock_dir/metadata.tmp.$token"
+  lock_claim_acquire "$lock_dir" "$identity" "$token" initializing || return 1
+  if [ -f "$metadata" ]; then
+    recorded_token=$(write_lock_metadata_value "$metadata" token)
+    if [ "$recorded_token" != "$token" ]; then
+      lock_claim_release "$lock_dir" "$identity" "$token" || :
+      return 1
+    fi
+  fi
+  if ! (umask 077; printf '%s\n' "$record" > "$temp") 19>&- ||
+    ! mv -f "$temp" "$metadata" 19>&-; then
+    rm -f "$temp" 19>&- 2>/dev/null || :
+    lock_claim_release "$lock_dir" "$identity" "$token" || :
+    return 1
+  fi
+  if ! recorded_token=$(lock_claim_metadata_value_once "$metadata" token); then
+    lock_claim_release "$lock_dir" "$identity" "$token" || :
+    return 1
+  fi
+  lock_claim_release "$lock_dir" "$identity" "$token" || return 1
+  [ "$recorded_token" = "$token" ]
+}
+write_lock_cleanup_failed_publication() { # lock-dir identity token
+  local lock_dir="$1" identity="$2" token="$3" current_identity current_token
+  [ -d "$lock_dir" ] || return 0
+  lock_claim_acquire "$lock_dir" "$identity" "$token" initializing || return 1
+  current_identity=$(write_lock_path_identity "$lock_dir") || current_identity=""
+  current_token=$(write_lock_metadata_value "$lock_dir/metadata" token)
+  if [ "$current_identity" != "$identity" ] ||
+    { [ -n "$current_token" ] && [ "$current_token" != "$token" ]; }; then
+    lock_claim_release "$lock_dir" "$identity" "$token" || :
+    return 1
+  fi
+  lock_claim_discard "$lock_dir" "$identity" "$token"
+}
+
+
 write_lock_heartbeat_write() {
-  local interval invalid now last lock_dir heartbeat temp
+  local interval invalid now last lock_dir heartbeat temp identity token generation
   write_lock_is_owner || return 0
   interval=${MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC:-20}
   invalid=0
@@ -366,31 +396,37 @@ write_lock_heartbeat_write() {
     return 0
   fi
   lock_dir="${MAESTRO_LOCK_DIR:-$(write_lock_path)}"
+  identity=${MAESTRO_LOCK_IDENTITY:-}
+  token=${MAESTRO_LOCK_TOKEN:-}
+  lock_claim_acquire "$lock_dir" "$identity" "$token" || return 0
+  generation=$(lock_claim_identity_generation "$identity") || {
+    lock_claim_release "$lock_dir" "$identity" "$token" || :
+    return 1
+  }
   heartbeat="$lock_dir/heartbeat"
-  temp="$lock_dir/heartbeat.tmp.$MAESTRO_LOCK_TOKEN"
-  if ! printf 'token=%s\nepoch=%s\n' "$MAESTRO_LOCK_TOKEN" "$now" > "$temp"; then
-    rm -f "$temp" 2>/dev/null || :
+  temp="$lock_dir/heartbeat.tmp.$token"
+  if ! printf 'token=%s\ngeneration=%s\nepoch=%s\n' \
+    "$token" "$generation" "$now" > "$temp" 19>&- ||
+    ! mv -f "$temp" "$heartbeat" 19>&-; then
+    rm -f "$temp" 19>&- 2>/dev/null || :
+    lock_claim_release "$lock_dir" "$identity" "$token" || :
     return 1
   fi
-  if ! write_lock_is_owner; then
-    rm -f "$temp" 2>/dev/null || :
-    return 0
+  if ! lock_claim_release "$lock_dir" "$identity" "$token"; then
+    return 1
   fi
-  if mv -f "$temp" "$heartbeat"; then
-    MAESTRO_LOCK_HEARTBEAT_LAST_WRITE_EPOCH=$now
-    MAESTRO_LOCK_HEARTBEAT_LAST_TOKEN=$MAESTRO_LOCK_TOKEN
-    return 0
-  fi
-  rm -f "$temp" 2>/dev/null || :
-  return 1
+  MAESTRO_LOCK_HEARTBEAT_LAST_WRITE_EPOCH=$now
+  MAESTRO_LOCK_HEARTBEAT_LAST_TOKEN=$token
 }
 
-write_lock_heartbeat_epoch() {   # lock_dir token
-  local lock_dir="$1" token="$2" heartbeat recorded_token
+write_lock_heartbeat_epoch() {   # lock_dir token identity
+  local lock_dir="$1" token="$2" identity="${3-}" heartbeat recorded_token
   heartbeat="$lock_dir/heartbeat"
-  [ -f "$heartbeat" ] || return 0
-  recorded_token=$(write_lock_metadata_value "$heartbeat" token)
+  [ -f "$heartbeat" ] && [ ! -L "$heartbeat" ] || return 0
+  recorded_token=$(lock_claim_metadata_value_once "$heartbeat" token) || return 0
   [ "$recorded_token" = "$token" ] || return 0
+  [ -z "$identity" ] ||
+    lock_claim_record_matches_identity "$heartbeat" "$identity" || return 0
   write_lock_metadata_value "$heartbeat" epoch
 }
 
@@ -417,8 +453,13 @@ write_lock_process_start() {   # pid
 }
 
 write_lock_path_mtime_epoch() { # path
-  stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1" 2>/dev/null
+  stat -c '%Y' "$1" 19>&- 2>/dev/null ||
+    stat -f '%m' "$1" 19>&- 2>/dev/null
 }
+write_lock_path_identity() { # path
+  lock_claim_path_identity "$1"
+}
+
 
 write_lock_session_id() {   # prints a validated session id, or unknown
   local session_id="${MAESTRO_SESSION_ID:-}"
@@ -439,16 +480,38 @@ write_lock_session_id() {   # prints a validated session id, or unknown
 # ponytail: no ticket files, so no arrival order and nothing to reap — the cap
 # bounds starvation. Add FIFO only if starvation is actually reproduced.
 write_lock_wait_tick() {   # deadline job session lock_dir
-  local deadline="$1" job="$2" session="$3" lock_dir="$4" now remaining sleep_for
+  local deadline="$1" job="$2" session="$3" lock_dir="$4"
+  local now remaining sleep_for last_log log_interval=30
   [ "$deadline" -gt 0 ] 2>/dev/null || return 1
   now=$(date +%s)
   [ "$now" -lt "$deadline" ] || return 1
   remaining=$((deadline - now))
   sleep_for=$MAESTRO_LOCK_WAIT_POLL_SEC
   [ "$sleep_for" -le "$remaining" ] || sleep_for=$remaining
-  progress "MAESTRO_LOCK: waiting for the write lease held by job=$job session=$session — ${remaining}s left before blocking (lock: $lock_dir); arrival order is not guaranteed"
+  last_log=${MAESTRO_LOCK_WAIT_LAST_LOG_EPOCH:-0}
+  if [ "$last_log" -eq 0 ] || [ "$((now - last_log))" -ge "$log_interval" ]; then
+    progress "MAESTRO_LOCK: waiting for the write lease held by job=$job session=$session — ${remaining}s left before blocking (lock: $lock_dir); arrival order is not guaranteed"
+    MAESTRO_LOCK_WAIT_LAST_LOG_EPOCH=$now
+  fi
   sleep "$sleep_for"
   return 0
+}
+
+write_lock_wait_summary() {   # wait-start wait-budget
+  local started="$1" budget="$2" now elapsed
+  case "$started" in
+    ''|*[!0-9]*)
+      printf 'wait_budget=%ss wait_elapsed=unknown' "$budget"
+      return 0
+      ;;
+  esac
+  now=$(date +%s) || {
+    printf 'wait_budget=%ss wait_elapsed=unknown' "$budget"
+    return 0
+  }
+  elapsed=$((now - started))
+  [ "$elapsed" -ge 0 ] || elapsed=0
+  printf 'wait_budget=%ss wait_elapsed=%ss' "$budget" "$elapsed"
 }
 
 write_lock_poison_gate() {   # lock_dir metadata → 11 when poisoned (after printing), else 0
@@ -477,17 +540,20 @@ write_lock_effective_poison() { # lock-dir metadata output-path output-quiescenc
 }
 
 write_lock_is_owner() {
-  local lock_dir metadata recorded_token
+  local lock_dir metadata recorded_token current_identity
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || {
     [ -n "${MAESTRO_LOCK_TOKEN:-}" ] || return 1
   }
+  [ -n "${MAESTRO_LOCK_IDENTITY:-}" ] || return 1
   lock_dir="${MAESTRO_LOCK_DIR:-$(write_lock_path)}"
-  [ ! -d "$lock_dir/.reclaim" ] || return 1
+  current_identity=$(write_lock_path_identity "$lock_dir") || return 1
+  [ "$current_identity" = "$MAESTRO_LOCK_IDENTITY" ] || return 1
   metadata="$lock_dir/metadata"
-  [ -f "$metadata" ] || return 1
-  recorded_token=$(write_lock_metadata_value "$metadata" token)
+  [ -f "$metadata" ] && [ ! -L "$metadata" ] || return 1
+  recorded_token=$(lock_claim_metadata_value_once "$metadata" token) || return 1
   [ -n "${MAESTRO_LOCK_TOKEN:-}" ] &&
-    [ "$recorded_token" = "$MAESTRO_LOCK_TOKEN" ]
+    [ "$recorded_token" = "$MAESTRO_LOCK_TOKEN" ] &&
+    lock_claim_record_matches_identity "$metadata" "$MAESTRO_LOCK_IDENTITY"
 }
 
 
@@ -518,10 +584,12 @@ write_lock_acquire() {
   local identity_note owner_session malformed_metadata
   local writers writers_rc digest_before log_path last prior_job prior_after observed_at
   local stale_digest_before stale_digest_after stale_released_at session_id started_at
-  local metadata_record reclaim_dir current_token
-  local wait_cap wait_poll wait_deadline initializing_grace
-  local heartbeat_stale heartbeat_epoch heartbeat_effective heartbeat_age heartbeat_note
+  local metadata_record reclaim_dir current_token generation_identity current_identity generation
+  local wait_cap wait_poll wait_deadline wait_started_epoch initializing_grace remaining sleep_for
+  local heartbeat_stale heartbeat_epoch heartbeat_effective heartbeat_age heartbeat_note create_rc
   MAESTRO_LOCK_ACQUIRED=0
+  MAESTRO_LOCK_IDENTITY=""
+  MAESTRO_LOCK_WAIT_LAST_LOG_EPOCH=0
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
   metadata="$MAESTRO_LOCK_DIR/metadata"
 
@@ -558,12 +626,45 @@ write_lock_acquire() {
 
 
   initializing_grace=0
-  if [ "$wait_cap" -gt 0 ]; then wait_deadline=$(( $(date +%s) + wait_cap )); else wait_deadline=0; fi
+  wait_started_epoch=$(date +%s 2>/dev/null) || wait_started_epoch=""
+  case "$wait_started_epoch" in
+    ''|*[!0-9]*)
+      progress "MAESTRO_LOCK: wait clock unavailable; waiting disabled"
+      wait_cap=0
+      wait_deadline=0
+      ;;
+    *)
+      if [ "$wait_cap" -gt 0 ]; then
+        wait_deadline=$((wait_started_epoch + wait_cap))
+      else
+        wait_deadline=0
+      fi
+      ;;
+  esac
+  token=$(lock_claim_random_id) || {
+    progress "MAESTRO_LOCK: lock token generation failed; no lease was created"
+    return 3
+  }
+
   attempt=0
   while [ "$attempt" -lt 2 ]; do
     write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata" || return 11
-    if mkdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
-      token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    create_rc=0
+    generation_identity=""
+    lock_claim_create "$MAESTRO_LOCK_DIR" generation_identity || create_rc=$?
+    if [ "$create_rc" -eq 2 ]; then
+      if write_lock_wait_tick "$wait_deadline" unknown unknown \
+        "$MAESTRO_LOCK_DIR"; then
+        continue
+      fi
+      progress "MAESTRO_LOCK: write dispatch blocked by a competing generation claimant ($(write_lock_wait_summary "$wait_started_epoch" "$wait_cap"); lock: $MAESTRO_LOCK_DIR)"
+      return 11
+    fi
+    if [ "$create_rc" -eq 3 ]; then
+      progress "MAESTRO_LOCK: lease generation initialization failed and the canonical generation could not be retired; retaining fail-closed lock (lock: $MAESTRO_LOCK_DIR)"
+      return 11
+    fi
+    if [ "$create_rc" -eq 0 ]; then
       process_start=$(write_lock_process_start "$$")
       # ponytail: mkdir gives mutual exclusion; ps only sharpens stale-owner recovery.
       # Without it, record the gap and let the contention path fail closed instead.
@@ -574,23 +675,27 @@ write_lock_acquire() {
       session_id=$(write_lock_session_id)
       now=$(date +%s)
       started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-      metadata_record=$(printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=unavailable' \
-        "$token" "$$" "$process_start" "$requested_job" "${session_id:-unknown}" \
+      generation=$(lock_claim_identity_generation "$generation_identity") || return 11
+      metadata_record=$(printf 'token=%s\ngeneration=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=unavailable' \
+        "$token" "$generation" "$$" "$process_start" "$requested_job" "${session_id:-unknown}" \
         "$started_at" "$now")
-      if ! write_lock_publish_metadata "$MAESTRO_LOCK_DIR" "$token" "$metadata_record"; then
-        rm -f "$metadata" "$MAESTRO_LOCK_DIR/heartbeat" 2>/dev/null || :
-        write_lock_remove_publication_temps "$MAESTRO_LOCK_DIR" || :
-        rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null || :
+      if ! write_lock_publish_metadata "$MAESTRO_LOCK_DIR" "$generation_identity" "$token" "$metadata_record"; then
+        if ! write_lock_cleanup_failed_publication "$MAESTRO_LOCK_DIR" \
+          "$generation_identity" "$token"; then
+          progress "MAESTRO_LOCK: metadata publication failed and the canonical generation could not be retired; retaining fail-closed lock (lock: $MAESTRO_LOCK_DIR)"
+          return 11
+        fi
         return 3
       fi
       MAESTRO_LOCK_TOKEN="$token"
+      MAESTRO_LOCK_IDENTITY="$generation_identity"
       MAESTRO_LOCK_ACQUIRED=1
 
       digest_before=$(repo_digest_bounded 2>/dev/null) || digest_before=unavailable
-      metadata_record=$(printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s' \
-        "$token" "$$" "$process_start" "$requested_job" "${session_id:-unknown}" \
+      metadata_record=$(printf 'token=%s\ngeneration=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s' \
+        "$token" "$generation" "$$" "$process_start" "$requested_job" "${session_id:-unknown}" \
         "$started_at" "$now" "$digest_before")
-      if ! write_lock_publish_metadata "$MAESTRO_LOCK_DIR" "$token" "$metadata_record"; then
+      if ! write_lock_publish_metadata "$MAESTRO_LOCK_DIR" "$generation_identity" "$token" "$metadata_record"; then
         progress "MAESTRO_LOCK: repository digest could not be recorded; lease retains digest_before=unavailable (lock: $MAESTRO_LOCK_DIR)"
       fi
 
@@ -619,14 +724,33 @@ write_lock_acquire() {
       progress "MAESTRO_LOCK: could not create write lock at $MAESTRO_LOCK_DIR"
       return 3
     fi
+    generation_identity=$(write_lock_path_identity "$MAESTRO_LOCK_DIR") || {
+      progress "MAESTRO_LOCK: write lease generation identity is unavailable; failing closed (lock: $MAESTRO_LOCK_DIR)"
+      return 11
+    }
 
     if [ ! -f "$metadata" ]; then
       if [ "$wait_cap" -gt 0 ] && [ "$initializing_grace" -lt 3 ]; then
-        initializing_grace=$((initializing_grace + 1))
-        sleep 1
-        continue
+        now=$(date +%s 2>/dev/null) || now=""
+        case "$now" in
+          ''|*[!0-9]*) wait_cap=0 ;;
+          *)
+            remaining=$((wait_deadline - now))
+            if [ "$remaining" -gt 0 ]; then
+              sleep_for=1
+              [ "$sleep_for" -le "$remaining" ] || sleep_for=$remaining
+              initializing_grace=$((initializing_grace + 1))
+              sleep "$sleep_for"
+              continue
+            fi
+            ;;
+        esac
       fi
-      progress "MAESTRO_LOCK: write dispatch blocked by an initializing owner (job=unknown session=unknown pid=unknown held=unknown, lock: $MAESTRO_LOCK_DIR)"
+      progress "MAESTRO_LOCK: write dispatch blocked by an initializing owner (job=unknown session=unknown pid=unknown held=unknown; $(write_lock_wait_summary "$wait_started_epoch" "$wait_cap"); lock: $MAESTRO_LOCK_DIR)"
+      return 11
+    fi
+    if ! lock_claim_record_matches_identity "$metadata" "$generation_identity"; then
+      progress "MAESTRO_LOCK: write lease metadata is malformed or belongs to another generation; owner cannot be identified; failing closed (lock: $MAESTRO_LOCK_DIR)"
       return 11
     fi
 
@@ -672,7 +796,8 @@ write_lock_acquire() {
           held="${held}s"
           if [ "$heartbeat_stale" -ne 0 ]; then
             heartbeat_effective=$started_epoch
-            heartbeat_epoch=$(write_lock_heartbeat_epoch "$MAESTRO_LOCK_DIR" "$recorded_token")
+            heartbeat_epoch=$(write_lock_heartbeat_epoch "$MAESTRO_LOCK_DIR" \
+              "$recorded_token" "$generation_identity")
             case "$heartbeat_epoch" in
               ''|*[!0-9]*) ;;
               *)
@@ -695,7 +820,7 @@ write_lock_acquire() {
           continue
         fi
       fi
-      progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)${identity_note}${heartbeat_note}"
+      progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown} for $held (lease_age=$held; $(write_lock_wait_summary "$wait_started_epoch" "$wait_cap"); lock: $MAESTRO_LOCK_DIR)${identity_note}${heartbeat_note}"
       return 11
     fi
 
@@ -712,14 +837,14 @@ write_lock_acquire() {
         if write_lock_wait_tick "$wait_deadline" "$owner_job" "${owner_session:-unknown}" "$MAESTRO_LOCK_DIR"; then
           continue
         fi
-        progress "MAESTRO_LOCK: write dispatch blocked; lease retained because orphaned job=$owner_job session=${owner_session:-unknown} is still running (lock: $MAESTRO_LOCK_DIR)"
+        progress "MAESTRO_LOCK: write dispatch blocked; lease retained because orphaned job=$owner_job session=${owner_session:-unknown} is still running ($(write_lock_wait_summary "$wait_started_epoch" "$wait_cap"); lock: $MAESTRO_LOCK_DIR)"
         return 11
       fi
     elif printf '%s\n' "$writers" | awk '$2 == "true" { found = 1 } END { exit !found }'; then
       if write_lock_wait_tick "$wait_deadline" "$owner_job" "${owner_session:-unknown}" "$MAESTRO_LOCK_DIR"; then
         continue
       fi
-      progress "MAESTRO_LOCK: write dispatch blocked; lease retained because an unidentified write-capable job is still running (session=${owner_session:-unknown}, lock: $MAESTRO_LOCK_DIR)"
+      progress "MAESTRO_LOCK: write dispatch blocked; lease retained because an unidentified write-capable job is still running (session=${owner_session:-unknown}; $(write_lock_wait_summary "$wait_started_epoch" "$wait_cap"); lock: $MAESTRO_LOCK_DIR)"
       return 11
     fi
 
@@ -727,60 +852,55 @@ write_lock_acquire() {
     # Recheck after liveness so that transition cannot be erased as stale.
     write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata" || return 11
 
-    # Claim this exact generation before deletion. The second token check closes
-    # the path-reuse ABA: a delayed reclaimer may observe a successor at the same
-    # pathname, but it cannot delete that successor using the stale classification.
+    # Serialize classification and atomically retire only this generation.
+    # The kernel-backed claim is released automatically if this shell dies.
     current_token=$(write_lock_metadata_value "$metadata" token)
     if [ "$current_token" != "$recorded_token" ]; then
       attempt=$((attempt + 1))
       continue
     fi
-    reclaim_dir="$MAESTRO_LOCK_DIR/.reclaim"
-    if ! mkdir "$reclaim_dir" 2>/dev/null; then
-      progress "MAESTRO_LOCK: write dispatch blocked by a competing stale-lease reclaimer (lock: $MAESTRO_LOCK_DIR)"
+    if ! lock_claim_acquire "$MAESTRO_LOCK_DIR" \
+      "$generation_identity" "$recorded_token"; then
+      progress "MAESTRO_LOCK: write dispatch blocked by a competing generation claimant ($(write_lock_wait_summary "$wait_started_epoch" "$wait_cap"); lock: $MAESTRO_LOCK_DIR)"
       return 11
     fi
-    current_token=$(write_lock_metadata_value "$metadata" token)
-    if [ "$current_token" != "$recorded_token" ]; then
-      rmdir "$reclaim_dir" 2>/dev/null || :
+    reclaim_dir=$(lock_claim_path "$MAESTRO_LOCK_DIR") || {
+      lock_claim_release "$MAESTRO_LOCK_DIR" \
+        "$generation_identity" "$recorded_token" || :
+      return 11
+    }
+    metadata="$reclaim_dir/metadata"
+    if ! lock_claim_current_path_matches "$generation_identity" "$recorded_token"; then
+      lock_claim_release "$MAESTRO_LOCK_DIR" \
+        "$generation_identity" "$recorded_token" || :
       attempt=$((attempt + 1))
       continue
     fi
-    if ! write_lock_poison_gate "$MAESTRO_LOCK_DIR" "$metadata"; then
-      rmdir "$reclaim_dir" 2>/dev/null || :
+    if ! write_lock_poison_gate "$reclaim_dir" "$metadata"; then
+      lock_claim_release "$MAESTRO_LOCK_DIR" \
+        "$generation_identity" "$recorded_token" || :
       return 11
     fi
 
-    # Observe and publish the adopted baseline while this generation claim still
-    # blocks a successor. Removing the lock first lets a successor publish and
-    # release before this older record, reversing baseline order.
-    stale_digest_after=$(repo_digest_bounded 2>/dev/null) || stale_digest_after=unavailable
-    stale_released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    if ! rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" \
-      "$MAESTRO_LOCK_DIR/heartbeat" 2>/dev/null; then
-      rmdir "$reclaim_dir" 2>/dev/null || :
-      return 11
-    fi
+    stale_digest_after=$(repo_digest_bounded 19>&- 2>/dev/null) ||
+      stale_digest_after=unavailable
+    stale_released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 19>&-)
     if repo_digest_is_observed "$stale_digest_before" &&
       repo_digest_is_observed "$stale_digest_after" &&
       [ "$stale_digest_before" != "$stale_digest_after" ]; then
       progress "PROVENANCE: ADOPTED UNOBSERVED INTERVAL — the tree changed while an orphaned lease was held (job=$owner_job, expected=$stale_digest_before, observed=$stale_digest_after); the interval was not observed and the author is unknown"
     fi
-    if log_path=$(provenance_log_path 2>/dev/null); then
-      # The interval between the orphan's last write and this steal was never observed,
-      # so the after value is adopted, not witnessed.
+    if log_path=$(provenance_log_path 19>&- 2>/dev/null); then
       provenance_log_append "$log_path" "$(printf '%s type=orphan-adopted job=%s session=%s before=%s after=%s' \
         "$stale_released_at" "$owner_job" "${owner_session:-unknown}" \
-        "$stale_digest_before" "$stale_digest_after")" || :
+        "$stale_digest_before" "$stale_digest_after")" 19>&- || :
     fi
-    write_lock_remove_publication_temps "$MAESTRO_LOCK_DIR" || :
-    if rmdir "$reclaim_dir" 2>/dev/null &&
-      rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
+    if lock_claim_discard "$MAESTRO_LOCK_DIR" \
+      "$generation_identity" "$recorded_token"; then
       progress "MAESTRO_LOCK: broke stale write lock held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown}"
       attempt=$((attempt + 1))
       continue
     fi
-    rmdir "$reclaim_dir" 2>/dev/null || :
 
     case "$started_epoch" in
       ''|*[!0-9]*) held="unknown" ;;
@@ -791,24 +911,26 @@ write_lock_acquire() {
         held="${held}s"
         ;;
     esac
-    progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown} for $held (lock: $MAESTRO_LOCK_DIR)"
+    progress "MAESTRO_LOCK: write dispatch blocked; held by job=$owner_job session=${owner_session:-unknown} pid=${owner_pid:-unknown} for $held (lease_age=$held; $(write_lock_wait_summary "$wait_started_epoch" "$wait_cap"); lock: $MAESTRO_LOCK_DIR)"
     return 11
   done
 
-  progress "MAESTRO_LOCK: write dispatch blocked by a competing acquirer (job=unknown session=unknown pid=unknown held=unknown, lock: $MAESTRO_LOCK_DIR)"
+  progress "MAESTRO_LOCK: write dispatch blocked by a competing acquirer (job=unknown session=unknown pid=unknown held=unknown; $(write_lock_wait_summary "$wait_started_epoch" "$wait_cap"); lock: $MAESTRO_LOCK_DIR)"
   return 11
 }
 
 write_lock_set_job() {
-  local job="$1" metadata next_metadata recorded_token owner_pid owner_start started_at started_epoch
-  local digest_before session_id
-  [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || {
-    [ -n "${MAESTRO_LOCK_TOKEN:-}" ] || return 0
+  local job="$1" metadata recorded_token owner_pid owner_start started_at started_epoch
+  local digest_before session_id identity token generation metadata_record
+  write_lock_is_owner || {
+    progress "MAESTRO_LOCK: this lease is no longer held by this process; job update skipped"
+    return 0
   }
+  identity=${MAESTRO_LOCK_IDENTITY:-}
+  token=${MAESTRO_LOCK_TOKEN:-}
   metadata="${MAESTRO_LOCK_DIR:-$(write_lock_path)}/metadata"
-  [ -f "$metadata" ] || return 0
   recorded_token=$(write_lock_metadata_value "$metadata" token)
-  [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || {
+  [ "$recorded_token" = "$token" ] || {
     progress "MAESTRO_LOCK: this lease is no longer held by this process; job update skipped"
     return 0
   }
@@ -820,15 +942,12 @@ write_lock_set_job() {
   digest_before=${digest_before:-unavailable}
   session_id=$(write_lock_metadata_value "$metadata" session_id)
   session_id=$(MAESTRO_SESSION_ID="${session_id:-}" write_lock_session_id)
-  next_metadata="${MAESTRO_LOCK_DIR}/metadata.new"
-  if ! printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\n' \
-    "$recorded_token" "$owner_pid" "$owner_start" "$job" "${session_id:-unknown}" \
-    "$started_at" "$started_epoch" "$digest_before" > "$next_metadata"; then
-    rm -f "$next_metadata" 2>/dev/null || :
-    return 3
-  fi
-  if ! write_lock_is_owner || ! mv -f "$next_metadata" "$metadata"; then
-    rm -f "$next_metadata" 2>/dev/null || :
+  generation=$(lock_claim_identity_generation "$identity") || return 3
+  metadata_record=$(printf 'token=%s\ngeneration=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s' \
+    "$token" "$generation" "$owner_pid" "$owner_start" "$job" "${session_id:-unknown}" \
+    "$started_at" "$started_epoch" "$digest_before")
+  if ! write_lock_publish_metadata "$MAESTRO_LOCK_DIR" "$identity" "$token" \
+    "$metadata_record"; then
     progress "MAESTRO_LOCK: this lease changed while publishing job=$job; job update rejected"
     return 3
   fi
@@ -836,18 +955,24 @@ write_lock_set_job() {
 
 write_lock_poison() {
   local job="$1" reason="$2" metadata next_metadata recorded_token owner_pid owner_start
-  local owner_job started_at started_epoch digest_before session_id
+  local owner_job started_at started_epoch digest_before session_id identity token generation
   write_lock_is_owner || {
     progress "MAESTRO_LOCK: this lease is no longer held by this process; poison not staged"
     return 3
   }
-  metadata="${MAESTRO_LOCK_DIR:-$(write_lock_path)}/metadata"
-  [ -f "$metadata" ] || return 3
-  recorded_token=$(write_lock_metadata_value "$metadata" token)
-  [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || {
-    progress "MAESTRO_LOCK: this lease is no longer held by this process; poison not staged"
+  identity=${MAESTRO_LOCK_IDENTITY:-}
+  token=${MAESTRO_LOCK_TOKEN:-}
+  lock_claim_acquire "$MAESTRO_LOCK_DIR" "$identity" "$token" || {
+    progress "MAESTRO_LOCK: this lease changed before poison could be staged"
     return 3
   }
+  metadata="$MAESTRO_LOCK_DIR/metadata"
+  recorded_token=$(write_lock_metadata_value "$metadata" token)
+  if [ "$recorded_token" != "$token" ]; then
+    lock_claim_release "$MAESTRO_LOCK_DIR" "$identity" "$token" || :
+    progress "MAESTRO_LOCK: this lease is no longer held by this process; poison not staged"
+    return 3
+  fi
   owner_pid=$(write_lock_metadata_value "$metadata" pid)
   owner_start=$(write_lock_metadata_value "$metadata" process_start)
   owner_job=$(write_lock_metadata_value "$metadata" job_id)
@@ -857,28 +982,76 @@ write_lock_poison() {
   digest_before=${digest_before:-unavailable}
   session_id=$(write_lock_metadata_value "$metadata" session_id)
   session_id=$(MAESTRO_SESSION_ID="${session_id:-}" write_lock_session_id)
-  next_metadata="${MAESTRO_LOCK_DIR}/metadata.new"
-  if printf 'token=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\nquiescence=unconfirmed\nunconfirmed_job=%s\nunconfirmed_reason=%s\n' \
-    "$recorded_token" "$owner_pid" "$owner_start" "$owner_job" "${session_id:-unknown}" \
-    "$started_at" "$started_epoch" "$digest_before" "$job" "$reason" > "$next_metadata"; then
-    return 0
-  else
-    rm -f "$next_metadata" 2>/dev/null || :
+  generation=$(lock_claim_identity_generation "$identity") || {
+    lock_claim_release "$MAESTRO_LOCK_DIR" "$identity" "$token" || :
+    return 3
+  }
+  next_metadata="$MAESTRO_LOCK_DIR/metadata.new"
+  if ! printf 'token=%s\ngeneration=%s\npid=%s\nprocess_start=%s\njob_id=%s\nsession_id=%s\nstarted_at=%s\nstarted_epoch=%s\ndigest_before=%s\nquiescence=unconfirmed\nunconfirmed_job=%s\nunconfirmed_reason=%s\n' \
+    "$token" "$generation" "$owner_pid" "$owner_start" "$owner_job" "${session_id:-unknown}" \
+    "$started_at" "$started_epoch" "$digest_before" "$job" "$reason" \
+    > "$next_metadata" 19>&-; then
+    rm -f "$next_metadata" 19>&- 2>/dev/null || :
+    lock_claim_release "$MAESTRO_LOCK_DIR" "$identity" "$token" || :
+    return 3
+  fi
+  if ! lock_claim_release "$MAESTRO_LOCK_DIR" "$identity" "$token"; then
+    progress "MAESTRO_LOCK: lease changed after poison staging; retaining fail-closed state"
     return 3
   fi
 }
 
+write_lock_finalize_poison() {
+  local lock_dir identity token metadata next_metadata staged_token quiescence
+  write_lock_is_owner || return 1
+  lock_dir=${MAESTRO_LOCK_DIR:-}
+  identity=${MAESTRO_LOCK_IDENTITY:-}
+  token=${MAESTRO_LOCK_TOKEN:-}
+  lock_claim_acquire "$lock_dir" "$identity" "$token" || return 1
+  metadata="$lock_dir/metadata"
+  next_metadata="$lock_dir/metadata.new"
+  staged_token=$(write_lock_metadata_value "$next_metadata" token)
+  quiescence=$(write_lock_metadata_value "$next_metadata" quiescence)
+  if [ "$staged_token" != "$token" ] || [ "$quiescence" != unconfirmed ] ||
+    ! lock_claim_record_matches_identity "$next_metadata" "$identity" ||
+    ! mv -f "$next_metadata" "$metadata" 19>&-; then
+    lock_claim_release "$lock_dir" "$identity" "$token" || :
+    return 1
+  fi
+  lock_claim_release "$lock_dir" "$identity" "$token"
+}
+
 write_lock_release() {
   local metadata recorded_token owner_job owner_session writers writers_rc quiescence
-  local unconfirmed_job unconfirmed_reason poison_metadata
-  local digest_before digest_after log_path released_at reclaim_dir current_token
+  local unconfirmed_job unconfirmed_reason poison_metadata claimed current_token
+  local digest_before digest_after log_path released_at observed_identity current_identity unknown_entry
   [ "${MAESTRO_LOCK_ACQUIRED:-0}" -eq 1 ] || return 0
   metadata="${MAESTRO_LOCK_DIR:-}/metadata"
-  [ -n "${MAESTRO_LOCK_DIR:-}" ] && [ -f "$metadata" ] || return 0
+  if [ -z "${MAESTRO_LOCK_DIR:-}" ] || [ ! -f "$metadata" ]; then
+    progress "MAESTRO_LOCK: acquired lease metadata is unavailable during release; retaining fail-closed state"
+    return 11
+  fi
+  observed_identity=${MAESTRO_LOCK_IDENTITY:-}
+  [ -n "$observed_identity" ] || {
+    progress "MAESTRO_LOCK: acquired lease identity is unavailable during release; retaining the lock"
+    return 11
+  }
+  current_identity=$(write_lock_path_identity "$MAESTRO_LOCK_DIR") || {
+    progress "MAESTRO_LOCK: lease generation identity is unavailable during release; retaining the lock"
+    return 11
+  }
+  [ "$current_identity" = "$observed_identity" ] || {
+    progress "MAESTRO_LOCK: lease generation changed before release; releasing nothing"
+    return 11
+  }
+  lock_claim_record_matches_identity "$metadata" "$observed_identity" || {
+    progress "MAESTRO_LOCK: lease metadata belongs to another generation during release; retaining the lock"
+    return 11
+  }
   recorded_token=$(write_lock_metadata_value "$metadata" token)
   [ "$recorded_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || {
     progress "MAESTRO_LOCK: this lease is no longer held by this process; releasing nothing"
-    return 0
+    return 11
   }
   owner_job=$(write_lock_metadata_value "$metadata" job_id)
   owner_job=${owner_job:-unknown}
@@ -886,17 +1059,20 @@ write_lock_release() {
   owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
   write_lock_effective_poison "$MAESTRO_LOCK_DIR" "$metadata" \
     poison_metadata quiescence
+  if [ "$poison_metadata" != "$metadata" ] &&
+    ! lock_claim_record_matches_identity "$poison_metadata" "$observed_identity"; then
+    progress "MAESTRO_LOCK: staged poison belongs to another generation; retaining the lock"
+    return 11
+  fi
   if [ "$quiescence" = "unconfirmed" ]; then
     unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
     unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-    owner_session=$(write_lock_metadata_value "$poison_metadata" session_id)
-    owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
     progress "MAESTRO_LOCK: write lease retained because quiescence was never confirmed (job=${unconfirmed_job:-$owner_job} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown}, lock: $MAESTRO_LOCK_DIR)"
-    return 0
+    return 11
   fi
   if [ "$_MAESTRO_WRITE_LEASE_RETAIN" -eq 1 ]; then
     progress "MAESTRO_LOCK: write lease retained because cancellation poison could not be persisted (job=$owner_job session=${owner_session:-unknown}, lock: $MAESTRO_LOCK_DIR)"
-    return 0
+    return 11
   fi
 
   writers=""
@@ -904,72 +1080,88 @@ write_lock_release() {
   writers_rc=$?
   if [ "$writers_rc" -eq 4 ]; then
     progress "MAESTRO_LOCK: job liveness could not be determined; write lease retained (job=$owner_job session=${owner_session:-unknown}, lock: $MAESTRO_LOCK_DIR)"
-    return 0
+    return 11
   fi
   if [ "$owner_job" != "unknown" ]; then
     if printf '%s\n' "$writers" | awk -v job="$owner_job" '$1 == job { found = 1 } END { exit !found }'; then
       progress "MAESTRO_LOCK: write lease retained because job $owner_job session=${owner_session:-unknown} is still running; a later dispatch will resolve it (lock: $MAESTRO_LOCK_DIR)"
-      return 0
+      return 11
     fi
   elif printf '%s\n' "$writers" | awk '$2 == "true" { found = 1 } END { exit !found }'; then
     progress "MAESTRO_LOCK: write lease retained because an unidentified write-capable job is still running; a later dispatch will resolve it (session=${owner_session:-unknown}, lock: $MAESTRO_LOCK_DIR)"
-    return 0
+    return 11
   fi
 
   digest_before=$(write_lock_metadata_value "$metadata" digest_before)
   digest_before=${digest_before:-unavailable}
   digest_after=$(repo_digest_bounded 2>/dev/null) || digest_after=unavailable
   released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-  # Cancellation can poison while this process checks job liveness.
   write_lock_effective_poison "$MAESTRO_LOCK_DIR" "$metadata" \
     poison_metadata quiescence
-  if [ "$quiescence" = "unconfirmed" ]; then
-    unconfirmed_job=$(write_lock_metadata_value "$poison_metadata" unconfirmed_job)
-    unconfirmed_reason=$(write_lock_metadata_value "$poison_metadata" unconfirmed_reason)
-    owner_session=$(write_lock_metadata_value "$poison_metadata" session_id)
-    owner_session=$(MAESTRO_SESSION_ID="${owner_session:-}" write_lock_session_id)
-    progress "MAESTRO_LOCK: write lease retained because quiescence was never confirmed (job=${unconfirmed_job:-$owner_job} session=${owner_session:-unknown} reason=${unconfirmed_reason:-unknown}, lock: $MAESTRO_LOCK_DIR)"
-    return 0
+  if [ "$poison_metadata" != "$metadata" ] &&
+    ! lock_claim_record_matches_identity "$poison_metadata" "$observed_identity"; then
+    progress "MAESTRO_LOCK: staged poison generation changed during release; retaining the lock"
+    return 11
   fi
-  current_token=$(write_lock_metadata_value "$metadata" token)
-  [ "$current_token" = "${MAESTRO_LOCK_TOKEN:-}" ] || return 0
-  reclaim_dir="$MAESTRO_LOCK_DIR/.reclaim"
-  if ! mkdir "$reclaim_dir" 2>/dev/null; then
-    progress "MAESTRO_LOCK: lease release lost the generation claim; retaining the lock"
-    return 0
+  if [ "$quiescence" = "unconfirmed" ]; then
+    progress "MAESTRO_LOCK: write lease retained because cancellation poison arrived during release (lock: $MAESTRO_LOCK_DIR)"
+    return 11
   fi
   current_token=$(write_lock_metadata_value "$metadata" token)
   if [ "$current_token" != "${MAESTRO_LOCK_TOKEN:-}" ]; then
-    rmdir "$reclaim_dir" 2>/dev/null || :
+    progress "MAESTRO_LOCK: lease token changed during release; retaining the lock"
+    return 11
+  fi
+  if ! lock_claim_acquire "$MAESTRO_LOCK_DIR" \
+    "$observed_identity" "${MAESTRO_LOCK_TOKEN:-}"; then
+    progress "MAESTRO_LOCK: lease release lost the generation claim; retaining the lock"
+    return 11
+  fi
+  claimed=$(lock_claim_path "$MAESTRO_LOCK_DIR") || {
+    lock_claim_release "$MAESTRO_LOCK_DIR" \
+      "$observed_identity" "${MAESTRO_LOCK_TOKEN:-}" || :
+    progress "MAESTRO_LOCK: lease release lost its claimed path; retaining the lock"
+    return 11
+  }
+  metadata="$claimed/metadata"
+  if ! lock_claim_current_path_matches "$observed_identity" \
+    "${MAESTRO_LOCK_TOKEN:-}"; then
+    lock_claim_release "$MAESTRO_LOCK_DIR" \
+      "$observed_identity" "${MAESTRO_LOCK_TOKEN:-}" || :
     progress "MAESTRO_LOCK: lease generation changed during release; releasing nothing"
-    return 0
+    return 11
   fi
-  write_lock_effective_poison "$MAESTRO_LOCK_DIR" "$metadata" \
-    poison_metadata quiescence
+  write_lock_effective_poison "$claimed" "$metadata" poison_metadata quiescence 19>&-
+  if [ "$poison_metadata" != "$metadata" ] &&
+    ! lock_claim_record_matches_identity "$poison_metadata" "$observed_identity"; then
+    lock_claim_release "$MAESTRO_LOCK_DIR" \
+      "$observed_identity" "${MAESTRO_LOCK_TOKEN:-}" || :
+    progress "MAESTRO_LOCK: staged poison generation changed during release; retaining the lock"
+    return 11
+  fi
   if [ "$quiescence" = "unconfirmed" ]; then
-    rmdir "$reclaim_dir" 2>/dev/null || :
+    lock_claim_release "$MAESTRO_LOCK_DIR" \
+      "$observed_identity" "${MAESTRO_LOCK_TOKEN:-}" || :
     progress "MAESTRO_LOCK: write lease retained because cancellation poison arrived during release (lock: $MAESTRO_LOCK_DIR)"
-    return 0
+    return 11
   fi
-  # Publish the completed baseline while the generation claim still excludes a
-  # successor. Otherwise the next acquirer can compare against the older record
-  # and report this authorized dispatch as a false baseline gap.
-  if log_path=$(provenance_log_path 2>/dev/null); then
-    # Best-effort diagnostic only, not an enforcement boundary: repository writers can rewrite this log.
-    # A differing before/after pair is a dispatch-window change with an unknown author:
-    # lease metadata delimits an interval; it never identifies which process wrote.
+  if write_lock_unknown_entry "$claimed" unknown_entry; then
+    lock_claim_release "$MAESTRO_LOCK_DIR" \
+      "$observed_identity" "${MAESTRO_LOCK_TOKEN:-}" || :
+    progress "MAESTRO_LOCK: write lease retained because its directory contains an unrecognized entry ($unknown_entry)"
+    return 11
+  fi
+  if log_path=$(provenance_log_path 19>&- 2>/dev/null); then
     provenance_log_append "$log_path" "$(printf '%s type=dispatch job=%s session=%s before=%s after=%s' \
-      "$released_at" "$owner_job" "${owner_session:-unknown}" "$digest_before" "$digest_after")" || :
+      "$released_at" "$owner_job" "${owner_session:-unknown}" "$digest_before" "$digest_after")" 19>&- || :
   fi
-  if ! rm -f "$metadata" "$MAESTRO_LOCK_DIR/metadata.new" \
-    "$MAESTRO_LOCK_DIR/heartbeat" 2>/dev/null ||
-    ! write_lock_remove_publication_temps "$MAESTRO_LOCK_DIR" ||
-    ! rmdir "$reclaim_dir" 2>/dev/null ||
-    ! rmdir "$MAESTRO_LOCK_DIR" 2>/dev/null; then
-    rmdir "$reclaim_dir" 2>/dev/null || :
-    return 0
+  if ! lock_claim_discard "$MAESTRO_LOCK_DIR" \
+    "$observed_identity" "${MAESTRO_LOCK_TOKEN:-}"; then
+    progress "MAESTRO_LOCK: lease generation could not be removed after release; retaining fail-closed state"
+    return 11
   fi
   MAESTRO_LOCK_ACQUIRED=0
+  MAESTRO_LOCK_IDENTITY=""
 }
 
 # Operator-facing manual check; do not wire this into cleanup.
@@ -1016,14 +1208,14 @@ provenance_check() {
 
 write_lease_clear() { # result-file evidence-file
   local result="${1-}" evidence="${2-}"
-  local lock_path metadata staged_metadata heartbeat orphan stale_heartbeat
+  local lock_path metadata staged_metadata heartbeat orphan stale_heartbeat heartbeat_missing
   local lock_mtime now lock_age poisoned_job poisoned_reason poisoned_session
   local poison_metadata quiescence owner_token owner_job owner_session owner_pid
   local owner_start started_epoch malformed heartbeat_stale heartbeat_note
   local heartbeat_effective heartbeat_epoch heartbeat_age current_start
-  local writers writers_rc running_job clear_token reclaim_dir
-  local current_poison current_quiescence current_token
-  local recovery_record recovery_pid recovery_start
+  local writers writers_rc running_job clear_token reclaim_dir claim_mode
+  local current_poison current_quiescence current_token generation_claim_token
+  local recovery_record recovery_pid recovery_start observed_identity current_identity
   [ -n "$result" ] && [ -n "$evidence" ] && [ "$result" != "$evidence" ] ||
     return 3
   : > "$evidence" || return 3
@@ -1038,12 +1230,17 @@ write_lease_clear() { # result-file evidence-file
     printf 'state=absent\n' > "$result"
     return 0
   fi
+  observed_identity=$(write_lock_path_identity "$lock_path") || {
+    progress "MAESTRO_LOCK: refusing to clear — Lease interval identity is unconfirmed (lock: $lock_path)"
+    return 11
+  }
 
   metadata="$lock_path/metadata"
   staged_metadata="$lock_path/metadata.new"
   heartbeat="$lock_path/heartbeat"
   orphan=0
   stale_heartbeat=0
+  heartbeat_missing=0
   if [ ! -e "$metadata" ] && [ ! -e "$staged_metadata" ]; then
     lock_mtime=$(write_lock_path_mtime_epoch "$lock_path") || {
       progress "MAESTRO_LOCK: refusing to clear — metadata is absent and lock age is unconfirmed (lock: $lock_path)"
@@ -1063,6 +1260,17 @@ write_lease_clear() { # result-file evidence-file
   else
     write_lock_effective_poison "$lock_path" "$metadata" \
       poison_metadata quiescence
+    if [ ! -f "$metadata" ] || [ -L "$metadata" ] ||
+      ! lock_claim_record_matches_identity "$metadata" "$observed_identity"; then
+      progress "MAESTRO_LOCK: refusing to clear — Lease interval metadata belongs to another generation (lock: $lock_path)"
+      return 11
+    fi
+    if [ "$poison_metadata" != "$metadata" ] &&
+      { [ ! -f "$poison_metadata" ] || [ -L "$poison_metadata" ] ||
+        ! lock_claim_record_matches_identity "$poison_metadata" "$observed_identity"; }; then
+      progress "MAESTRO_LOCK: refusing to clear — staged Lease interval metadata is malformed or belongs to another generation (lock: $lock_path)"
+      return 11
+    fi
     if [ "$quiescence" != "unconfirmed" ]; then
       owner_token=$(write_lock_metadata_value "$metadata" token)
       owner_job=$(write_lock_metadata_value "$metadata" job_id)
@@ -1088,9 +1296,12 @@ write_lease_clear() { # result-file evidence-file
           if [ "$heartbeat_stale" -ne 0 ]; then
             now=$(date +%s)
             heartbeat_effective=$started_epoch
-            heartbeat_epoch=$(write_lock_heartbeat_epoch "$lock_path" "$owner_token")
+            heartbeat_epoch=$(write_lock_heartbeat_epoch "$lock_path" \
+              "$owner_token" "$observed_identity")
             case "$heartbeat_epoch" in
-              ''|*[!0-9]*) ;;
+              ''|*[!0-9]*)
+                heartbeat_missing=1
+                ;;
               *)
                 [ "$heartbeat_epoch" -gt "$heartbeat_effective" ] &&
                   heartbeat_effective=$heartbeat_epoch
@@ -1100,6 +1311,8 @@ write_lease_clear() { # result-file evidence-file
             [ "$heartbeat_age" -lt 0 ] && heartbeat_age=0
             if [ "$heartbeat_age" -gt "$heartbeat_stale" ]; then
               stale_heartbeat=1
+            elif [ "$heartbeat_missing" -eq 1 ]; then
+              heartbeat_note="; metadata-only lease (heartbeat file missing; lease start ${heartbeat_age}s old)"
             else
               heartbeat_note="; heartbeat ${heartbeat_age}s old"
             fi
@@ -1170,65 +1383,84 @@ write_lease_clear() { # result-file evidence-file
     progress "MAESTRO_LOCK: refusing to clear — a write-capable job is still running (${running_job:-unknown}) session=${poisoned_session:-unknown}"
     return 11
   fi
-  reclaim_dir="$lock_path/.reclaim"
-  if ! mkdir "$reclaim_dir" 2>/dev/null; then
-    progress "MAESTRO_LOCK: refusing to clear — Lease interval generation claim is unavailable (lock: $lock_path)"
+  generation_claim_token=${clear_token:-}
+  claim_mode=present
+  if [ -z "$generation_claim_token" ]; then
+    generation_claim_token="orphan-$observed_identity"
+    claim_mode=absent
+  fi
+  if ! lock_claim_acquire "$lock_path" "$observed_identity" \
+    "$generation_claim_token" "$claim_mode"; then
+    progress "MAESTRO_LOCK: refusing to clear — generation claim is unavailable (lock: $lock_path)"
     return 11
   fi
+  reclaim_dir=$(lock_claim_path "$lock_path") || {
+    lock_claim_release "$lock_path" "$observed_identity" \
+      "$generation_claim_token" || :
+    return 11
+  }
+  metadata="$reclaim_dir/metadata"
+  staged_metadata="$reclaim_dir/metadata.new"
   if [ "$orphan" -eq 1 ]; then
     if [ -e "$metadata" ] || [ -e "$staged_metadata" ]; then
-      rmdir "$reclaim_dir" 2>/dev/null || :
+      lock_claim_release "$lock_path" "$observed_identity" \
+        "$generation_claim_token" || :
       progress "MAESTRO_LOCK: refusing to clear — metadata appeared while claiming the orphan Lease interval"
       return 11
     fi
+    current_identity=$(write_lock_path_identity "$reclaim_dir") || current_identity=""
+    if [ "$current_identity" != "$observed_identity" ]; then
+      lock_claim_release "$lock_path" "$observed_identity" \
+        "$generation_claim_token" || :
+      progress "MAESTRO_LOCK: refusing to clear — Lease interval generation changed during recovery"
+      return 11
+    fi
   else
-    write_lock_effective_poison "$lock_path" "$metadata" \
-      current_poison current_quiescence
+    write_lock_effective_poison "$reclaim_dir" "$metadata" \
+      current_poison current_quiescence 19>&-
+    if [ "$current_poison" != "$metadata" ] &&
+      { [ ! -f "$current_poison" ] || [ -L "$current_poison" ] ||
+        ! lock_claim_record_matches_identity "$current_poison" "$observed_identity"; }; then
+      lock_claim_release "$lock_path" "$observed_identity" \
+        "$generation_claim_token" || :
+      progress "MAESTRO_LOCK: refusing to clear — Lease interval poison belongs to another generation"
+      return 11
+    fi
+    current_identity=$(write_lock_path_identity "$reclaim_dir") || current_identity=""
     current_token=$(write_lock_metadata_value "$current_poison" token)
     if [ -z "$current_token" ] && [ "$current_poison" != "$metadata" ]; then
       current_token=$(write_lock_metadata_value "$metadata" token)
     fi
-    if [ "$current_token" != "$clear_token" ] ||
+    if [ "$current_identity" != "$observed_identity" ] ||
+      [ "$current_token" != "$clear_token" ] ||
       { [ "$stale_heartbeat" -eq 0 ] &&
         [ "$current_quiescence" != unconfirmed ]; }; then
-      rmdir "$reclaim_dir" 2>/dev/null || :
+      lock_claim_release "$lock_path" "$observed_identity" \
+        "$generation_claim_token" || :
       progress "MAESTRO_LOCK: refusing to clear — Lease interval generation changed during recovery"
       return 11
     fi
   fi
 
   if [ "$orphan" -eq 1 ]; then
-    progress "MAESTRO_LOCK: clearing structurally invalid orphan write lease (lock: $lock_path, removing: every entry under $lock_path, then $lock_path)"
-    if ! find "$lock_path" -mindepth 1 -maxdepth 1 \
-      ! -name .reclaim -exec rm -rf {} + 2>/dev/null ||
-      ! rmdir "$reclaim_dir" 2>/dev/null ||
-      ! write_lock_remove_publication_temps "$lock_path" ||
-      ! rmdir "$lock_path" 2>/dev/null; then
-      rmdir "$reclaim_dir" 2>/dev/null || :
-      progress "MAESTRO_LOCK: failed to clear structurally invalid orphan write lease at $lock_path"
-      return 11
-    fi
+    progress "MAESTRO_LOCK: clearing structurally invalid orphan write lease (lock: $lock_path, removing atomically: every entry in the claimed generation)"
+  elif [ "$stale_heartbeat" -eq 1 ] && [ "$heartbeat_missing" -eq 1 ]; then
+    progress "MAESTRO_LOCK: clearing metadata-only write lease after its missing heartbeat exceeded the stale threshold (job=$owner_job session=${owner_session:-unknown} lease_start_age=${heartbeat_age}s, lock: $lock_path)"
   elif [ "$stale_heartbeat" -eq 1 ]; then
     progress "MAESTRO_LOCK: clearing a write lease whose heartbeat went stale (job=$owner_job session=${owner_session:-unknown} last_heartbeat=${heartbeat_age}s ago, lock: $lock_path)"
-  elif [ -e "$staged_metadata" ]; then
-    progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path, removing: $staged_metadata)"
+  elif [ -e "$reclaim_dir/metadata.new" ]; then
+    progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path, removing staged entry atomically: $lock_path/metadata.new)"
   else
     progress "MAESTRO_LOCK: clearing poisoned write lease (job=${poisoned_job:-unknown} session=${poisoned_session:-unknown} reason=${poisoned_reason:-unknown}, lock: $lock_path)"
   fi
-  if [ "$orphan" -eq 0 ]; then
-    if ! rm -f "$metadata" "$heartbeat" 2>/dev/null ||
-      ! rm -rf "$staged_metadata" 2>/dev/null ||
-      ! write_lock_remove_publication_temps "$lock_path" ||
-      ! rmdir "$reclaim_dir" 2>/dev/null ||
-      ! rmdir "$lock_path" 2>/dev/null; then
-      rmdir "$reclaim_dir" 2>/dev/null || :
-      if [ "$stale_heartbeat" -eq 1 ]; then
-        progress "MAESTRO_LOCK: failed to clear stale-heartbeat write lease at $lock_path session=${owner_session:-unknown}"
-      else
-        progress "MAESTRO_LOCK: failed to clear poisoned write lease at $lock_path session=${poisoned_session:-unknown}"
-      fi
-      return 11
-    fi
+  if ! lock_claim_discard "$lock_path" "$observed_identity" \
+    "$generation_claim_token"; then
+    progress "MAESTRO_LOCK: failed to atomically remove the claimed write lease generation at $lock_path"
+    return 11
+  fi
+  if [ -d "$lock_path" ]; then
+    progress "MAESTRO_LOCK: cleared the requested generation, but a successor already holds the write lease (lock: $lock_path)"
+    return 11
   fi
   printf 'state=cleared\n' > "$result"
   return 0
@@ -1268,8 +1500,7 @@ _write_lease_turn_event() { # event job reason result-file evidence-file
       ;;
     cancel-end)
       _MAESTRO_WRITE_LEASE_RETAIN=1
-      if [ ! -e "${MAESTRO_LOCK_DIR:-}/metadata.new" ] ||
-        ! mv -f "${MAESTRO_LOCK_DIR}/metadata.new" "${MAESTRO_LOCK_DIR}/metadata" 2>/dev/null; then
+      if ! write_lock_finalize_poison; then
         printf 'MAESTRO_LOCK: cancellation poison could not be finalized (job=%s reason=%s)\n' \
           "$job" "$reason" >> "$evidence" 2>/dev/null || :
         return 11
@@ -1292,6 +1523,7 @@ write_lease_begin() { # evidence-file
   [ -n "$evidence" ] || return 3
   MAESTRO_LOCK_TOKEN=""
   MAESTRO_LOCK_DIR=""
+  MAESTRO_LOCK_IDENTITY=""
   MAESTRO_LOCK_ACQUIRED=0
   _MAESTRO_WRITE_LEASE_RETAIN=0
   write_lock_acquire unknown
@@ -1304,6 +1536,7 @@ write_lease_end() { # evidence-file
   if [ -z "$lock_path" ] || [ ! -d "$lock_path" ]; then
     MAESTRO_LOCK_TOKEN=""
     MAESTRO_LOCK_DIR=""
+    MAESTRO_LOCK_IDENTITY=""
     MAESTRO_LOCK_ACQUIRED=0
     _MAESTRO_WRITE_LEASE_RETAIN=0
   fi

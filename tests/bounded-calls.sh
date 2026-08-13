@@ -395,7 +395,7 @@ t14_nonzero_status_and_result_are_lost() (
   local output="$TEST_ROOT/nonzero-status.out" calls="$TEST_ROOT/nonzero-status.calls"
   local call_out="$TEST_ROOT/nonzero-status.stdout"
   local call_err="$TEST_ROOT/nonzero-status.stderr"
-  local result="$TEST_ROOT/nonzero-result" rc statuses
+  local result="$TEST_ROOT/nonzero-result" evidence="$TEST_ROOT/nonzero-result.evidence" rc statuses
   sleep() { command sleep 0.05; }
   : > "$calls"
   MAESTRO_TEST_CALL_LOG="$calls" \
@@ -412,7 +412,7 @@ t14_nonzero_status_and_result_are_lost() (
 
   MAESTRO_TEST_RESULT='RESULT: DONE' MAESTRO_TEST_RESULT_EXIT=1 \
     companion_result "$FIXTURE" task-result-exit-aaaaaa : "$result" \
-      "$call_out" "$call_err" >/dev/null 2>&1
+      "$call_out" "$call_err" "$evidence" >/dev/null 2>&1
   rc=$?
   [ "$rc" -eq 4 ] || { echo "nonzero result rc=$rc want 4"; return 1; }
 )
@@ -478,6 +478,18 @@ t16_three_segment_job_id_round_trips() (
   done
 )
 
+t17_repeated_instant_exit_is_reaped() (
+  local out="$TEST_ROOT/instant-exit.out" err="$TEST_ROOT/instant-exit.err"
+  local i rc
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+    21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+    process_run_bounded 1 TEST_INSTANT : "$out" "$err" -- bash -c 'exit 0'
+    rc=$?
+    [ "$rc" -eq 0 ] ||
+      { echo "instant exit $i rc=$rc want 0"; return 1; }
+  done
+)
+
 check() {
   local fn="$1" label="$2" detail
   if detail=$("$fn" 2>&1); then
@@ -508,5 +520,6 @@ check t13_cancellation_writes_one_terminal_fact "cancellation produces one calle
 check t14_nonzero_status_and_result_are_lost "nonzero status and result calls fail closed despite parseable output"
 check t15_capitalized_terminal_status_completes "capitalized terminal status is normalized once"
 check t16_three_segment_job_id_round_trips "three-segment job ids round-trip without truncation"
+check t17_repeated_instant_exit_is_reaped "repeated instant exits cannot wedge bounded polling"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
