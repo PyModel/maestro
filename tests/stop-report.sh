@@ -70,13 +70,14 @@ printf 'Objective: fail closed when status is lost.\n' > "$STATUS_LOSS_PLAN"
 printf 'Objective: carry failed evidence.\n' > "$FAILED_PLAN"
 printf 'Objective: reject a result prefix.\n' > "$REPO/prefix-plan.md"
 printf 'Objective: accept the last result record.\n' > "$REPO/last-record-plan.md"
+printf 'Objective: accept a trailing result reason.\n' > "$REPO/reason-plan.md"
 cp "$DONE_PLAN" "$TEST_ROOT/done-plan.before"
 git init -q "$REPO"
 (
   cd "$REPO" &&
     git config user.email p@p &&
     git config user.name p &&
-    git add needs-plan.md done-plan.md status-loss-plan.md failed-plan.md prefix-plan.md last-record-plan.md &&
+    git add needs-plan.md done-plan.md status-loss-plan.md failed-plan.md prefix-plan.md last-record-plan.md reason-plan.md &&
     git commit -q -m init
 )
 
@@ -168,6 +169,8 @@ run_loop prefix "$REPO/prefix-plan.md" 'RESULT: DONEISH' 2
 PREFIX_RC=$?
 run_loop last-record "$REPO/last-record-plan.md" $'RESULT: FAILED\nearlier failure\nRESULT: DONE'
 LAST_RECORD_RC=$?
+run_loop reason "$REPO/reason-plan.md" 'RESULT: BLOCKED — active lock prevented the bounded tests'
+REASON_RC=$?
 run_failed_loop
 run_status_loss
 
@@ -271,6 +274,15 @@ t7_result_records_are_full_line_and_last_wins() {
   [ "$LAST_RECORD_RC" -eq 0 ] || { echo "last-record rc=$LAST_RECORD_RC want 0"; return 1; }
   grep -q 'LOOP_STATE: VERIFIED_DONE' "$TEST_ROOT/last-record.progress" ||
     { echo "last anchored DONE record did not win"; return 1; }
+}
+
+t7b_result_trailing_reason_is_blocked() {
+  local starts
+  [ "$REASON_RC" -eq 11 ] || { echo "trailing-reason rc=$REASON_RC want 11"; return 1; }
+  starts=$(grep -c '^task ' "$TEST_ROOT/reason.calls" || true)
+  [ "$starts" -eq 1 ] || { echo "trailing-reason starts=$starts want 1"; return 1; }
+  ! grep -qx 'IMPLEMENTER_STATE: COMPANION_FAILURE' "$TEST_ROOT/reason.stderr" ||
+    { echo "trailing-reason was classified as companion failure"; return 1; }
 }
 
 t8_failed_result_evidence_reaches_next_dispatch() {
@@ -911,6 +923,7 @@ check t4_second_stop_appended "second stop appends a second history block"
 check t5_verified_done_unchanged "VERIFIED_DONE appends nothing"
 check t6_status_loss_fails_closed "status loss blocks after one dispatch and retains poison"
 check t7_result_records_are_full_line_and_last_wins "RESULT records are anchored and the last record wins"
+check t7b_result_trailing_reason_is_blocked "RESULT trailing reason remains a real BLOCKED result"
 check t8_failed_result_evidence_reaches_next_dispatch "FAILED result evidence reaches the next dispatch"
 check t8b_stuck_attempt_history_persists "STUCK persists bounded attempt history in the plan"
 check t8c_result_transport_failure_blocks_without_retry "result transport failure blocks without billing a retry"

@@ -24,7 +24,7 @@ _write_turn_positive_integer() {
 
 _write_turn_result_state() {
   printf '%s\n' "$1" |
-    sed -nE 's/^RESULT:[[:space:]]*(DONE|NEEDS_ANSWERS|BLOCKED|FAILED)[[:space:]]*$/\1/p' |
+    sed -nE 's/^RESULT:[[:space:]]*(DONE|NEEDS_ANSWERS|BLOCKED|FAILED)([[:space:]]*[^[:alnum:]_[:space:]].*)?[[:space:]]*$/\1/p' |
     tail -1
 }
 # Implementer contract — appended to every dispatch so each run is disciplined by
