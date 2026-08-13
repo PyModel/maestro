@@ -89,7 +89,7 @@ t0c_failed_started_publication_cancels_job() (
   local evidence="$TEST_ROOT/publication-failure.evidence"
   local calls="$TEST_ROOT/publication-failure.calls" rc
   companion_resolve() { printf '%s' "$FIXTURE"; }
-  companion_pin() { printf 'gpt-5.6-sol\thigh\thigh\n'; }
+  companion_pin() { printf 'gpt-5.6-sol\thigh\thigh\tgpt-5.6-luna-max\n'; }
   reject_started() {
     [ "$1" != started ]
   }
@@ -106,6 +106,38 @@ t0c_failed_started_publication_cancels_job() (
     { echo "profile omitted unpublished job"; return 1; }
   grep -q '^cancel_reason=launch-publication-failed$' "$profile" ||
     { echo "profile omitted publication failure"; return 1; }
+)
+
+t0e_role_dispatch_uses_pinned_models() (
+  local read_prompt="$TEST_ROOT/model-routing-read.prompt"
+  local read_result="$TEST_ROOT/model-routing-read.result"
+  local read_profile="$TEST_ROOT/model-routing-read.profile"
+  local read_evidence="$TEST_ROOT/model-routing-read.evidence"
+  local read_argv="$TEST_ROOT/model-routing-read.argv"
+  local write_prompt="$TEST_ROOT/model-routing-write.prompt"
+  local write_result="$TEST_ROOT/model-routing-write.result"
+  local write_profile="$TEST_ROOT/model-routing-write.profile"
+  local write_evidence="$TEST_ROOT/model-routing-write.evidence"
+  local write_argv="$TEST_ROOT/model-routing-write.argv" rc
+  companion_resolve() { printf '%s' "$FIXTURE"; }
+  companion_pin() { printf 'gpt-5.6-sol\thigh\thigh\tgpt-5.6-luna-max\n'; }
+  write_lifecycle() { return 0; }
+  printf 'read objective\n' > "$read_prompt"
+  export MAESTRO_TEST_ARGV="$read_argv"
+  companion_turn read "$read_prompt" 2 1 "$read_result" "$read_profile" \
+    "$read_evidence" :
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo "read dispatch rc=$rc"; return 1; }
+  grep -Fq '"--model","gpt-5.6-sol"' "$read_argv" ||
+    { echo "read dispatch used the implementation model: $(cat "$read_argv")"; return 1; }
+  printf 'write objective\n' > "$write_prompt"
+  export MAESTRO_TEST_ARGV="$write_argv"
+  companion_turn write "$write_prompt" 2 1 "$write_result" "$write_profile" \
+    "$write_evidence" write_lifecycle
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo "write dispatch rc=$rc"; return 1; }
+  grep -Fq '"--model","gpt-5.6-luna-max"' "$write_argv" ||
+    { echo "write dispatch used the debate model: $(cat "$write_argv")"; return 1; }
 )
 
 t0d_read_interrupt_never_cancels_unknown_writer() (
@@ -503,6 +535,7 @@ printf '=== Bounded companion calls verification ===\n'
 check t0_process_module_contract "deep process module owns bounded output and rc"
 check t0b_companion_module_contract "companion interface requires an explicit mode"
 check t0c_failed_started_publication_cancels_job "failed launch publication cancels the unpublished job"
+check t0e_role_dispatch_uses_pinned_models "read and write dispatches use their pinned models"
 check t0d_read_interrupt_never_cancels_unknown_writer "read interrupt never cancels an unknown writer"
 check t1_hanging_status_is_bounded "hanging status honors the companion timeout"
 check t2_timeout_reaps_process_group "timeout returns 125 and reaps the process group"

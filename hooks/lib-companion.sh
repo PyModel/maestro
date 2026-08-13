@@ -142,32 +142,40 @@ companion_resolve() {
 }
 
 companion_pin() {
-  local here selector pin model efforts debate_effort impl_effort
+  local here selector pin model fields debate_effort impl_effort impl_model
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   selector="$here/codex-model-select.sh"
   if ! pin=$(bash "$selector" --pin 2>/dev/null); then
-    echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <debate-effort> <impl-effort>" >&2
+    echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <debate-effort> <impl-effort> <impl-model>" >&2
     return 3
   fi
   case "$pin" in
-    *$'\t'*$'\t'*) ;;
+    *$'\t'*$'\t'*$'\t'*) ;;
     *)
-      echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <debate-effort> <impl-effort>" >&2
+      echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <debate-effort> <impl-effort> <impl-model>" >&2
       return 3 ;;
   esac
   model=${pin%%$'\t'*}
-  efforts=${pin#*$'\t'}
-  debate_effort=${efforts%%$'\t'*}
-  impl_effort=${efforts#*$'\t'}
-  if [ -z "$model" ] || [ -z "$debate_effort" ] || [ -z "$impl_effort" ]; then
-    echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <debate-effort> <impl-effort>" >&2
+  fields=${pin#*$'\t'}
+  debate_effort=${fields%%$'\t'*}
+  fields=${fields#*$'\t'}
+  impl_effort=${fields%%$'\t'*}
+  impl_model=${fields#*$'\t'}
+  if [ -z "$model" ] || [ -z "$debate_effort" ] ||
+    [ -z "$impl_effort" ] || [ -z "$impl_model" ]; then
+    echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <debate-effort> <impl-effort> <impl-model>" >&2
     return 3
   fi
   if ! companion_wrapper_accepts_effort "$impl_effort"; then
     echo "unsupported implementation effort '$impl_effort' — choose none|minimal|low|medium|high|xhigh; max/ultra are debate-only" >&2
     return 3
   fi
-  printf '%s\t%s\t%s\n' "$model" "$debate_effort" "$impl_effort"
+  case "$impl_model" in
+    *[!a-zA-Z0-9._-]*)
+      echo "unsupported implementation model '$impl_model' — choose letters, digits, . _ -" >&2
+      return 3 ;;
+  esac
+  printf '%s\t%s\t%s\t%s\n' "$model" "$debate_effort" "$impl_effort" "$impl_model"
 }
 
 companion_start() { # companion prompt mode model effort lifecycle job-file stdout stderr
@@ -623,7 +631,7 @@ _companion_turn_cleanup() { # profile-file [retain-job-lock]
 companion_turn() { # mode prompt-file max-idle poll result-file profile-file evidence-file lifecycle
   local mode="${1-}" prompt_file="${2-}" max_idle="${3-}" poll="${4-}"
   local result="${5-}" profile="${6-}" evidence="${7-}" lifecycle="${8-}"
-  local prompt C pin efforts model effort job rc cleanup_rc derived
+  local prompt C pin fields model effort impl_model job rc cleanup_rc derived
   local override_model="${MAESTRO_COMPANION_MODEL-}"
   local override_effort="${MAESTRO_COMPANION_EFFORT-}"
   local override_model_set=0 override_effort_set=0
@@ -663,11 +671,15 @@ companion_turn() { # mode prompt-file max-idle poll result-file profile-file evi
   C=$(companion_resolve) || return 3
   pin=$(companion_pin) || return 3
   model=${pin%%$'\t'*}
-  efforts=${pin#*$'\t'}
+  fields=${pin#*$'\t'}
+  fields=${fields#*$'\t'}
+  effort=${fields%%$'\t'*}
+  impl_model=${fields#*$'\t'}
   if [ "$mode" = write ]; then
-    effort=${efforts#*$'\t'}
+    model=$impl_model
   else
-    effort=${efforts%%$'\t'*}
+    fields=${pin#*$'\t'}
+    effort=${fields%%$'\t'*}
   fi
   [ "${MAESTRO_COMPANION_MODEL+x}" = x ] && override_model_set=1
   [ "${MAESTRO_COMPANION_EFFORT+x}" = x ] && override_effort_set=1

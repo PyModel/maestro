@@ -27,6 +27,17 @@ function nextSequenceValue(file, fallback) {
   return values[0];
 }
 
+function requestedFlag(name, fallback) {
+  if (!process.env.MAESTRO_TEST_ARGV) return fallback;
+  try {
+    const argv = JSON.parse(fs.readFileSync(process.env.MAESTRO_TEST_ARGV, "utf8"));
+    const index = argv.indexOf(name);
+    return typeof argv[index + 1] === "string" ? argv[index + 1] : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 if (command === "--help") {
   appendCall("--help");
   const delay = Number(process.env.MAESTRO_TEST_HELP_DELAY ?? "0");
@@ -130,13 +141,15 @@ if (command === "status" && args.at(-1) === "--json") {
         process.env.MAESTRO_TEST_JOB_PHASE_FILE,
         process.env.MAESTRO_TEST_JOB_PHASE ?? "completed"
       );
+  const requestedModel = requestedFlag("--model", "gpt-5.6-sol");
+  const requestedEffort = requestedFlag("--effort", "high");
   const job = {
     id: args[0],
     status,
     phase: status === "running" ? "running" : "done",
     elapsed: "1s",
     progressPreview: [],
-    request: { model: "gpt-5.6-sol", effort: "high" }
+    request: { model: requestedModel, effort: requestedEffort }
   };
   if (process.env.MAESTRO_TEST_LOGFILE) {
     job.logFile = process.env.MAESTRO_TEST_LOGFILE;

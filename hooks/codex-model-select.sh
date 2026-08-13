@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Maestro Codex model + debate/implementation effort selector.
 # Pins top-level model settings in ~/.codex/config.toml and keeps the
-# implementation effort in ~/.codex/maestro-impl-effort and the scout pin in
-# ~/.codex/maestro-scout.
+# implementation effort/model in ~/.codex/maestro-impl-effort and
+# ~/.codex/maestro-impl-model, plus the scout pin in ~/.codex/maestro-scout.
 #
 # Usage:
 #   codex-model-select.sh --show
 #   codex-model-select.sh --pin
 #   codex-model-select.sh --scout <model> <effort>
 #   codex-model-select.sh --scout-pin
-#   codex-model-select.sh <model> <debate-effort> [impl-effort]
+#   codex-model-select.sh <model> <debate-effort> [impl-effort] [impl-model]
 #   codex-model-select.sh --ask-on-start on|off|status
 #
 # Debate effort: none | minimal | low | medium | high | xhigh | max | ultra
@@ -19,6 +19,7 @@ set -uo pipefail
 
 CODEX_CONF="$HOME/.codex/config.toml"
 IMPL_EFFORT_FILE="$HOME/.codex/maestro-impl-effort"
+IMPL_MODEL_FILE="$HOME/.codex/maestro-impl-model"
 SCOUT_FILE="$HOME/.codex/maestro-scout"
 MAESTRO_DIR="$HOME/.maestro"
 ASK_FLAG="$MAESTRO_DIR/ask-on-start"
@@ -218,10 +219,19 @@ read_impl_effort() {
   printf -v "$1" '%s' "${VALUE:-medium}"
 }
 
+read_impl_model() {
+  local VALUE=""
+  if [ -f "$IMPL_MODEL_FILE" ]; then
+    IFS= read -r VALUE < "$IMPL_MODEL_FILE" || :
+  fi
+  printf -v "$1" '%s' "$VALUE"
+}
+
 show() {
-  local M E I SM SE
+  local M E I IM SM SE
   read_pin M E || return 3
   read_impl_effort I
+  read_impl_model IM
   echo "model=${M:-(not pinned — Codex default)}"
   if [ -n "$E" ] && ! valid_effort "$E"; then
     echo "effort=$E (invalid)"
@@ -229,6 +239,13 @@ show() {
     echo "effort=${E:-(not pinned — Codex default)}"
   fi
   echo "impl-effort=$I"
+  if [ -n "$IM" ] && valid_model "$IM"; then
+    echo "impl-model=$IM"
+  elif [ -f "$IMPL_MODEL_FILE" ] && [ -n "$IM" ]; then
+    echo "impl-model=$IM (invalid)"
+  else
+    echo "impl-model=${M:-(not pinned — Codex default)} (inherited)"
+  fi
   if [ ! -f "$SCOUT_FILE" ]; then
     echo "scout=(not pinned — scout dispatch disabled)"
   else
@@ -243,9 +260,10 @@ show() {
 }
 
 pin() {
-  local M E I
+  local M E I IM
   read_pin M E || return 3
   read_impl_effort I
+  read_impl_model IM
   if [ -z "$M" ] || [ -z "$E" ]; then
     echo "SELECT_ERROR: Codex model and effort must both be pinned in the config.toml preamble" >&2
     return 3
@@ -258,7 +276,12 @@ pin() {
     echo "SELECT_ERROR: invalid implementation effort '$I' (expected: none | minimal | low | medium | high | xhigh; max/ultra are debate-only because the companion wrapper cannot express them for write jobs)" >&2
     return 3
   fi
-  printf '%s\t%s\t%s\n' "$M" "$E" "$I"
+  if [ -n "$IM" ] && ! valid_model "$IM"; then
+    echo "SELECT_ERROR: invalid implementation model '$IM' (expected letters, digits, . _ -)" >&2
+    return 3
+  fi
+  [ -n "$IM" ] || IM="$M"
+  printf '%s\t%s\t%s\t%s\n' "$M" "$E" "$I" "$IM"
 }
 
 stat_mode() {
@@ -319,15 +342,19 @@ render_config() { # source destination model effort
   ' "$source" > "$destination"
 }
 
-publish_pin() { # model debate-effort impl-effort
-  local model="$1" effort="$2" impl="$3"
-  local config_source config_tmp impl_tmp config_original impl_original
-  local config_existed=0 impl_existed=0 config_mode=600 impl_mode=600
+publish_pin() { # model debate-effort impl-effort impl-model
+  local model="$1" effort="$2" impl="$3" impl_model="$4"
+  local config_source config_tmp impl_tmp model_tmp
+  local config_original impl_original model_original
+  local config_existed=0 impl_existed=0 model_existed=0
+  local config_mode=600 impl_mode=600 model_mode=600
   mkdir -p "$HOME/.codex" || return 3
   config_tmp="$CODEX_CONF.mtmp.$$"
   impl_tmp="$IMPL_EFFORT_FILE.mtmp.$$"
+  model_tmp="$IMPL_MODEL_FILE.mtmp.$$"
   config_original="$CODEX_CONF.moriginal.$$"
   impl_original="$IMPL_EFFORT_FILE.moriginal.$$"
+  model_original="$IMPL_MODEL_FILE.moriginal.$$"
 
   if [ -f "$CODEX_CONF" ]; then
     config_existed=1
@@ -348,19 +375,34 @@ publish_pin() { # model debate-effort impl-effort
       return 3
     }
   fi
+  if [ -f "$IMPL_MODEL_FILE" ]; then
+    model_existed=1
+    model_mode=$(stat_mode "$IMPL_MODEL_FILE") || {
+      rm -f "$config_original" "$impl_original"
+      return 3
+    }
+    cp -p "$IMPL_MODEL_FILE" "$model_original" || {
+      rm -f "$config_original" "$impl_original"
+      return 3
+    }
+  fi
 
   if ! render_config "$config_source" "$config_tmp" "$model" "$effort" ||
     ! chmod "$config_mode" "$config_tmp" ||
     ! printf '%s\n' "$impl" > "$impl_tmp" ||
-    ! chmod "$impl_mode" "$impl_tmp"; then
-    rm -f "$config_tmp" "$impl_tmp" "$config_original" "$impl_original"
+    ! chmod "$impl_mode" "$impl_tmp" ||
+    ! printf '%s\n' "$impl_model" > "$model_tmp" ||
+    ! chmod "$model_mode" "$model_tmp"; then
+    rm -f "$config_tmp" "$impl_tmp" "$model_tmp" \
+      "$config_original" "$impl_original" "$model_original"
     echo "SELECT_ERROR: could not stage Codex pin files" >&2
     return 3
   fi
 
   if [ "$config_existed" -eq 1 ] && [ ! -f "$CODEX_CONF.maestro.bak" ]; then
     cp -p "$CODEX_CONF" "$CODEX_CONF.maestro.bak" || {
-      rm -f "$config_tmp" "$impl_tmp" "$config_original" "$impl_original"
+      rm -f "$config_tmp" "$impl_tmp" "$model_tmp" \
+        "$config_original" "$impl_original" "$model_original"
       echo "SELECT_ERROR: could not back up config.toml" >&2
       return 3
     }
@@ -368,7 +410,8 @@ publish_pin() { # model debate-effort impl-effort
   fi
 
   if ! mv -f "$config_tmp" "$CODEX_CONF"; then
-    rm -f "$config_tmp" "$impl_tmp" "$config_original" "$impl_original"
+    rm -f "$config_tmp" "$impl_tmp" "$model_tmp" \
+      "$config_original" "$impl_original" "$model_original"
     echo "SELECT_ERROR: could not publish config.toml" >&2
     return 3
   fi
@@ -379,14 +422,42 @@ publish_pin() { # model debate-effort impl-effort
     else
       rm -f "$CODEX_CONF"
     fi
-    if [ "$impl_existed" -eq 1 ] && [ ! -f "$IMPL_EFFORT_FILE" ]; then
-      cp -p "$impl_original" "$IMPL_EFFORT_FILE" 2>/dev/null || :
+    if [ "$impl_existed" -eq 1 ]; then
+      [ -f "$IMPL_EFFORT_FILE" ] ||
+        cp -p "$impl_original" "$IMPL_EFFORT_FILE" 2>/dev/null || :
+    else
+      rm -f "$IMPL_EFFORT_FILE"
     fi
-    rm -f "$config_tmp" "$impl_tmp" "$config_original" "$impl_original"
+    rm -f "$config_tmp" "$impl_tmp" "$model_tmp" \
+      "$config_original" "$impl_original" "$model_original"
     echo "SELECT_ERROR: could not publish implementation effort; previous pin restored" >&2
     return 3
   fi
-  rm -f "$config_original" "$impl_original"
+  if ! mv -f "$model_tmp" "$IMPL_MODEL_FILE"; then
+    if [ "$config_existed" -eq 1 ]; then
+      mv -f "$config_original" "$CODEX_CONF" 2>/dev/null ||
+        cp -p "$config_original" "$CODEX_CONF" 2>/dev/null || :
+    else
+      rm -f "$CODEX_CONF"
+    fi
+    if [ "$impl_existed" -eq 1 ]; then
+      mv -f "$impl_original" "$IMPL_EFFORT_FILE" 2>/dev/null ||
+        cp -p "$impl_original" "$IMPL_EFFORT_FILE" 2>/dev/null || :
+    else
+      rm -f "$IMPL_EFFORT_FILE"
+    fi
+    if [ "$model_existed" -eq 1 ]; then
+      mv -f "$model_original" "$IMPL_MODEL_FILE" 2>/dev/null ||
+        cp -p "$model_original" "$IMPL_MODEL_FILE" 2>/dev/null || :
+    else
+      rm -f "$IMPL_MODEL_FILE"
+    fi
+    rm -f "$config_tmp" "$impl_tmp" "$model_tmp" \
+      "$config_original" "$impl_original" "$model_original"
+    echo "SELECT_ERROR: could not publish implementation model; previous pin restored" >&2
+    return 3
+  fi
+  rm -f "$config_original" "$impl_original" "$model_original"
   return 0
 }
 
@@ -438,17 +509,27 @@ case "${1:-}" in
     esac
     exit $? ;;
   ""|--help|-h)
-    echo "usage: codex-model-select.sh --show | --pin | --scout <model> <effort> | --scout-pin | <model> <debate-effort> [impl-effort] | --ask-on-start on|off|status" >&2
+    echo "usage: codex-model-select.sh --show | --pin | --scout <model> <effort> | --scout-pin | <model> <debate-effort> [impl-effort] [impl-model] | --ask-on-start on|off|status" >&2
     exit 3 ;;
 esac
 
 pin_lock_acquire || exit 3
+[ "$#" -le 4 ] || {
+  echo "usage: codex-model-select.sh <model> <debate-effort> [impl-effort] [impl-model]" >&2
+  exit 3
+}
 MODEL="${1:-}"
 EFFORT="${2:-}"
 if [ $# -ge 3 ]; then
   IMPL_EFFORT="$3"
 else
   read_impl_effort IMPL_EFFORT
+fi
+if [ "$#" -eq 4 ]; then
+  IMPL_MODEL="$4"
+else
+  read_impl_model IMPL_MODEL
+  [ -n "$IMPL_MODEL" ] || IMPL_MODEL="$MODEL"
 fi
 
 if ! valid_model "$MODEL"; then
@@ -463,8 +544,12 @@ if ! valid_impl_effort "$IMPL_EFFORT"; then
   echo "SELECT_ERROR: invalid implementation effort '$IMPL_EFFORT' (expected: none | minimal | low | medium | high | xhigh; max/ultra are debate-only because the companion wrapper cannot express them for write jobs)" >&2
   exit 3
 fi
-
-if ! publish_pin "$MODEL" "$EFFORT" "$IMPL_EFFORT"; then
+if ! valid_model "$IMPL_MODEL"; then
+  echo "SELECT_ERROR: invalid implementation model '$IMPL_MODEL' (expected letters, digits, . _ -)" >&2
   exit 3
 fi
-echo "SELECT: Codex pin updated → model=$MODEL debate-effort=$EFFORT impl-effort=$IMPL_EFFORT (applies from the next dispatch)"
+
+if ! publish_pin "$MODEL" "$EFFORT" "$IMPL_EFFORT" "$IMPL_MODEL"; then
+  exit 3
+fi
+echo "SELECT: Codex pin updated → model=$MODEL debate-effort=$EFFORT impl-effort=$IMPL_EFFORT impl-model=$IMPL_MODEL (applies from the next dispatch)"
