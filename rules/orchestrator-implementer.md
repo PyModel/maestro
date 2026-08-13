@@ -5,14 +5,16 @@
 
 ## Codex model & effort
 
-At session start a hook asks which Codex model and role-specific reasoning efforts to use (or shows the current pin). Discussion and implementation share the model but keep separate effort tiers. Mid-session, the user can say "codex model" to change them; apply with:
+At session start a hook asks which Codex models and role-specific reasoning efforts to use (or shows the current pin). Discussion and implementation each carry their own model and their own effort tier. Mid-session, the user can say "codex model" to change them; apply with:
 
 ```
 bash ~/.claude/hooks/codex-model-select.sh --show
-bash ~/.claude/hooks/codex-model-select.sh <model> <debate-effort> <impl-effort>
+bash ~/.claude/hooks/codex-model-select.sh <model> <debate-effort> <impl-effort> <impl-model>
 ```
 
-Effort guide: minimal/low for quick mechanical work, medium for default implementation, and **high for architecture debates, delicate refactors, and final-review judgment**. Debate effort may also use max/ultra through top-level Codex config; implementation effort is limited to none/minimal/low/medium/high/xhigh because the companion must express it explicitly per write job. Never accept a silent fallback from an unsupported implementation tier. Model availability depends on the user's ChatGPT plan; the script validates the name's shape only, and Codex itself rejects a model it cannot reach. “Keep current” is usable only when `--pin` succeeds; a fresh unpinned install cannot dispatch until the user selects values.
+Name `<impl-model>` explicitly. Omitting it keeps an existing implementation pin, but on a fresh unpinned install it silently inherits `<model>`, which is not the intended implementation default.
+
+Effort guide: minimal/low for quick mechanical work, medium for default implementation, and **high for architecture debates, delicate refactors, and final-review judgment**. Debate effort may also use max/ultra through top-level Codex config; implementation effort uses none/minimal/low/medium/high/xhigh per write job, while max/ultra are allowed only when the implementation effort exactly matches the pinned top-level debate effort and the companion omits the per-job flag. Never accept a silent fallback from an unsupported implementation tier. Model availability depends on the user's ChatGPT plan; the script validates the name's shape only, and Codex itself rejects a model it cannot reach. “Keep current” is usable only when `--pin` succeeds; a fresh unpinned install cannot dispatch until the user selects values.
 
 ## Dispatch
 

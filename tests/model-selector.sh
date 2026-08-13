@@ -47,7 +47,7 @@ EOF
   printf '%s\n' "$nested" | grep -qx '  model = "nested-model"' || { echo "nested model changed: $nested"; return 1; }
   printf '%s\n' "$nested" | grep -qx '  model_reasoning_effort = "low"' || { echo "nested effort changed: $nested"; return 1; }
   [ "$(cat "$impl")" = low ] || { echo "implementation effort not updated"; return 1; }
-  [ "$(HOME="$home" bash "$SELECTOR" --pin)" = $'gpt-5.6-sol\thigh\tlow' ] ||
+  [ "$(HOME="$home" bash "$SELECTOR" --pin)" = $'gpt-5.6-sol\thigh\tlow\tgpt-5.6-sol' ] ||
     { echo "--pin disagrees with written values"; return 1; }
 }
 
@@ -95,17 +95,17 @@ EOF
 
 t4_rejects_unexpressible_implementation_effort() {
   local home config impl output rc
-  home=$(new_home reject-impl-ultra)
+  home=$(new_home reject-impl-max)
   config="$home/.codex/config.toml"
   impl="$home/.codex/maestro-impl-effort"
   printf 'model = "old-model"\nmodel_reasoning_effort = "medium"\n' > "$config"
   printf 'medium\n' > "$impl"
   cp "$config" "$home/config.before"
   cp "$impl" "$home/impl.before"
-  output=$(HOME="$home" bash "$SELECTOR" new-model high ultra 2>&1); rc=$?
+  output=$(HOME="$home" bash "$SELECTOR" new-model high max 2>&1); rc=$?
   [ "$rc" -eq 3 ] || { echo "rc=$rc want 3: $output"; return 1; }
-  case "$output" in *'implementation effort'*'none | minimal | low | medium | high | xhigh'*) ;; *)
-    echo "rejection did not explain wrapper-supported implementation tiers: $output"; return 1 ;; esac
+  [ "$output" = "SELECT_ERROR: implementation effort 'max' cannot be expressed per write job (the companion accepts none|minimal|low|medium|high|xhigh); max/ultra are usable only when the top-level debate effort is the same value, currently 'high'" ] ||
+    { echo "unexpected rejection: $output"; return 1; }
   cmp -s "$config" "$home/config.before" || { echo "config changed after rejected implementation effort"; return 1; }
   cmp -s "$impl" "$home/impl.before" || { echo "implementation file changed after rejection"; return 1; }
 }
@@ -148,7 +148,144 @@ EOF
   [ "$a_rc" -eq 0 ] && [ "$b_rc" -eq 0 ] ||
     { echo "selector rc values A=$a_rc B=$b_rc; A=$(cat "$home/a.out") B=$(cat "$home/b.out")"; return 1; }
   final=$(HOME="$home" bash "$SELECTOR" --pin) || return 1
-  [ "$final" = $'model-b\tlow\tlow' ] || { echo "concurrent final pin is torn or reordered: $final"; return 1; }
+  [ "$final" = $'model-b\tlow\tlow\tmodel-a' ] || { echo "concurrent final pin is torn or reordered: $final"; return 1; }
+}
+
+t6_publishes_and_shows_implementation_model() {
+  local home config impl output pin show
+  home=$(new_home impl-model)
+  config="$home/.codex/config.toml"
+  impl="$home/.codex/maestro-impl-effort"
+  printf 'model = "old-model"\nmodel_reasoning_effort = "medium"\n' > "$config"
+  printf 'medium\n' > "$impl"
+  output=$(HOME="$home" bash "$SELECTOR" gpt-5.6-sol max xhigh gpt-5.6-luna-max 2>&1) ||
+    { echo "selector failed: $output"; return 1; }
+  pin=$(HOME="$home" bash "$SELECTOR" --pin) || return 1
+  [ "$pin" = $'gpt-5.6-sol\tmax\txhigh\tgpt-5.6-luna-max' ] ||
+    { echo "pin=$pin"; return 1; }
+  show=$(HOME="$home" bash "$SELECTOR" --show) || return 1
+  case "$show" in *'impl-model=gpt-5.6-luna-max'*) ;; *)
+    echo "show omitted implementation model: $show"; return 1 ;; esac
+}
+
+t7_missing_implementation_model_is_inherited() {
+  local home config impl pin show
+  home=$(new_home inherited)
+  config="$home/.codex/config.toml"
+  impl="$home/.codex/maestro-impl-effort"
+  printf 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\n' > "$config"
+  printf 'high\n' > "$impl"
+  pin=$(HOME="$home" bash "$SELECTOR" --pin) || return 1
+  [ "$pin" = $'gpt-5.6-sol\thigh\thigh\tgpt-5.6-sol' ] ||
+    { echo "inherited pin=$pin"; return 1; }
+  show=$(HOME="$home" bash "$SELECTOR" --show) || return 1
+  case "$show" in *'impl-model=gpt-5.6-sol (inherited)'*) ;; *)
+    echo "show omitted inherited marker: $show"; return 1 ;; esac
+}
+
+t8_corrupt_implementation_model_fails_pin() {
+  local home config impl output rc
+  home=$(new_home corrupt-impl-model)
+  config="$home/.codex/config.toml"
+  impl="$home/.codex/maestro-impl-effort"
+  printf 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\n' > "$config"
+  printf 'high\n' > "$impl"
+  printf 'bad model!\n' > "$home/.codex/maestro-impl-model"
+  output=$(HOME="$home" bash "$SELECTOR" --pin 2>&1); rc=$?
+  [ "$rc" -eq 3 ] || { echo "rc=$rc want 3: $output"; return 1; }
+  case "$output" in *'SELECT_ERROR:'*"invalid implementation model"*) ;; *)
+    echo "corrupt model error missing: $output"; return 1 ;; esac
+}
+
+t9_three_argument_repin_preserves_implementation_model() {
+  local home config impl model pin output
+  home=$(new_home preserve-impl-model)
+  config="$home/.codex/config.toml"
+  impl="$home/.codex/maestro-impl-effort"
+  model="$home/.codex/maestro-impl-model"
+  printf 'model = "old-model"\nmodel_reasoning_effort = "medium"\n' > "$config"
+  printf 'medium\n' > "$impl"
+  printf 'gpt-5.6-luna-max\n' > "$model"
+  output=$(HOME="$home" bash "$SELECTOR" gpt-5.6-sol high low 2>&1) ||
+    { echo "selector failed: $output"; return 1; }
+  pin=$(HOME="$home" bash "$SELECTOR" --pin) || return 1
+  [ "$pin" = $'gpt-5.6-sol\thigh\tlow\tgpt-5.6-luna-max' ] ||
+    { echo "three-argument repin changed implementation model: $pin"; return 1; }
+}
+
+t10_failed_implementation_model_publish_rolls_back_all_files() {
+  local home config impl model shim real_mv output rc
+  home=$(new_home rollback-impl-model)
+  config="$home/.codex/config.toml"
+  impl="$home/.codex/maestro-impl-effort"
+  model="$home/.codex/maestro-impl-model"
+  shim="$home/shim"
+  real_mv=$(command -v mv)
+  mkdir -p "$shim"
+  printf 'model = "old-model"\nmodel_reasoning_effort = "medium"\n' > "$config"
+  printf 'medium\n' > "$impl"
+  printf 'old-impl-model\n' > "$model"
+  cp "$config" "$home/config.before"
+  cp "$impl" "$home/impl.before"
+  cp "$model" "$home/model.before"
+  cat > "$shim/mv" <<EOF
+#!/usr/bin/env bash
+last="\${!#}"
+if [ "\$last" = "$model" ] && [ ! -e "$home/failed-once" ]; then
+  : > "$home/failed-once"
+  exit 1
+fi
+exec "$real_mv" "\$@"
+EOF
+  chmod +x "$shim/mv"
+  output=$(HOME="$home" PATH="$shim:$PATH" bash "$SELECTOR" new-model high low new-impl-model 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || { echo "failed publish returned success: $output"; return 1; }
+  case "$output" in *'implementation model'*'previous pin restored'*) ;; *)
+    echo "model publication error missing: $output"; return 1 ;; esac
+  cmp -s "$config" "$home/config.before" || { echo "config was not rolled back"; return 1; }
+  cmp -s "$impl" "$home/impl.before" || { echo "impl effort was not rolled back"; return 1; }
+  cmp -s "$model" "$home/model.before" || { echo "impl model was not rolled back"; return 1; }
+}
+
+t11_matching_top_level_max_is_valid() {
+  local home config impl output pin show
+  home=$(new_home matching-top-level-max)
+  config="$home/.codex/config.toml"
+  impl="$home/.codex/maestro-impl-effort"
+  printf 'model = "old-model"\nmodel_reasoning_effort = "medium"\n' > "$config"
+  printf 'medium\n' > "$impl"
+  output=$(HOME="$home" bash "$SELECTOR" gpt-5.6-luna max max 2>&1) ||
+    { echo "selector rejected exact max match: $output"; return 1; }
+  pin=$(HOME="$home" bash "$SELECTOR" --pin) || return 1
+  [ "$pin" = $'gpt-5.6-luna\tmax\tmax\tgpt-5.6-luna' ] ||
+    { echo "pin=$pin"; return 1; }
+  show=$(HOME="$home" bash "$SELECTOR" --show) || return 1
+  case "$show" in *'impl-effort=max (via top-level config)'*) ;; *)
+    echo "show omitted exact-match diagnostic: $show"; return 1 ;; esac
+}
+
+t12_stored_mismatched_max_fails_pin() {
+  local home output show rc
+  home=$(new_home stored-mismatched-max)
+  printf 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\n' > "$home/.codex/config.toml"
+  printf 'max\n' > "$home/.codex/maestro-impl-effort"
+  output=$(HOME="$home" bash "$SELECTOR" --pin 2>&1); rc=$?
+  [ "$rc" -eq 3 ] || { echo "rc=$rc want 3: $output"; return 1; }
+  [ "$output" = "SELECT_ERROR: implementation effort 'max' cannot be expressed per write job (the companion accepts none|minimal|low|medium|high|xhigh); max/ultra are usable only when the top-level debate effort is the same value, currently 'high'" ] ||
+    { echo "unexpected stored-pin rejection: $output"; return 1; }
+  show=$(HOME="$home" bash "$SELECTOR" --show) || return 1
+  case "$show" in *'impl-effort=max (invalid — top-level effort is high)'*) ;; *)
+    echo "show omitted mismatch diagnostic: $show"; return 1 ;; esac
+}
+
+t13_scout_keeps_strict_effort_cap() {
+  local home output rc
+  home=$(new_home scout-strict-cap)
+  output=$(HOME="$home" bash "$SELECTOR" --scout gpt-5.6-luna max 2>&1); rc=$?
+  [ "$rc" -eq 3 ] || { echo "rc=$rc want 3: $output"; return 1; }
+  [ "$output" = "SELECT_ERROR: invalid scout effort 'max' (expected: none | minimal | low | medium | high | xhigh)" ] ||
+    { echo "scout cap changed: $output"; return 1; }
+  [ ! -e "$home/.codex/maestro-scout" ] || { echo "scout pin was written"; return 1; }
 }
 
 check() {
@@ -162,5 +299,13 @@ check t2_indented_table_is_not_top_level_pin "indented table keys cannot fake a 
 check t3_failed_publish_rolls_back_both_files "failed second publish rolls back both files"
 check t4_rejects_unexpressible_implementation_effort "selector rejects implementation effort the wrapper cannot express"
 check t5_concurrent_selection_cannot_publish_torn_pin "concurrent selectors cannot publish a torn model/effort tuple"
+check t6_publishes_and_shows_implementation_model "selector publishes and shows the implementation model"
+check t7_missing_implementation_model_is_inherited "missing implementation model inherits the debate model"
+check t8_corrupt_implementation_model_fails_pin "corrupt implementation model fails closed"
+check t9_three_argument_repin_preserves_implementation_model "three-argument repin preserves the implementation model"
+check t10_failed_implementation_model_publish_rolls_back_all_files "failed implementation model publication rolls back all files"
+check t11_matching_top_level_max_is_valid "matching top-level max implementation effort is valid"
+check t12_stored_mismatched_max_fails_pin "stored mismatched max implementation effort fails pin"
+check t13_scout_keeps_strict_effort_cap "scout keeps the strict wrapper effort cap"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

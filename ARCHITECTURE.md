@@ -93,7 +93,7 @@ machine-readable", not for parallelism.
 
 | Component | Trigger | Responsibility | Depends on |
 |---|---|---|---|
-| `session-start.mjs` | `SessionStart` | Reads the Codex model/effort pin; emits the setup question (when armed via `~/.maestro/ask-on-start`); appends a validated `MAESTRO_SESSION_ID` export to `$CLAUDE_ENV_FILE` for session attribution | `~/.codex/config.toml`, `~/.codex/maestro-impl-effort` |
+| `session-start.mjs` | `SessionStart` | Reads the Codex model/effort pin; emits the setup question (when armed via `~/.maestro/ask-on-start`); appends a validated `MAESTRO_SESSION_ID` export to `$CLAUDE_ENV_FILE` for session attribution | `~/.codex/config.toml`, `~/.codex/maestro-impl-effort`, `~/.codex/maestro-impl-model` |
 | `orchestrator-inject.mjs` | `UserPromptSubmit` | Resets the direct-edit authorization flag on new tasks; sets it only on an explicit "edit it yourself"-class imperative; emits the orchestrator/implementer directive only when the prompt carries a code/design signal; intercepts "codex model" setup phrasing | `maestro-policy.mjs`, `~/.maestro/direct-edit/` |
 | `orchestrator-gate.mjs` | `PreToolUse` (`Edit\|Write\|MultiEdit`) | Blocks the orchestrator's direct source edits; allows non-code allowlisted files, anchored scratch/Desktop paths, any path carrying a `.claude` or `.codex` segment (harness exemption — segment-based, not root-anchored), and only a session-scoped, owner-private, exact-content direct-edit flag; refuses overrides inside subagents; fails closed on unreadable payloads | `maestro-policy.mjs`, `~/.maestro/direct-edit/` |
 | `maestro-policy.mjs` | (shared module) | Single source of truth for file classification (non-code extensions/basenames), session-id validation, and direct-edit directive parsing with negation/quote guards | none |
@@ -128,7 +128,7 @@ Layering is strict and directional: `lib-process.sh` → `lib-companion.sh` →
 
 | Component | Role |
 |---|---|
-| `codex-model-select.sh` | Transactionally pins Codex model + debate effort (in `~/.codex/config.toml`) and implementation effort (in `~/.codex/maestro-impl-effort`); serialized by its own lock; `--show`, `--pin`, `--ask-on-start on\|off` |
+| `codex-model-select.sh` | Transactionally pins Codex model + debate effort (in `~/.codex/config.toml`) and implementation effort/model (in `~/.codex/maestro-impl-effort` and `~/.codex/maestro-impl-model`); serialized by its own lock; `--show`, `--pin`, `--ask-on-start on\|off` |
 | `codex-mcp-check.sh` | Reports which MCP servers background Codex jobs inherit from `~/.codex/config.toml`, env keys masked |
 
 ### 2.6 Installer / uninstaller (package entry points)
@@ -143,7 +143,7 @@ Layering is strict and directional: `lib-process.sh` → `lib-companion.sh` →
 | Dependency | Role | Boundary |
 |---|---|---|
 | Claude Code | Host runtime; fires hooks; runs the orchestrator model | Contract: hook JSON payloads on stdin, exit codes |
-| Codex CLI + `openai-codex` plugin (`codex-companion.mjs`) | Executes background agent jobs | Contract: `codex task --background [--write] --model … --effort …`, `status --json`, `cancel`, `result`, `status --all --json`; a **compatibility probe** on `--help` refuses write dispatch if `task` is described without `--write` |
+| Codex CLI + `openai-codex` plugin (`codex-companion.mjs`) | Executes background agent jobs | Contract: `codex task --background [--write] --model … [--effort …]`, `status --json`, `cancel`, `result`, `status --all --json`; wrapper-expressible write efforts use `--effort`, while max/ultra omit it only when identical to the pinned top-level `model_reasoning_effort`; a **compatibility probe** on `--help` refuses write dispatch if `task` is described without `--write` |
 | `~/.codex/config.toml` | Codex configuration: model, reasoning efforts, MCP servers, `web_search` | Parsed as TOML; only true top-level keys are trusted |
 | Git | Repository scope, tree digests (`git hash-object --no-filters`), worktree/submodule discovery | Must be present in the working directory |
 
@@ -203,7 +203,7 @@ kill without a recovery daemon.
 | Session-start preference | `~/.maestro/ask-on-start` | Empty marker file; armed by default on first install, managed by `codex-model-select.sh --ask-on-start on\|off` and removed by uninstall | `install.mjs`, `codex-model-select.sh` | `session-start.mjs`, `uninstall.mjs` |
 | Installer ownership manifest | `~/.maestro/install-manifest.json` | `{ "version": 1, "files": { "<key>": "<sha256>" } }`, `0600` | `install.mjs` | `install.mjs`, `uninstall.mjs` |
 | Session identity | `$CLAUDE_ENV_FILE` | `export MAESTRO_SESSION_ID=<validated id>` appended at session start | `session-start.mjs` | All lease/provenance code via `write_lock_session_id` |
-| Codex pin | `~/.codex/config.toml` (top-level `model`, `model_reasoning_effort`), `~/.codex/maestro-impl-effort` | TOML preamble / single line | `codex-model-select.sh` | `companion_pin`, `session-start.mjs` |
+| Codex pin | `~/.codex/config.toml` (top-level `model`, `model_reasoning_effort`), `~/.codex/maestro-impl-effort`, `~/.codex/maestro-impl-model` | TOML preamble / single line | `codex-model-select.sh` | `companion_pin`, `session-start.mjs` |
 | Hook registrations | `~/.claude/settings.json` | `hooks.<event>` blocks with exact `# maestro-managed:<script>` command markers | `install.mjs` | Claude Code |
 | Backups | `*.maestro.bak` beside settings/config | Byte copy of the pre-merge state | `install.mjs` | Operator, uninstall |
 
@@ -289,7 +289,7 @@ implementer-loop.sh --clear-lease
 implementer-watchdog.sh --file <plan-file> [max_idle] [poll]
 discussion-loop.sh --new "<topic>" [slug]
 discussion-loop.sh --turn <file> [slug] [max_idle] [poll]
-codex-model-select.sh --show | --pin | <model> <debate-effort> [impl-effort] | --ask-on-start on|off|status
+codex-model-select.sh --show | --pin | <model> <debate-effort> [impl-effort] [impl-model] | --ask-on-start on|off|status
 codex-mcp-check.sh
 node install.mjs [--with-workflow]
 node uninstall.mjs
@@ -325,7 +325,10 @@ cancellation (unconfirmed quiescence).
 ### 4.4 Companion transport (Maestro → Codex)
 
 Implemented in `lib-companion.sh` via the plugin's `codex-companion.mjs`:
-`task --background [--write] --model <m> --effort <e> <prompt>`,
+`task --background [--write] --model <m> [--effort <e>] <prompt>`;
+write jobs omit `--effort` only for an exact max/ultra match with the pinned
+top-level `model_reasoning_effort`, otherwise the wrapper-expressible effort is
+passed explicitly.
 `status <job> --json`, `cancel <job>`, `result <job>`, `status --all --json`
 (repository-global writer visibility, parsed strictly, session filter
 deliberately stripped). Jobs are identified as `task-<id>-<id>`.
@@ -377,7 +380,7 @@ agent processes. The "production environment" is:
 macOS (primary) / Linux  ──►  Claude Code (ships Node)  ──►  Codex CLI (ChatGPT login)
      ├── ~/.claude/           hooks/, rules/, skills/, settings.json
      ├── ~/.maestro/          install-manifest, discussions/, direct-edit/, ask-on-start
-     ├── ~/.codex/            config.toml, maestro-impl-effort
+     ├── ~/.codex/            config.toml, maestro-impl-effort, maestro-impl-model
      └── <repo>/.git/         maestro-write.lock/, maestro-provenance.log
 ```
 
@@ -432,7 +435,8 @@ Pull requests and pushes to `main` both trigger it. There is no CD — the
   `task` synopsis lacks `--write` (guards against upstream flag drift).
 - The model pin is verified against the launched job's recorded
   `request.model`/`request.effort` (`companion_verify_pin`), warning on
-  mismatch.
+  mismatch; an absent/null effort is accepted only for an exact-match write
+  dispatch that omitted the wrapper flag.
 
 **Boundary statement.** The write path is coupled to the companion transport's
 JSON contract: status fields (`phase`, `elapsed`, `progressPreview`,
@@ -599,7 +603,7 @@ flowchart LR
     HOOKS["Maestro hooks & adapters<br/>(installed into ~/.claude)"]
     GIT[("Working tree + .git<br/>lease lock, provenance log)")]
     MAE[("~/.maestro<br/>manifest, discussions, direct-edit")]
-    COD[("~/.codex<br/>config.toml, effort pin")]
+    COD[("~/.codex<br/>config.toml, effort/model pins")]
 
     U --> CC
     CC --> HOOKS

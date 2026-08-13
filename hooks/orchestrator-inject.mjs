@@ -97,13 +97,17 @@ if (directiveOpensGate(prompt)) {
 // it before the code-signal logic so "codex model" never triggers the work loop.
 if (/(codex (model|settings|effort|config)|pick (the )?codex|change codex|set codex)/i.test(prompt)) {
   process.stdout.write(
-    'CODEX MODEL SETUP — ask the user for the Codex model and separate role-specific efforts.\n' +
+    'CODEX MODEL SETUP — ask the user for the debate model, implementation model, and separate role-specific efforts.\n' +
     'Show current settings first:  bash ~/.claude/hooks/codex-model-select.sh --show\n' +
     'Debate effort governs read-only discussions; implementation effort governs write jobs.\n' +
-    'minimal/low = quick mechanics, medium = default, high = delicate work; max/ultra are\n' +
-    'debate-only because the companion cannot express them for write jobs.\n' +
-    'Apply their picks:  bash ~/.claude/hooks/codex-model-select.sh <model> <debate-effort> <impl-effort>\n' +
-    'and confirm all three values in one line.'
+    'Implementation model — default: gpt-5.6-luna at effort max.\n' +
+    'Alternatives: gpt-5.6-sol at low | medium | high; gpt-5.6-luna at xhigh;\n' +
+    "gpt-5.6-terra at xhigh or max. Availability depends on the user's ChatGPT plan.\n" +
+    'Debate default stays: model gpt-5.6-sol, effort max.\n' +
+    'max/ultra work on the implementation side only when the debate effort is the same value —\n' +
+    'the companion cannot pass them as a per-job flag, so the pinned top-level config value is what delivers that tier.\n' +
+    'Apply their picks:  bash ~/.claude/hooks/codex-model-select.sh <model> <debate-effort> <impl-effort> <impl-model>\n' +
+    'and confirm all four values in one line.'
   );
   process.exit(0);
 }
