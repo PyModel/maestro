@@ -92,35 +92,30 @@ companion_call() { # stdout-file stderr-file [--tick fn] companion args...
 }
 
 companion_workspace_writers() { # companion stdout-file stderr-file
-  local C="$1" out="$2" err="$3" status parsed rc
+  local C="$1" out="$2" err="$3" parsed rc
   parsed="${out}.parsed"
   CODEX_COMPANION_SESSION_ID='' companion_call "$out" "$err" \
     "$C" status --all --json
   rc=$?
   [ "$rc" -eq 0 ] || return 4
-  status=$(cat "$out")
-  [ -n "${status//[[:space:]]/}" ] || return 4
+  [ -s "$out" ] || return 4
 
-  printf '%s\n' "$status" | node -e '
-    let input = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => { input += chunk; });
-    process.stdin.on("end", () => {
-      try {
-        const value = JSON.parse(input);
-        if (!value || typeof value !== "object" || Array.isArray(value) ||
-            !Array.isArray(value.running)) process.exit(4);
-        for (const job of value.running) {
-          if (!job || typeof job !== "object" || Array.isArray(job) ||
-              typeof job.id !== "string" || !/^task-[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(job.id) ||
-              typeof job.write !== "boolean") process.exit(4);
-          process.stdout.write(`${job.id}\t${job.write}\n`);
-        }
-      } catch {
-        process.exit(4);
+  node -e '
+    const fs = require("node:fs");
+    try {
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      if (!value || typeof value !== "object" || Array.isArray(value) ||
+          !Array.isArray(value.running)) process.exit(4);
+      for (const job of value.running) {
+        if (!job || typeof job !== "object" || Array.isArray(job) ||
+            typeof job.id !== "string" || !/^task-[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(job.id) ||
+            typeof job.write !== "boolean") process.exit(4);
+        process.stdout.write(`${job.id}\t${job.write}\n`);
       }
-    });
-  ' > "$parsed" 2>/dev/null
+    } catch {
+      process.exit(4);
+    }
+  ' "$out" > "$parsed" 2>/dev/null
   rc=$?
   if [ "$rc" -ne 0 ]; then
     rm -f "$parsed"
@@ -228,7 +223,11 @@ companion_start() { # companion prompt mode model effort lifecycle job-file stdo
   fi
   JOB=$(printf '%s' "$START" | grep -oE 'task-[a-z0-9][a-z0-9-]*[a-z0-9]' | head -1)
   if [ -z "$JOB" ]; then
-    printf 'could not start Codex job. Output: %s' "$START" >&2
+    printf 'Codex task launch succeeded but returned no job id. Output: %s\n' "$START" >&2
+    if [ "$mode" = write ]; then
+      "$lifecycle" cancel-begin unknown launch-response-unparseable "$err" || :
+      return 125
+    fi
     return 3
   fi
   printf '%s\n' "$JOB" > "$job_file" || return 3
@@ -564,9 +563,9 @@ companion_poll() {
   done
 }
 
-companion_result() { # companion job lifecycle result-file stdout stderr
+companion_result() { # companion job lifecycle result-file stdout stderr evidence
   local C="$1" JOB="$2" lifecycle="$3" result="$4" out="$5" err="$6"
-  local OUT rc
+  local evidence="$7" OUT rc
   companion_call "$out" "$err" --tick "$lifecycle" "$C" result "$JOB"
   rc=$?
   OUT=$(cat "$out")
@@ -577,7 +576,16 @@ companion_result() { # companion job lifecycle result-file stdout stderr
     OUT=$(cat "$out")
   fi
   if [ "$rc" -ne 0 ] || [ -z "${OUT//[[:space:]]/}" ]; then
-    printf 'job %s returned an empty result twice' "$JOB" >&2
+    {
+      printf 'MAESTRO_COMPANION_RESULT_TRANSPORT: job=%s rc=%s; final transport tails follow (8192 bytes per stream)\n' \
+        "$JOB" "$rc"
+      printf '%s\n' '--- result transport stdout ---'
+      tail -c 8192 "$out" 2>/dev/null || :
+      printf '\n%s\n' '--- result transport stderr ---'
+      tail -c 8192 "$err" 2>/dev/null || :
+      printf '\n%s\n' '--- end result transport evidence ---'
+    } >> "$evidence" 2>/dev/null || :
+    printf 'job %s returned an empty or failed result twice\n' "$JOB" >&2
     return 4
   fi
   printf '%s\n' "$OUT" > "$result" || return 4
@@ -603,18 +611,19 @@ _companion_profile_write() { # file mode model effort job cancel-reason cancel-r
   } > "$tmp" && mv -f "$tmp" "$file"
 }
 
-_companion_turn_cleanup() { # profile-file
-  local profile="$1"
+_companion_turn_cleanup() { # profile-file [retain-job-lock]
+  local profile="$1" retain_job_lock="${2:-0}"
   rm -f "${profile}.job" "${profile}.transport.out" \
     "${profile}.transport.err" "${profile}.cancel" \
     "${profile}.cancel.new" 2>/dev/null || :
+  [ "$retain_job_lock" -eq 1 ] && return 0
   job_lock_release
 }
 
 companion_turn() { # mode prompt-file max-idle poll result-file profile-file evidence-file lifecycle
   local mode="${1-}" prompt_file="${2-}" max_idle="${3-}" poll="${4-}"
   local result="${5-}" profile="${6-}" evidence="${7-}" lifecycle="${8-}"
-  local prompt C pin efforts model effort job rc derived
+  local prompt C pin efforts model effort job rc cleanup_rc derived
   local override_model="${MAESTRO_COMPANION_MODEL-}"
   local override_effort="${MAESTRO_COMPANION_EFFORT-}"
   local override_model_set=0 override_effort_set=0
@@ -647,6 +656,8 @@ companion_turn() { # mode prompt-file max-idle poll result-file profile-file evi
   : > "$result" || return 3
   : > "$evidence" || return 3
   _companion_turn_cleanup "$profile"
+  rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
   rm -f "$profile" "${profile}.new" || return 3
 
   C=$(companion_resolve) || return 3
@@ -677,6 +688,8 @@ companion_turn() { # mode prompt-file max-idle poll result-file profile-file evi
   rc=$?
   if [ "$rc" -ne 0 ]; then
     _companion_turn_cleanup "$profile"
+    cleanup_rc=$?
+    [ "$cleanup_rc" -eq 0 ] || return "$cleanup_rc"
     return "$rc"
   fi
   started=$SECONDS
@@ -684,7 +697,15 @@ companion_turn() { # mode prompt-file max-idle poll result-file profile-file evi
     "$lifecycle" "$job_file" "$call_out" "$call_err"
   rc=$?
   if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 125 ]; then
+      _companion_profile_write "$profile" "$mode" "$model" "$effort" \
+        unknown launch-response-unparseable unconfirmed || :
+      _companion_turn_cleanup "$profile" 1
+      return 125
+    fi
     _companion_turn_cleanup "$profile"
+    cleanup_rc=$?
+    [ "$cleanup_rc" -eq 0 ] || return "$cleanup_rc"
     return "$rc"
   fi
   job=$(cat "$job_file")
@@ -708,7 +729,9 @@ companion_turn() { # mode prompt-file max-idle poll result-file profile-file evi
     _companion_profile_write "$profile" "$mode" "$model" "$effort" \
       "$job" "${reason:-unknown}" "${request:-unknown}" || :
     _companion_turn_cleanup "$profile"
-    [ "$mode" = write ] && return 125
+    cleanup_rc=$?
+    if [ "$mode" = write ]; then return 125; fi
+    [ "$cleanup_rc" -eq 0 ] || return "$cleanup_rc"
     return 4
   fi
   if [ "$mode" = read ]; then
@@ -722,12 +745,14 @@ companion_turn() { # mode prompt-file max-idle poll result-file profile-file evi
   rc=$?
   if [ "$rc" -eq 0 ]; then
     if ! companion_result "$C" "$job" "$lifecycle" "$result" \
-      "$call_out" "$call_err"; then
+      "$call_out" "$call_err" "$evidence"; then
       _companion_turn_cleanup "$profile"
+      cleanup_rc=$?
+      [ "$cleanup_rc" -eq 0 ] || return "$cleanup_rc"
       return 4
     fi
     _companion_turn_cleanup "$profile"
-    return 0
+    return $?
   fi
   if [ -f "$cancel_fact" ]; then
     reason=$(companion_cancel_fact_value "$cancel_fact" reason)
@@ -736,6 +761,8 @@ companion_turn() { # mode prompt-file max-idle poll result-file profile-file evi
   _companion_profile_write "$profile" "$mode" "$model" "$effort" \
     "$job" "${reason:-unknown}" "${request:-unknown}" || :
   _companion_turn_cleanup "$profile"
+  cleanup_rc=$?
+  [ "$rc" -eq 125 ] || [ "$cleanup_rc" -eq 0 ] || return "$cleanup_rc"
   return "$rc"
 }
 

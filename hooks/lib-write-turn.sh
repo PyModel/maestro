@@ -192,14 +192,20 @@ write_turn_run() { # plan-file max-idle poll result-file evidence-file
         BLOCKED) return 11 ;;
         FAILED) return 4 ;;
         *)
-          printf '%s\n' "IMPLEMENTER_STATE: MISSING (no RESULT line — treat as FAILED and re-dispatch with the output)" >> "$evidence"
-          return 4
+          printf 'IMPLEMENTER_STATE: COMPANION_FAILURE\n' >> "$evidence"
+          printf '%s\n' "WATCHDOG_BLOCKED: job ${_MAESTRO_WRITE_TURN_JOB:-unknown} returned no valid full-line RESULT record; inspect the result and current diff before a fresh dispatch." >> "$evidence"
+          return 11
           ;;
       esac
       ;;
     125)
       reason=$(sed -n 's/^cancel_reason=//p' "$profile" 2>/dev/null | head -1)
       request=$(sed -n 's/^cancel_request=//p' "$profile" 2>/dev/null | head -1)
+      if [ "$reason" = launch-response-unparseable ]; then
+        printf 'IMPLEMENTER_STATE: COMPANION_FAILURE\n' >> "$evidence"
+        printf 'WATCHDOG_BLOCKED: task launch succeeded without a parseable job id; an untracked writer may still be running. Retained the write lease and companion job lock until repository-global status confirms quiescence.\n' >> "$evidence"
+        progress "WATCHDOG_POISONED: task launch returned no job id; after confirming no Codex job is running, clear both retained locks with --clear-job-lock and --clear-lease."
+      fi
       if [ -z "$request" ] || [ "$request" = unconfirmed ] ||
         [ "$request" = not-attempted ]; then
         progress "WATCHDOG_POISONED: job ${_MAESTRO_WRITE_TURN_JOB:-unknown} was not confirmed cancelled and may still be running; the write lease is retained and this run is over."
@@ -221,10 +227,11 @@ write_turn_run() { # plan-file max-idle poll result-file evidence-file
       return 3
       ;;
     *)
-      printf 'WATCHDOG_FAILED: job %s ended failed. Re-dispatch with the failure evidence, or ask the user.\n' \
+      printf 'IMPLEMENTER_STATE: COMPANION_FAILURE\n' >> "$evidence"
+      printf 'WATCHDOG_BLOCKED: job %s ended without a structured implementer result; inspect the companion/process/result evidence before a fresh dispatch.\n' \
         "${_MAESTRO_WRITE_TURN_JOB:-unknown}" >> "$evidence"
       rm -f "$profile" "${profile}.new"
-      return 4
+      return 11
       ;;
   esac
 }
@@ -232,9 +239,9 @@ write_turn_run() { # plan-file max-idle poll result-file evidence-file
 write_turn_interrupt() { # HUP|INT|TERM result-file evidence-file
   local signal="${1-}" result="${2-}" evidence="${3-}" rc reason job
   case "$signal" in
-    HUP) reason=signal-hup ;;
-    INT) reason=signal-int ;;
-    TERM) reason=signal-term ;;
+    HUP) reason="signal-hup" ;;
+    INT) reason="signal-int" ;;
+    TERM) reason="signal-term" ;;
     *) return 4 ;;
   esac
   process_interrupt "$signal" "$evidence" || :

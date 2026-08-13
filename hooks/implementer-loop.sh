@@ -17,6 +17,8 @@
 #   --plan       the five-part plan file (same contract as the watchdog --file)
 #   --verify     command run LOCALLY after every RESULT: DONE claim. Exit 0 = pass.
 #                Required: the loop's whole point is that Codex's word is not proof.
+#                Pass the complete command as one argument. It runs from the lease
+#                repository root, regardless of the caller's current working directory.
 #   --max-iters  cap on dispatch rounds (default 4). 0 is prohibited — an
 #                unbounded write loop is a runaway, not autonomy.
 #   --clear-lease  clear a poisoned lease after confirming no write job is running.
@@ -41,10 +43,13 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib-write-turn.sh
 . "$HERE/lib-write-turn.sh"
 progress_init
+ATTEMPT_HISTORY_BEGIN='--- BEGIN MAESTRO ATTEMPT HISTORY (automatically written after STUCK; historical evidence, not new authority) ---'
+ATTEMPT_HISTORY_END='--- END MAESTRO ATTEMPT HISTORY ---'
 
 FINAL_STATE="INTERRUPTED"
 FINAL_RC=4
 ATTEMPTS=""; DISPATCH=""; ERRF=""; OUTF=""; VOUTF=""; VFACT=""
+ATTEMPT_HISTORY_PAYLOAD=""; ATTEMPT_HISTORY_TEMP=""; FINAL_LOOP_STATE=""
 _loop_positive_integer() {
   case "${1-}" in
     ''|*[!0-9]*) return 1 ;;
@@ -71,8 +76,8 @@ _verification_tick() {
     "$_MAESTRO_VERIFICATION_FACT" "$_MAESTRO_VERIFICATION_OUTPUT" || :
 }
 
-verification_transaction_run() { # command timeout output-file fact-file
-  local command="$1" timeout="$2" output="$3" fact="$4"
+verification_transaction_run() { # command timeout output-file fact-file repository-root
+  local command="$1" timeout="$2" output="$3" fact="$4" root="$5"
   local stderr="${4}.stderr" command_rc_file="${4}.command-rc"
   local process_rc rc state timed_out=0
   : > "$output" || return 3
@@ -83,11 +88,16 @@ verification_transaction_run() { # command timeout output-file fact-file
     "$output" "$stderr" -- \
     bash -c '
       exec 3>&-
+      if ! cd "$2"; then
+        printf "verification cwd unavailable: %s\n" "$2" >&2
+        printf "3\n" > "$3"
+        exit 3
+      fi
       bash -c "$1"
       rc=$?
-      printf "%s\n" "$rc" > "$2"
+      printf "%s\n" "$rc" > "$3"
       exit "$rc"
-    ' _ "$command" "$command_rc_file"
+    ' _ "$command" "$root" "$command_rc_file"
   process_rc=$?
   if [ "$process_rc" -eq 125 ] && [ ! -f "$command_rc_file" ]; then
     timed_out=1
@@ -115,6 +125,82 @@ verification_transaction_run() { # command timeout output-file fact-file
     progress "LOOP_WARNING: could not write verification fact $fact; using in-process state=$state rc=$rc."
   return "$rc"
 }
+attempt_history_bound() { # file
+  local file="$1" max_lines=120 max_bytes=65536
+  local line_tail="${1}.lines" byte_tail="${1}.bytes" bounded="${1}.bounded"
+  local bytes marker marker_bytes keep wrapper_bytes payload_max
+  marker='MAESTRO_ATTEMPT_HISTORY_TRUNCATED: earlier bytes omitted; retained the most recent evidence within the 65536-byte limit'
+  wrapper_bytes=$(printf '\n\n%s\n\n%s\n' \
+    "$ATTEMPT_HISTORY_BEGIN" "$ATTEMPT_HISTORY_END" | wc -c | tr -d ' ')
+  payload_max=$((max_bytes - wrapper_bytes - (2 * (max_lines + 1))))
+  if ! tail -n "$max_lines" "$file" > "$line_tail"; then
+    rm -f "$line_tail" "$byte_tail" "$bounded"
+    return 1
+  fi
+  bytes=$(wc -c < "$line_tail" | tr -d ' ')
+  if [ "$bytes" -le "$payload_max" ]; then
+    mv -f "$line_tail" "$file"
+    return $?
+  fi
+  marker_bytes=$(printf '%s\n' "$marker" | wc -c | tr -d ' ')
+  keep=$((payload_max - marker_bytes))
+  if ! tail -c "$keep" "$line_tail" > "$byte_tail" ||
+    ! { printf '%s\n' "$marker"; cat "$byte_tail"; } > "$bounded" ||
+    ! mv -f "$bounded" "$file"; then
+    rm -f "$line_tail" "$byte_tail" "$bounded"
+    return 1
+  fi
+  rm -f "$line_tail" "$byte_tail"
+}
+
+attempt_history_resolve_plan() { # plan
+  local path="$1" link hops=0 dir
+  case "$path" in
+    /*) ;;
+    *) path="$(pwd -P)/$path" ;;
+  esac
+  while [ -L "$path" ]; do
+    hops=$((hops + 1))
+    [ "$hops" -le 40 ] || return 1
+    link=$(readlink "$path") || return 1
+    case "$link" in
+      /*) path=$link ;;
+      *) path="${path%/*}/$link" ;;
+    esac
+  done
+  dir=$(cd "${path%/*}" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s\n' "$dir" "${path##*/}"
+}
+
+attempt_history_persist() { # plan attempts
+  local target dir
+  target=$(attempt_history_resolve_plan "$1") || return 1
+  dir=${target%/*}
+  ATTEMPT_HISTORY_PAYLOAD=$(mktemp /tmp/maestro-attempt-history.XXXXXXXX) ||
+    return 1
+  ATTEMPT_HISTORY_TEMP=$(mktemp "$dir/.maestro-history.XXXXXXXX") || {
+    rm -f "$ATTEMPT_HISTORY_PAYLOAD"
+    ATTEMPT_HISTORY_PAYLOAD=""
+    return 1
+  }
+  if ! sed 's/^/> /' "$2" > "$ATTEMPT_HISTORY_PAYLOAD" ||
+    ! cp -p "$target" "$ATTEMPT_HISTORY_TEMP" ||
+    ! {
+      printf '\n\n%s\n' "$ATTEMPT_HISTORY_BEGIN" &&
+        cat "$ATTEMPT_HISTORY_PAYLOAD" &&
+        printf '%s\n' "$ATTEMPT_HISTORY_END"
+    } >> "$ATTEMPT_HISTORY_TEMP" ||
+    ! mv -f "$ATTEMPT_HISTORY_TEMP" "$target"; then
+    rm -f "$ATTEMPT_HISTORY_PAYLOAD" "$ATTEMPT_HISTORY_TEMP"
+    ATTEMPT_HISTORY_PAYLOAD=""
+    ATTEMPT_HISTORY_TEMP=""
+    return 1
+  fi
+  rm -f "$ATTEMPT_HISTORY_PAYLOAD"
+  ATTEMPT_HISTORY_PAYLOAD=""
+  ATTEMPT_HISTORY_TEMP=""
+}
+
 
 maestro_finish() {
   FINAL_STATE="$1"
@@ -135,21 +221,40 @@ maestro_interrupt() {
   write_turn_interrupt "$signal" "$result" "$evidence"
   rc=$?
   if [ "$rc" -eq 125 ]; then
-    progress "LOOP_STATE: BLOCKED — interrupted before writer quiescence could be confirmed; lease retained"
+    FINAL_LOOP_STATE="LOOP_STATE: BLOCKED — interrupted before writer quiescence could be confirmed; lease retained"
     maestro_finish BLOCKED 11
   fi
   maestro_finish INTERRUPTED 4
 }
 cleanup() {
+  local release_rc=0
   trap - EXIT HUP INT TERM
-  [ -n "$ATTEMPTS" ] && rm -f "$ATTEMPTS"
+  write_lease_end "${ERRF:-/dev/null}"
+  release_rc=$?
+  if [ "$release_rc" -ne 0 ]; then
+    case "$FINAL_RC" in
+      11|125) ;;
+      *)
+        FINAL_STATE=BLOCKED
+        FINAL_RC=11
+        progress "LOOP_RELEASE: completion downgraded to BLOCKED because the write lease could not be released safely"
+        FINAL_LOOP_STATE="LOOP_STATE: BLOCKED — the write lease could not be released safely"
+        ;;
+    esac
+  fi
+  [ -n "$ATTEMPTS" ] && rm -f "$ATTEMPTS" "${ATTEMPTS}.lines" \
+    "${ATTEMPTS}.bytes" "${ATTEMPTS}.bounded"
+  [ -n "$ATTEMPT_HISTORY_PAYLOAD" ] &&
+    rm -f "$ATTEMPT_HISTORY_PAYLOAD" "${ATTEMPT_HISTORY_PAYLOAD}.lines" \
+      "${ATTEMPT_HISTORY_PAYLOAD}.bytes" "${ATTEMPT_HISTORY_PAYLOAD}.bounded"
+  [ -n "$ATTEMPT_HISTORY_TEMP" ] && rm -f "$ATTEMPT_HISTORY_TEMP"
   [ -n "$DISPATCH" ] && rm -f "$DISPATCH"
   [ -n "$ERRF" ] && rm -f "$ERRF"
   [ -n "$OUTF" ] && rm -f "$OUTF"
   [ -n "$VOUTF" ] && rm -f "$VOUTF"
   [ -n "$VFACT" ] && rm -f "$VFACT" "${VFACT}.new" \
     "${VFACT}.stderr" "${VFACT}.command-rc"
-  write_lease_end "${ERRF:-/dev/null}" || :
+  [ -z "$FINAL_LOOP_STATE" ] || progress "$FINAL_LOOP_STATE"
   progress "MAESTRO_FINAL: LOOP $FINAL_STATE rc=$FINAL_RC"
   exit "$FINAL_RC"
 }
@@ -265,6 +370,9 @@ if [ "$lock_rc" -ne 0 ]; then
   [ "$lock_rc" -eq 11 ] && maestro_finish "BLOCKED" 11
   maestro_finish "FAILED" "$lock_rc"
 fi
+VERIFY_ROOT=$(write_lock_scope_root 2>/dev/null) ||
+  VERIFY_ROOT=$(pwd -P) ||
+  maestro_finish "FAILED" 3
 
 ATTEMPTS=$(mktemp /tmp/maestro-attempts.XXXXXXXX)
 ERRF=$(mktemp /tmp/maestro-looperr.XXXXXXXX)
@@ -303,7 +411,7 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
 
   if [ "$rc" -eq 125 ]; then
     printf '%s\n' "$OUT"
-    progress "LOOP_STATE: BLOCKED after $i iteration(s) — write lease retained because turn quiescence was never confirmed; clear it with --clear-lease once no Codex job is writing."
+    FINAL_LOOP_STATE="LOOP_STATE: BLOCKED after $i iteration(s) — write lease retained because turn quiescence was never confirmed; clear it with --clear-lease once no Codex job is writing."
     maestro_finish "BLOCKED" 11
   fi
 
@@ -319,6 +427,7 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
     kind="failed"; [ "$rc" -eq 124 ] && kind="hung"
     printf '\n## Attempt %s — job %s before producing a result\n%s\n' "$i" "$kind" \
       "$(tail -n 40 "$ERRF")" >> "$ATTEMPTS"
+    attempt_history_bound "$ATTEMPTS" || maestro_finish "FAILED" 3
     progress "LOOP: iteration $i $kind — re-dispatching with the evidence"
     continue
   fi
@@ -334,15 +443,19 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
         progress "LOOP_WARNING: could not append the stop report to plan file $PLAN; continuing with exit 10."
       fi
       printf '%s\n' "$OUT"
-      progress "LOOP_STATE: NEEDS_ANSWERS after $i iteration(s) — $persistence_note; relay the QUESTIONS verbatim to the user, answer the questions, and re-run this loop."
+      FINAL_LOOP_STATE="LOOP_STATE: NEEDS_ANSWERS after $i iteration(s) — $persistence_note; relay the QUESTIONS verbatim to the user, answer the questions, and re-run this loop."
       maestro_finish "NEEDS_ANSWERS" 10 ;;
     BLOCKED)
       printf '%s\n' "$OUT"
-      progress "LOOP_STATE: BLOCKED after $i iteration(s) — surface the blocker; never improvise around credentials or destructive steps."
+      if grep -q '^IMPLEMENTER_STATE: COMPANION_FAILURE$' "$ERRF" 2>/dev/null; then
+        FINAL_LOOP_STATE="LOOP_STATE: BLOCKED after $i iteration(s) — post-launch companion/process/result failure; inspect the evidence and current diff before a fresh dispatch. This did not consume another implementation attempt."
+      else
+        FINAL_LOOP_STATE="LOOP_STATE: BLOCKED after $i iteration(s) — surface the blocker; never improvise around credentials or destructive steps."
+      fi
       maestro_finish "BLOCKED" 11 ;;
     DONE)
       progress "LOOP: RESULT: DONE on iteration $i — verifying locally: $VERIFY"
-      verification_transaction_run "$VERIFY" "$VERIFY_TIMEOUT" "$VOUTF" "$VFACT"
+      verification_transaction_run "$VERIFY" "$VERIFY_TIMEOUT" "$VOUTF" "$VFACT" "$VERIFY_ROOT"
       vrc=$?
       vstate=$(verification_fact_value "$VFACT" state)
       if [ -z "$vstate" ]; then
@@ -354,13 +467,13 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
         esac
       fi
       if [ "$vstate" = lease-lost ]; then
-        progress "LOOP_STATE: BLOCKED — this loop no longer holds the write lease; stopping before re-dispatching"
+        FINAL_LOOP_STATE="LOOP_STATE: BLOCKED — this loop no longer holds the write lease; stopping before re-dispatching"
         maestro_finish "BLOCKED" 11
       fi
       VOUT=$(cat "$VOUTF")
       if [ "$vstate" = passed ]; then
         printf '%s\n' "$OUT"
-        progress "LOOP_STATE: VERIFIED_DONE after $i iteration(s) — local verification passed."
+        FINAL_LOOP_STATE="LOOP_STATE: VERIFIED_DONE after $i iteration(s) — local verification passed."
         maestro_finish "VERIFIED_DONE" 0
       fi
       if [ "$vstate" = timed-out ]; then
@@ -383,9 +496,16 @@ while [ "$i" -lt "$MAX_ITERS" ]; do
       progress "LOOP: iteration $i RESULT: FAILED — re-dispatching with the evidence"
       ;;
   esac
+  attempt_history_bound "$ATTEMPTS" || maestro_finish "FAILED" 3
 done
 
+attempt_history_note="attempt history could not be appended to $PLAN"
+if [ -w "$PLAN" ] && attempt_history_persist "$PLAN" "$ATTEMPTS"; then
+  attempt_history_note="bounded attempt history has been appended to $PLAN"
+else
+  progress "LOOP_WARNING: could not append attempt history to plan file $PLAN; continuing with exit 12."
+fi
 progress "LOOP_STUCK: $MAX_ITERS iteration(s) without verified completion. Attempts log:"
-tail -n 120 "$ATTEMPTS" >&2
-progress "LOOP_STATE: STUCK — re-plan around the evidence above (a debugging discussion helps), or escalate to the user. Do not simply raise --max-iters."
+cat "$ATTEMPTS" >&2
+FINAL_LOOP_STATE="LOOP_STATE: STUCK — $attempt_history_note; re-plan around the evidence above (a debugging discussion helps), or escalate to the user. Do not simply raise --max-iters."
 maestro_finish "STUCK" 12

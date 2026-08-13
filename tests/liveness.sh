@@ -25,6 +25,34 @@ status_running_job() {
   printf '{\n  "running": [\n    {\n      "id": "%s",\n      "write": %s\n    }\n  ],\n  "latestFinished": null\n}\n' "$1" "$2"
 }
 
+prepare_generation() { # lock [generation]
+  local lock="$1" generation="${2-}"
+  mkdir -p "$lock" || return 1
+  if [ -z "$generation" ]; then
+    [ ! -f "$lock/generation" ] || return 0
+    generation=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || return 1
+  fi
+  printf '%s\n' "$generation" > "$lock/generation"
+}
+
+sync_generation_field() { # lock [record-name]
+  local lock="$1" record="${2:-metadata}" generation file temp
+  generation=$(cat "$lock/generation") || return 1
+  file="$lock/$record"
+  temp="$file.generation"
+  awk -v generation="$generation" '
+    BEGIN { written = 0 }
+    /^generation=/ {
+      if (!written) print "generation=" generation
+      written = 1
+      next
+    }
+    { print }
+    END { if (!written) print "generation=" generation }
+  ' "$file" > "$temp" || return 1
+  command mv "$temp" "$file"
+}
+
 new_repo() {
   local dir="$TEST_ROOT/$1"
   git init -q "$dir"
@@ -148,7 +176,7 @@ t2_growth_defeats_idle() {
 t3_write_cancel_poisons() {
   local metadata="$TEST_ROOT/deadline-repo/.git/maestro-write.lock/metadata"
   local repo state shim pid lock poison_metadata
-  local stage_repo stage_state stage_shim stage_lock
+  local stage_repo stage_state stage_lock stage_attempt
   local race_state race_shim release_repo release_lock release_poison
   local acquire_repo acquire_lock acquire_poison race_failed=0
   [ -f "$metadata" ] || { echo "poisoned metadata missing"; return 1; }
@@ -177,7 +205,7 @@ t3_write_cancel_poisons() {
     printf '    */metadata.new)\n'
     printf '      count=$((count + 1))\n'
     printf '      printf "%%s\\\\n" "$count" > "$state"\n'
-    printf '      [ "$count" -eq 2 ] && exit 1\n'
+    printf '      [ "$count" -eq 1 ] && exit 1\n'
     printf '      ;;\n'
     printf '  esac\n'
     printf 'fi\n'
@@ -239,31 +267,15 @@ t3_write_cancel_poisons() {
 
   stage_repo=$(new_repo poison-stage-failure-repo)
   stage_state="$TEST_ROOT/poison-stage-failure-state"
-  stage_shim="$stage_state/shim"
-  mkdir -p "$stage_shim"
+  stage_lock="$stage_repo/.git/maestro-write.lock"
+  mkdir -p "$stage_state"
   : > "$stage_state/job.log"
   : > "$stage_state/calls.log"
   status_empty > "$stage_state/status.json"
-  {
-    printf '#!/usr/bin/env bash\n'
-    printf 'real_mv="%s"\n' "$REAL_MV"
-    printf 'if [ "${1:-}" = "-f" ]; then\n'
-    printf '  case "${2:-}" in\n'
-    printf '    */metadata.new)\n'
-    printf '      "$real_mv" "$@"\n'
-    printf '      rc=$?\n'
-    printf '      [ "$rc" -eq 0 ] && mkdir "$2"\n'
-    printf '      exit "$rc"\n'
-    printf '      ;;\n'
-    printf '  esac\n'
-    printf 'fi\n'
-    printf 'exec "$real_mv" "$@"\n'
-  } > "$stage_shim/mv"
-  chmod +x "$stage_shim/mv"
   set -m
   (
     cd "$stage_repo" &&
-      env HOME="$TEST_HOME" PATH="$stage_shim:$TEST_PATH" \
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" \
         MAESTRO_TEST_CALL_LOG="$stage_state/calls.log" \
         MAESTRO_TEST_JOB_PHASE=running \
         MAESTRO_TEST_LOGFILE="$stage_state/job.log" \
@@ -275,6 +287,19 @@ t3_write_cancel_poisons() {
   ) > "$stage_state/output" 2>&1 &
   pid=$!
   set +m
+  stage_attempt=0
+  while ! grep -qx 'job_id=task-fake0000-aaaaaa' "$stage_lock/metadata" 2>/dev/null; do
+    stage_attempt=$((stage_attempt + 1))
+    if [ "$stage_attempt" -ge 50 ]; then
+      kill -TERM -"$pid" 2>/dev/null || :
+      wait_bounded "$pid" 3
+      echo "write job was not published before poison staging setup"
+      return 1
+    fi
+    sleep 0.05
+  done
+  mkdir "$stage_lock/metadata.new" ||
+    { echo "could not block poison staging"; return 1; }
   wait_bounded "$pid" 11
   [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "pre-cancel poison staging failure hung"; return 1; }
   [ "$WAIT_RC" -eq 11 ] || { echo "pre-cancel staging failure rc=$WAIT_RC want 11"; return 1; }
@@ -282,7 +307,6 @@ t3_write_cancel_poisons() {
     echo "cancel issued after poison staging failed: $(tr '\n' ' ' < "$stage_state/calls.log")"
     return 1
   fi
-  stage_lock="$stage_repo/.git/maestro-write.lock"
   [ -d "$stage_lock" ] || { echo "lease released after poison staging failed"; return 1; }
   grep -q 'was not cancelled and may still be running' "$stage_state/output" &&
     grep -q 'task-fake0000-aaaaaa' "$stage_state/output" &&
@@ -315,10 +339,10 @@ t3_write_cancel_poisons() {
   set +m
   wait_bounded "$pid" 4
   [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "staging marker clear hung"; return 1; }
-  [ "$WAIT_RC" -eq 0 ] || { echo "staging marker clear rc=$WAIT_RC want 0"; return 1; }
-  grep -Fq "$stage_lock/metadata.new" "$stage_state/clear-output" ||
-    { echo "staging marker clear omitted removed entry"; return 1; }
-  [ ! -d "$stage_lock" ] || { echo "staging marker survived clear"; return 1; }
+  [ "$WAIT_RC" -eq 11 ] || { echo "staging marker clear rc=$WAIT_RC want 11"; return 1; }
+  grep -q 'staged Lease interval metadata is malformed' "$stage_state/clear-output" ||
+    { echo "staging marker refusal diagnostic missing"; return 1; }
+  [ -d "$stage_lock" ] || { echo "unsafe staging marker was cleared"; return 1; }
 
   race_state="$TEST_ROOT/late-poison-race-state"
   race_shim="$race_state/shim"
@@ -362,17 +386,18 @@ t3_write_cancel_poisons() {
   wait_bounded "$pid" 8
   [ "$WAIT_TIMED_OUT" -eq 0 ] ||
     { echo "late-poison release race hung"; race_failed=1; }
-  [ "$WAIT_RC" -eq 0 ] ||
-    { echo "late-poison release rc=$WAIT_RC want 0"; race_failed=1; }
+  [ "$WAIT_RC" -eq 11 ] ||
+    { echo "late-poison release rc=$WAIT_RC want 11"; race_failed=1; }
   grep -qx 'quiescence=unconfirmed' "$release_lock/metadata" 2>/dev/null ||
     { echo "release erased poison that arrived during liveness check"; race_failed=1; }
 
   acquire_repo=$(new_repo late-poison-acquire-repo)
   acquire_lock="$acquire_repo/.git/maestro-write.lock"
   acquire_poison="$race_state/acquire.poison"
-  mkdir -p "$acquire_lock"
+  prepare_generation "$acquire_lock" || return 1
   printf 'token=late-token\npid=99999999\nprocess_start=dead\njob_id=task-acquire-race\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' \
     > "$acquire_lock/metadata"
+  sync_generation_field "$acquire_lock" || return 1
   sed -n 'p' "$acquire_lock/metadata" > "$acquire_poison"
   printf 'quiescence=unconfirmed\nunconfirmed_job=task-acquire-race\nunconfirmed_reason=deadline\n' \
     >> "$acquire_poison"
@@ -459,8 +484,9 @@ t6_clear_lease_works_and_refuses() {
 
   refuse_repo=$(new_repo clear-refuse-repo)
   metadata="$refuse_repo/.git/maestro-write.lock/metadata"
-  mkdir -p "$(dirname "$metadata")"
+  prepare_generation "$(dirname "$metadata")" || return 1
   printf 'token=old\npid=999999\nprocess_start=dead\njob_id=task-old00000-aaaaaa\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\nquiescence=unconfirmed\nunconfirmed_job=task-old00000-aaaaaa\nunconfirmed_reason=deadline\n' > "$metadata"
+  sync_generation_field "$(dirname "$metadata")" || return 1
   status_running_job task-running0-bbbbbb true > "$state/running.json"
   set -m
   (
@@ -481,7 +507,7 @@ t6_clear_lease_works_and_refuses() {
 
   wedge_repo=$(new_repo clear-wedge-repo)
   wedge_lock="$wedge_repo/.git/maestro-write.lock"
-  mkdir -p "$wedge_lock"
+  prepare_generation "$wedge_lock" || return 1
   touch -t 202001010000 "$wedge_lock"
   set -m
   (
@@ -501,7 +527,7 @@ t6_clear_lease_works_and_refuses() {
 
   fresh_wedge_repo=$(new_repo clear-fresh-wedge-repo)
   fresh_wedge_lock="$fresh_wedge_repo/.git/maestro-write.lock"
-  mkdir -p "$fresh_wedge_lock"
+  prepare_generation "$fresh_wedge_lock" || return 1
   set -m
   (
     cd "$fresh_wedge_repo" &&
@@ -521,9 +547,10 @@ t6_clear_lease_works_and_refuses() {
   healthy_lock="$healthy_repo/.git/maestro-write.lock"
   healthy_pid=$$
   healthy_now=$(date +%s)
-  mkdir -p "$healthy_lock"
+  prepare_generation "$healthy_lock" || return 1
   printf 'token=healthy-token\npid=%s\nprocess_start=unavailable\njob_id=task-healthy-owner\nsession_id=sess-healthy-owner\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
     "$healthy_pid" "$healthy_now" > "$healthy_lock/metadata"
+  sync_generation_field "$healthy_lock" || return 1
   set -m
   (
     cd "$healthy_repo" &&
@@ -679,6 +706,78 @@ t8_verifier_boundaries() {
     echo "successful verifier child $child survived VERIFIED_DONE"
     return 1
   fi
+  repo=$(new_repo verifier-root-repo)
+  state="$TEST_ROOT/verifier-root-state"
+  mkdir -p "$repo/deep/nested" "$state"
+  : > "$state/calls.log"
+  status_empty > "$state/status.json"
+  verify='test "$PWD" = "$(git rev-parse --show-toplevel)"'
+  set -m
+  (
+    cd "$repo/deep/nested" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_PHASE=completed \
+        MAESTRO_TEST_RESULT='RESULT: DONE' \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify "$verify" \
+          --max-iters 1 --poll 1
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  wait_bounded "$pid" 7
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "verifier root cwd exceeded 7s bound"; return 1; }
+  [ "$WAIT_RC" -eq 0 ] ||
+    { echo "verifier root cwd rc=$WAIT_RC want 0: $(tr '\n' ' ' < "$state/output")"; return 1; }
+  grep -q '^MAESTRO_FINAL: LOOP VERIFIED_DONE rc=0$' "$state/output" ||
+    { echo "verifier root cwd final missing: $(tr '\n' ' ' < "$state/output")"; return 1; }
+  local heartbeat first second
+  repo=$(new_repo verifier-heartbeat-repo)
+  state="$TEST_ROOT/verifier-heartbeat-state"
+  mkdir -p "$state"
+  : > "$state/calls.log"
+  status_empty > "$state/status.json"
+  verify='sleep 5'
+  set -m
+  (
+    cd "$repo" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_CALL_LOG="$state/calls.log" \
+        MAESTRO_TEST_JOB_PHASE=completed \
+        MAESTRO_TEST_RESULT='RESULT: DONE' \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC=1 \
+        MAESTRO_LOCK_HEARTBEAT_STALE_SEC=2 \
+        MAESTRO_VERIFY_TIMEOUT_SEC=8 \
+        bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify "$verify" \
+          --max-iters 1 --poll 1
+  ) > "$state/output" 2>&1 &
+  pid=$!
+  set +m
+  heartbeat="$repo/.git/maestro-write.lock/heartbeat"
+  for _ in 1 2 3 4 5 6 7 8; do
+    if grep -q 'LOOP: RESULT: DONE on iteration 1' "$state/output" 2>/dev/null &&
+      [ -f "$heartbeat" ]; then
+      break
+    fi
+    sleep 1
+  done
+  grep -q 'LOOP: RESULT: DONE on iteration 1' "$state/output" ||
+    { echo "verifier did not reach local verification"; return 1; }
+  [ -f "$heartbeat" ] || { echo "verification heartbeat missing"; return 1; }
+  first=$(sed -n 's/^epoch=//p' "$heartbeat" | head -1)
+  sleep 2
+  second=$(sed -n 's/^epoch=//p' "$heartbeat" | head -1)
+  case "$first:$second" in
+    :*|*:|*[!0-9:]*) echo "invalid heartbeat epochs: first=$first second=$second"; return 1 ;;
+  esac
+  [ "$second" -gt "$first" ] ||
+    { echo "verification heartbeat did not advance: first=$first second=$second"; return 1; }
+  kill -0 "$pid" 2>/dev/null ||
+    { echo "verifier ended before heartbeat observation"; return 1; }
+  wait_bounded "$pid" 10
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "heartbeat verifier exceeded 10s"; return 1; }
+  [ "$WAIT_RC" -eq 0 ] || { echo "heartbeat verifier rc=$WAIT_RC"; return 1; }
 }
 
 t9_terminal_at_deadline_harvests() {
@@ -1019,7 +1118,7 @@ t17_malformed_status_counts_as_status_loss() {
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  wait_bounded "$pid" 7
+  wait_bounded "$pid" 11
   [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "malformed status did not take bounded status-loss path"; return 1; }
   [ "$WAIT_RC" -eq 11 ] || { echo "rc=$WAIT_RC want 11"; return 1; }
   statuses=$(grep -c '^status task-fake0000-aaaaaa --json$' "$state/calls.log" || true)
@@ -1113,6 +1212,58 @@ t19_waiting_contender_signal_does_not_cancel_owner() (
     { echo "waiting contender cancelled the active lease owner"; return 1; }
 )
 
+t20_concurrent_clear_large_status_is_bounded() (
+  local repo state lock pid1 pid2 rc1 rc2 timed1 timed2
+  repo=$(new_repo concurrent-clear-repo)
+  state="$TEST_ROOT/concurrent-clear-state"
+  lock="$repo/.git/maestro-write.lock"
+  mkdir -p "$state"
+  prepare_generation "$lock" || return 1
+  "$REAL_NODE" -e '
+    const fs = require("node:fs");
+    fs.writeFileSync(process.argv[1], JSON.stringify({
+      running: [],
+      latestFinished: null,
+      padding: " ".repeat(256 * 1024)
+    }));
+  ' "$state/status.json" || return 1
+  printf 'token=concurrent-clear\npid=999999\nprocess_start=dead\njob_id=task-concurrent-clear\nsession_id=session-concurrent-clear\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\nquiescence=unconfirmed\nunconfirmed_job=task-concurrent-clear\nunconfirmed_reason=signal-term\n' \
+    > "$lock/metadata"
+  sync_generation_field "$lock" || return 1
+
+  set -m
+  (
+    cd "$repo" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash "$LOOP" --clear-lease
+  ) > "$state/first.out" 2>&1 &
+  pid1=$!
+  (
+    cd "$repo" &&
+      env HOME="$TEST_HOME" PATH="$TEST_PATH" \
+        MAESTRO_TEST_STATUS="$state/status.json" \
+        bash "$LOOP" --clear-lease
+  ) > "$state/second.out" 2>&1 &
+  pid2=$!
+  set +m
+
+  wait_bounded "$pid1" 4
+  rc1=$WAIT_RC
+  timed1=$WAIT_TIMED_OUT
+  wait_bounded "$pid2" 4
+  rc2=$WAIT_RC
+  timed2=$WAIT_TIMED_OUT
+  [ "$timed1" -eq 0 ] && [ "$timed2" -eq 0 ] ||
+    { echo "concurrent clear timed out first=$timed1 second=$timed2"; return 1; }
+  case "$rc1:$rc2" in
+    0:0|0:11|11:0) ;;
+    *) echo "concurrent clear rc=$rc1:$rc2 want one success and no failure"; return 1 ;;
+  esac
+  [ ! -d "$lock" ] ||
+    { echo "concurrent clear left lock entries: $(find "$lock" -mindepth 1 -maxdepth 1 -print)"; return 1; }
+)
+
 check() {
   local fn="$1" label="$2" detail
   if detail=$("$fn" 2>&1); then
@@ -1125,7 +1276,7 @@ check() {
 printf '=== Liveness verification ===\n'
 check t1_deadline_growing_log "deadline fires against a growing log"
 check t2_growth_defeats_idle "log growth defeats the idle timer"
-check t3_write_cancel_poisons "write cancellation poisons; failed mv retains; failed staging blocks and clears; late poison wins"
+check t3_write_cancel_poisons "write cancellation poisons; failed writes retain fail-closed state; late poison wins"
 check t4_poison_stops_redispatch "poison prevents a second dispatch"
 check t5_poison_blocks_acquire "poison blocks later acquisition"
 check t6_clear_lease_works_and_refuses "clear-lease clears safely and refuses a live writer"
@@ -1142,5 +1293,6 @@ check t16_observed_cancellation_is_terminal "observed write cancellation poisons
 check t17_malformed_status_counts_as_status_loss "malformed nonempty status follows bounded status loss"
 check t18_invalid_polling_args_fail_before_launch "invalid polling args and mixed clear mode fail before launch"
 check t19_waiting_contender_signal_does_not_cancel_owner "waiting contender TERM never cancels the active owner"
+check t20_concurrent_clear_large_status_is_bounded "concurrent clear stays bounded with a large status payload"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

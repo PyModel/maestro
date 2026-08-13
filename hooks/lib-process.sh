@@ -10,6 +10,7 @@ _MAESTRO_PROCESS_LOADED=1
 # The module owns the spawned process group; callers own output and evidence files.
 
 _MAESTRO_PROCESS_PID=""
+_MAESTRO_PROCESS_COMPLETION=""
 
 progress_init() {
   if ! { true >&3; } 2>/dev/null; then exec 3>&1; fi
@@ -32,7 +33,7 @@ _process_group_stop() { # pid
 process_run_bounded() { # timeout label tick stdout stderr -- command [args...]
   local timeout="${1-}" label="${2-}" tick="${3-}"
   local stdout_file="${4-}" stderr_file="${5-}"
-  local pid start elapsed timed_out=0 ticks=0 rc
+  local pid start elapsed timed_out=0 ticks=0 rc completion
   shift 5 2>/dev/null || return 3
   [ "${1-}" = "--" ] || return 3
   shift
@@ -48,17 +49,23 @@ process_run_bounded() { # timeout label tick stdout stderr -- command [args...]
   [ "$#" -gt 0 ] || return 3
   : > "$stdout_file" || return 3
   : > "$stderr_file" || return 3
+  completion=$(mktemp "${TMPDIR:-/tmp}/maestro-process-completion.XXXXXX") ||
+    return 3
+  _MAESTRO_PROCESS_COMPLETION=$completion
 
   set -m
   (
     "$@" > "$stdout_file" 2> "$stderr_file"
+    rc=$?
+    printf '%s\n' "$rc" > "$completion"
+    exit "$rc"
   ) &
   pid=$!
   _MAESTRO_PROCESS_PID=$pid
   set +m
 
   start=$SECONDS
-  while kill -0 "$pid" 2>/dev/null; do
+  while [ ! -s "$completion" ]; do
     elapsed=$((SECONDS - start))
     if [ "$elapsed" -ge "$timeout" ]; then
       timed_out=1
@@ -83,6 +90,8 @@ process_run_bounded() { # timeout label tick stdout stderr -- command [args...]
   if kill -0 -"$pid" 2>/dev/null; then
     _process_group_stop "$pid"
   fi
+  rm -f "$completion"
+  _MAESTRO_PROCESS_COMPLETION=""
   _MAESTRO_PROCESS_PID=""
 
   if [ "$timed_out" -eq 1 ]; then
@@ -98,6 +107,8 @@ process_interrupt() { # HUP|INT|TERM evidence-file
   [ -n "$pid" ] || return 0
   _process_group_stop "$pid"
   wait "$pid" 2>/dev/null || :
+  rm -f "${_MAESTRO_PROCESS_COMPLETION:-}"
+  _MAESTRO_PROCESS_COMPLETION=""
   _MAESTRO_PROCESS_PID=""
   if [ -n "$evidence" ]; then
     printf 'MAESTRO_PROCESS: interrupted active process group with %s\n' "$signal" >> "$evidence" 2>/dev/null || :

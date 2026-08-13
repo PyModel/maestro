@@ -20,6 +20,34 @@ bad()  { printf 'FAIL  %s — %s\n' "$1" "$2"; FAIL=$((FAIL+1)); }
 
 ws() { local d="$TEST_ROOT/$1"; mkdir -p "$d"; printf '%s' "$d"; }
 
+prepare_generation() { # lock [generation]
+  local lock="$1" generation="${2-}"
+  mkdir -p "$lock" || return 1
+  if [ -z "$generation" ]; then
+    [ ! -f "$lock/generation" ] || return 0
+    generation=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || return 1
+  fi
+  printf '%s\n' "$generation" > "$lock/generation"
+}
+
+sync_generation_field() { # lock [record-name]
+  local lock="$1" record="${2:-metadata}" generation file temp
+  generation=$(cat "$lock/generation") || return 1
+  file="$lock/$record"
+  temp="$file.generation"
+  awk -v generation="$generation" '
+    BEGIN { written = 0 }
+    /^generation=/ {
+      if (!written) print "generation=" generation
+      written = 1
+      next
+    }
+    { print }
+    END { if (!written) print "generation=" generation }
+  ' "$file" > "$temp" || return 1
+  command mv "$temp" "$file"
+}
+
 without_ps_path() {  # dir
   local bin="$1/no-ps"
   mkdir -p "$bin"
@@ -76,9 +104,11 @@ run_clear_lease() {  # dir status stale_sec
 }
 
 dead_lock() {  # dir job_id
-  mkdir -p "$1/.maestro-write.lock"
-  printf 'token=old\npid=999999\nprocess_start=dead\njob_id=%s\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\n' \
-    "$2" > "$1/.maestro-write.lock/metadata"
+  local lock="$1/.maestro-write.lock" generation
+  prepare_generation "$lock" || return 1
+  generation=$(cat "$lock/generation") || return 1
+  printf 'token=old\ngeneration=%s\npid=999999\nprocess_start=dead\njob_id=%s\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\n' \
+    "$generation" "$2" > "$lock/metadata"
 }
 
 # ---------------------------------------------------------------- deep Lease interval interface
@@ -303,13 +333,15 @@ t11() (
 # ---------------------------------------------------------------- step 12
 # A live owner with unconfirmable identity must block rather than be stolen.
 t12() (
-  local dir owner_pid rc; dir=$(ws no_ps_contention)
+  local dir lock owner_pid rc; dir=$(ws no_ps_contention)
+  lock="$dir/.maestro-write.lock"
   status_empty > "$dir/status.json"
   sleep 30 & owner_pid=$!
   trap 'kill "$owner_pid" 2>/dev/null || :; wait "$owner_pid" 2>/dev/null || :' EXIT
-  mkdir -p "$dir/.maestro-write.lock"
+  prepare_generation "$lock" || return 1
   printf 'token=old\npid=%s\nprocess_start=unavailable\njob_id=task-live0000-aaaaaa\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\n' \
-    "$owner_pid" > "$dir/.maestro-write.lock/metadata"
+    "$owner_pid" > "$lock/metadata"
+  sync_generation_field "$lock" || return 1
   cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
   export MAESTRO_TEST_STATUS="$dir/status.json"
   PATH=$(without_ps_path "$dir"); export PATH
@@ -445,12 +477,14 @@ t19() (
 # ---------------------------------------------------------------- step 20
 # A live owner with unconfirmed process identity is never queueable.
 t20() (
-  local dir owner_pid out rc started elapsed; dir=$(ws wait_identity_unconfirmed)
+  local dir lock owner_pid out rc started elapsed; dir=$(ws wait_identity_unconfirmed)
+  lock="$dir/.maestro-write.lock"
   sleep 30 & owner_pid=$!
   trap 'kill "$owner_pid" 2>/dev/null || :; wait "$owner_pid" 2>/dev/null || :' EXIT
-  mkdir -p "$dir/.maestro-write.lock"
+  prepare_generation "$lock" || return 1
   printf 'token=old\npid=%s\nprocess_start=unavailable\njob_id=task-unconfirmed-aaaaaa\nsession_id=session-unconfirmed\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
-    "$owner_pid" "$(date +%s)" > "$dir/.maestro-write.lock/metadata"
+    "$owner_pid" "$(date +%s)" > "$lock/metadata"
+  sync_generation_field "$lock" || return 1
   cd "$dir" || exit 1; . "$LIB"; progress_init
   export MAESTRO_LOCK_WAIT_SEC=2 MAESTRO_LOCK_WAIT_POLL_SEC=1
   started=$(date +%s)
@@ -581,7 +615,7 @@ t25() (
 t26() (
   local dir lock out rc; dir=$(ws malformed_metadata)
   lock="$dir/.maestro-write.lock"
-  mkdir -p "$lock"
+  prepare_generation "$lock" || return 1
   : > "$lock/metadata"
   status_empty > "$dir/status.json"
   cd "$dir" || exit 1; . "$LIB"; companion_resolve() { printf '%s' "$FAKE"; }; progress_init
@@ -645,7 +679,7 @@ t27() (
 t28() (
   local dir lock out rc; dir=$(ws absent_metadata)
   lock="$dir/.maestro-write.lock"
-  mkdir -p "$lock"
+  prepare_generation "$lock" || return 1
   cd "$dir" || exit 1; . "$LIB"; progress_init
   out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
@@ -662,7 +696,7 @@ t28() (
 # ---------------------------------------------------------------- step 29
 # A current owner's heartbeat is visible as fresh and never changes its token.
 t29() (
-  local dir lock heartbeat owner_token recorded_token out rc; dir=$(ws heartbeat_fresh)
+  local dir lock heartbeat owner_token recorded_token generation out rc; dir=$(ws heartbeat_fresh)
   cd "$dir" || exit 1; . "$LIB"; progress_init
   PATH=$(confirmed_ps_path "$dir"); export PATH
   export MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC=1
@@ -673,11 +707,15 @@ t29() (
   heartbeat="$lock/heartbeat"
   owner_token=$MAESTRO_LOCK_TOKEN
   write_lock_heartbeat_write || { echo "heartbeat write failed"; return 1; }
-  [ "$(wc -l < "$heartbeat")" -eq 2 ] ||
-    { echo "heartbeat did not contain exactly two lines"; return 1; }
+  [ "$(wc -l < "$heartbeat")" -eq 3 ] ||
+    { echo "heartbeat did not contain exactly three lines"; return 1; }
   grep -qx "token=$owner_token" "$heartbeat" ||
     { echo "heartbeat token missing"; return 1; }
-  write_lock_heartbeat_epoch "$lock" "$owner_token" | grep -Eq '^[0-9]+$' ||
+  generation=$(cat "$lock/generation") || return 1
+  grep -qx "generation=$generation" "$heartbeat" ||
+    { echo "heartbeat generation missing"; return 1; }
+  write_lock_heartbeat_epoch "$lock" "$owner_token" "$MAESTRO_LOCK_IDENTITY" |
+    grep -Eq '^[0-9]+$' ||
     { echo "heartbeat epoch missing"; return 1; }
   unset MAESTRO_LOCK_TOKEN
   out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
@@ -794,10 +832,12 @@ t32() (
   lock="$dir/.maestro-write.lock"
   status="$dir/status.json"
   now=$(date +%s)
-  mkdir -p "$lock"
+  prepare_generation "$lock" || return 1
   printf 'token=stale-writer\npid=%s\nprocess_start=old\njob_id=task-stale-writer\nsession_id=session-stale-writer\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
     99999999 "$((now - 5))" > "$lock/metadata"
   printf 'token=stale-writer\nepoch=%s\n' "$((now - 5))" > "$lock/heartbeat"
+  sync_generation_field "$lock" || return 1
+  sync_generation_field "$lock" heartbeat || return 1
   status_running_job task-running-writer true > "$status"
   out=$(run_clear_lease "$dir" "$status" 1 2>&1); rc=$?
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
@@ -815,10 +855,12 @@ t33() (
   lock="$dir/.maestro-write.lock"
   status="$dir/status.json"
   now=$(date +%s)
-  mkdir -p "$lock"
+  prepare_generation "$lock" || return 1
   printf 'token=stale-empty\npid=%s\nprocess_start=old\njob_id=task-stale-empty\nsession_id=session-stale-empty\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
     99999999 "$((now - 5))" > "$lock/metadata"
   printf 'token=stale-empty\nepoch=%s\n' "$((now - 5))" > "$lock/heartbeat"
+  sync_generation_field "$lock" || return 1
+  sync_generation_field "$lock" heartbeat || return 1
   status_empty > "$status"
   out=$(run_clear_lease "$dir" "$status" 1 2>&1); rc=$?
   [ "$rc" -eq 0 ] || { echo "rc=$rc want 0: $out"; return 1; }
@@ -838,10 +880,12 @@ t34() (
   lock="$dir/.maestro-write.lock"
   status="$dir/status.json"
   now=$(date +%s)
-  mkdir -p "$lock"
+  prepare_generation "$lock" || return 1
   printf 'token=fresh-clear\npid=%s\nprocess_start=current\njob_id=task-fresh-clear\nsession_id=session-fresh-clear\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
     "$$" "$now" > "$lock/metadata"
   printf 'token=fresh-clear\nepoch=%s\n' "$now" > "$lock/heartbeat"
+  sync_generation_field "$lock" || return 1
+  sync_generation_field "$lock" heartbeat || return 1
   status_empty > "$status"
   out=$(run_clear_lease "$dir" "$status" 10 2>&1); rc=$?
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
@@ -871,10 +915,12 @@ t35() (
   }
   trap disabled_owner_cleanup EXIT
   now=$(date +%s)
-  mkdir -p "$lock"
+  prepare_generation "$lock" || return 1
   printf 'token=disabled\npid=%s\nprocess_start=Mon Jan  1 00:00:00 2026\njob_id=task-disabled\nsession_id=session-disabled\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
     "$owner_pid" "$((now - 5))" > "$lock/metadata"
   printf 'token=disabled\nepoch=%s\n' "$((now - 5))" > "$lock/heartbeat"
+  sync_generation_field "$lock" || return 1
+  sync_generation_field "$lock" heartbeat || return 1
   kill -STOP "$owner_pid" || return 1
   cd "$dir" || exit 1; . "$LIB"; progress_init
   export MAESTRO_LOCK_HEARTBEAT_STALE_SEC=0
@@ -899,10 +945,12 @@ t36() (
   local dir lock out rc; dir=$(ws heartbeat_unknown_age)
   lock="$dir/.maestro-write.lock"
   PATH=$(confirmed_ps_path "$dir"); export PATH
-  mkdir -p "$lock"
+  prepare_generation "$lock" || return 1
   printf 'token=unknown-age\npid=%s\nprocess_start=Mon Jan  1 00:00:00 2026\njob_id=task-unknown-age\nsession_id=session-unknown-age\nstarted_at=unknown\nstarted_epoch=not-a-number\ndigest_before=unavailable\n' \
     "$$" > "$lock/metadata"
   printf 'token=unknown-age\nepoch=1\n' > "$lock/heartbeat"
+  sync_generation_field "$lock" || return 1
+  sync_generation_field "$lock" heartbeat || return 1
   cd "$dir" || exit 1; . "$LIB"; progress_init
   export MAESTRO_LOCK_HEARTBEAT_STALE_SEC=1
   out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
@@ -971,10 +1019,12 @@ t39() (
   mkdir -p "$ps_shim"
   printf '#!/bin/sh\nprintf "%%s\\n" %q\n' "$owner_start" > "$ps_shim/ps"
   chmod +x "$ps_shim/ps"
-  mkdir -p "$lock"
+  prepare_generation "$lock" || return 1
   printf 'token=stale-live\npid=%s\nprocess_start=%s\njob_id=task-stale-live\nsession_id=session-stale-live\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=%s\ndigest_before=unavailable\n' \
     "$$" "$owner_start" "$((now - 5))" > "$lock/metadata"
   printf 'token=stale-live\nepoch=%s\n' "$((now - 5))" > "$lock/heartbeat"
+  sync_generation_field "$lock" || return 1
+  sync_generation_field "$lock" heartbeat || return 1
   status_empty > "$status"
   out=$(run_clear_lease "$dir" "$status" 1 2>&1); rc=$?
   [ "$rc" -eq 11 ] || { echo "rc=$rc want 11: $out"; return 1; }
@@ -994,9 +1044,11 @@ t40() (
   state="$dir/reclaim-state"
   shim="$state/shim"
   real_rm=$(command -v rm)
-  mkdir -p "$lock" "$shim"
+  mkdir -p "$shim"
+  prepare_generation "$lock" || return 1
   status_empty > "$dir/status.json"
   printf 'token=old\npid=999999\nprocess_start=dead\njob_id=task-old\nsession_id=session-old\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' > "$lock/metadata"
+  sync_generation_field "$lock" || return 1
   cat > "$shim/rm" <<EOF
 #!/usr/bin/env bash
 for arg in "\$@"; do
@@ -1124,10 +1176,12 @@ t43() (
   cd "$dir" || exit 1
   . "$LEASE_LIB"
   progress_init
-  mkdir "$lock"
+  prepare_generation "$lock" || return 1
   printf 'token=first\npid=999999\nprocess_start=dead\njob_id=task-first00-aaaaaa\nsession_id=test\nstarted_epoch=1\nquiescence=unconfirmed\nunconfirmed_job=task-first00-aaaaaa\nunconfirmed_reason=deadline\n' > "$lock/metadata"
+  sync_generation_field "$lock" || return 1
   write_lock_workspace_writers() {
     printf 'token=second\npid=999999\nprocess_start=dead\njob_id=task-second0-aaaaaa\nsession_id=test\nstarted_epoch=1\nquiescence=unconfirmed\nunconfirmed_job=task-second0-aaaaaa\nunconfirmed_reason=deadline\n' > "$lock/metadata"
+    sync_generation_field "$lock" || return 1
     return 0
   }
   write_lease_clear "$result" "$evidence"; rc=$?
@@ -1147,10 +1201,11 @@ t44() (
   cd "$dir" || exit 1
   . "$LEASE_LIB"
   progress_init
-  mkdir "$lock"
+  prepare_generation "$lock" || return 1
   start=$(write_lock_process_start "$$")
   printf 'token=live\npid=%s\nprocess_start=%s\njob_id=task-live0000-aaaaaa\nsession_id=test\nstarted_epoch=1\nquiescence=unconfirmed\nunconfirmed_job=task-live0000-aaaaaa\nunconfirmed_reason=deadline\n' \
     "$$" "${start:-unavailable}" > "$lock/metadata"
+  sync_generation_field "$lock" || return 1
   write_lock_workspace_writers() { return 0; }
   write_lease_clear "$result" "$evidence"; rc=$?
   [ "$rc" -eq 11 ] || { echo "live owner clear rc=$rc want 11"; return 1; }
@@ -1163,9 +1218,10 @@ t45_publication_temp_does_not_wedge_steal() (
   dir=$(ws publication_temps)
   lock="$dir/.maestro-write.lock"
   status_empty > "$dir/status.json"
-  mkdir -p "$lock"
+  prepare_generation "$lock" || return 1
   printf 'token=old\npid=99999999\nprocess_start=dead\njob_id=task-stale-temp-aaaaaa\nsession_id=test\nstarted_at=2026-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable\n' \
     > "$lock/metadata"
+  sync_generation_field "$lock" || return 1
   : > "$lock/heartbeat.tmp.deadtoken"
   cd "$dir" || exit 1
   . "$LIB"
@@ -1319,6 +1375,613 @@ t50_effective_poison_state_is_shared() (
     { echo "staged poison state path=$selected quiescence=$quiescence"; return 1; }
 )
 
+# ---------------------------------------------------------------- wait diagnostics
+t51_wait_diagnostics_identify_waiter_budget() (
+  local dir out rc started_epoch metadata rewritten
+  dir=$(ws wait_diagnostics)
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  write_lock_acquire task-wait-diagnostic-aaaaaa >/dev/null 2>&1 || return 1
+  metadata="$dir/.maestro-write.lock/metadata"
+  started_epoch=$(date +%s)
+  rewritten="$metadata.rewritten"
+  sed "s/^started_epoch=.*/started_epoch=$((started_epoch - 60))/" \
+    "$metadata" > "$rewritten" || return 1
+  mv -f "$rewritten" "$metadata" || return 1
+  unset MAESTRO_LOCK_TOKEN
+  export MAESTRO_LOCK_WAIT_SEC=2 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  printf '%s\n' "$out" | grep -Eq 'lease_age=6[2-5]s' ||
+    { echo "lease age missing or inaccurate: $out"; return 1; }
+  printf '%s\n' "$out" | grep -q 'wait_budget=2s' ||
+    { echo "wait budget missing: $out"; return 1; }
+  printf '%s\n' "$out" | grep -Eq 'wait_elapsed=[2-3]s' ||
+    { echo "wait elapsed missing or inaccurate: $out"; return 1; }
+)
+
+t52_contention_progress_is_throttled() (
+  local dir out rc wait_lines
+  dir=$(ws wait_progress)
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  write_lock_acquire task-wait-progress-aaaaaa >/dev/null 2>&1 || return 1
+  unset MAESTRO_LOCK_TOKEN
+  export MAESTRO_LOCK_WAIT_SEC=3 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  wait_lines=$(printf '%s\n' "$out" | grep -c 'waiting for the write lease' || true)
+  [ "$wait_lines" -eq 1 ] ||
+    { echo "wait_lines=$wait_lines want 1: $out"; return 1; }
+)
+
+t53_initializing_wait_respects_budget() (
+  local dir lock out rc started elapsed
+  dir=$(ws initializing_wait_budget)
+  lock="$dir/.maestro-write.lock"
+  prepare_generation "$lock" || return 1
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  export MAESTRO_LOCK_WAIT_SEC=1 MAESTRO_LOCK_WAIT_POLL_SEC=1
+  started=$(date +%s)
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  [ "$elapsed" -le 2 ] ||
+    { echo "initializing-owner elapsed=${elapsed}s exceeded 1s cap: $out"; return 1; }
+  printf '%s\n' "$out" | grep -Eq 'wait_budget=1s wait_elapsed=[1-2]s' ||
+    { echo "initializing-owner budget missing: $out"; return 1; }
+)
+
+t54_atomic_clear_preserves_successor() (
+  local dir lock first_result first_evidence second_result second_evidence
+  local second_rc_file rc move_rc token candidate
+  dir=$(ws atomic_clear_successor)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  first_result="$dir/first.result"
+  first_evidence="$dir/first.evidence"
+  second_result="$dir/second.result"
+  second_evidence="$dir/second.evidence"
+  second_rc_file="$dir/second.rc"
+  prepare_generation "$lock" || return 1
+  printf 'token=old\npid=999999\nprocess_start=dead\njob_id=task-old00000-aaaaaa\nsession_id=test\nstarted_epoch=1\nquiescence=unconfirmed\nunconfirmed_job=task-old00000-aaaaaa\nunconfirmed_reason=deadline\n' > "$lock/metadata"
+  sync_generation_field "$lock" || return 1
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  write_lock_workspace_writers() {
+    printf -v "$1" '%s' ""
+    return 0
+  }
+  mv() {
+    if [ "${1-}" = "$lock" ]; then
+      write_lease_clear "$second_result" "$second_evidence" >/dev/null 2>&1
+      printf '%s\n' "$?" > "$second_rc_file"
+      command mv "$@"
+      move_rc=$?
+      prepare_generation "$lock" eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee || return 1
+      printf 'token=successor\npid=999998\nprocess_start=dead\njob_id=task-successor-aaaaaa\nsession_id=test\nstarted_epoch=1\n' > "$lock/metadata"
+      sync_generation_field "$lock" || return 1
+      return "$move_rc"
+    fi
+    command mv "$@"
+  }
+  write_lease_clear "$first_result" "$first_evidence" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 11 ] ||
+    { echo "first clear rc=$rc want 11 after successor acquisition"; return 1; }
+  [ "$(cat "$second_rc_file")" -eq 11 ] ||
+    { echo "second clear bypassed the active generation claim"; return 1; }
+  token=$(sed -n 's/^token=//p' "$lock/metadata")
+  [ "$token" = successor ] ||
+    { echo "successor generation was removed or changed (token=${token:-missing})"; return 1; }
+  for candidate in "$lock".reclaim.clear-*; do
+    [ ! -e "$candidate" ] ||
+      { echo "atomic clear left a reclaim generation: $candidate"; return 1; }
+  done
+)
+
+t55_metadata_only_clear_is_reported() (
+  local dir lock result evidence out rc
+  dir=$(ws metadata_only_clear)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  result="$dir/result"
+  evidence="$dir/evidence"
+  prepare_generation "$lock" || return 1
+  printf 'token=metadata-only\npid=999999\nprocess_start=dead\njob_id=task-metadata-only\nsession_id=test\nstarted_epoch=1\n' > "$lock/metadata"
+  sync_generation_field "$lock" || return 1
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  write_lock_workspace_writers() {
+    printf -v "$1" '%s' ""
+    return 0
+  }
+  export MAESTRO_LOCK_HEARTBEAT_STALE_SEC=1
+  out=$(write_lease_clear "$result" "$evidence" 3>&1); rc=$?
+  [ "$rc" -eq 0 ] || { echo "metadata-only clear rc=$rc want 0: $out"; return 1; }
+  printf '%s\n' "$out" | grep -q 'clearing metadata-only write lease' ||
+    { echo "metadata-only structure missing from diagnostics: $out"; return 1; }
+  [ ! -d "$lock" ] || { echo "metadata-only generation survived clear"; return 1; }
+)
+
+t56_orphan_identity_fences_successor_publication() (
+  local dir lock result evidence rc probe_a probe_b
+  dir=$(ws orphan_identity_successor)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  result="$dir/result"
+  evidence="$dir/evidence"
+  prepare_generation "$lock" || return 1
+  touch -t 202001010000 "$lock"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  write_lock_workspace_writers() {
+    rm -rf "$lock"
+    prepare_generation "$lock" || return 1
+    touch -t 202001010000 "$lock"
+    printf -v "$1" '%s' ""
+    return 0
+  }
+  write_lease_clear "$result" "$evidence"
+  rc=$?
+  [ "$rc" -eq 11 ] || { echo "orphan clear rc=$rc want 11"; return 1; }
+  [ -d "$lock" ] || { echo "successor publication directory was removed"; return 1; }
+  probe_a=$(mktemp -d "$dir/identity-a.XXXXXX") || return 1
+  probe_b=$(mktemp -d "$dir/identity-b.XXXXXX") || return 1
+  prepare_generation "$probe_a" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa || return 1
+  prepare_generation "$probe_b" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb || return 1
+  [ "$(write_lock_path_identity "$probe_a")" != "$(write_lock_path_identity "$probe_b")" ] ||
+    { echo "directory identity helper does not distinguish generations"; return 1; }
+  [ ! -e "$lock/metadata" ] ||
+    { echo "successor unexpectedly published metadata"; return 1; }
+)
+t57_publication_claim_blocks_concurrent_clear() (
+  local dir lock identity generation record state publisher rc result evidence i
+  dir=$(ws publication_claim_clear)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  state="$dir/interleave"
+  result="$dir/clear.result"
+  evidence="$dir/clear.evidence"
+  mkdir -p "$state"
+  prepare_generation "$lock" || return 1
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  identity=$(write_lock_path_identity "$lock") || return 1
+  generation=$(cat "$lock/generation") || return 1
+  record=$(printf 'token=publisher\ngeneration=%s\npid=999999\nprocess_start=dead\njob_id=task-publisher-aaaaaa\nsession_id=test\nstarted_at=2020-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable' "$generation")
+  (
+    mv() {
+      command mv "$@" || return
+      case "$*" in
+        *"$lock/metadata")
+          : > "$state/metadata-moved"
+          while [ ! -e "$state/finish-publication" ]; do sleep 0.05; done
+          ;;
+      esac
+    }
+    write_lock_publish_metadata "$lock" "$identity" publisher "$record"
+  ) > "$state/publisher.out" 2>&1 &
+  publisher=$!
+  i=0
+  while [ ! -e "$state/metadata-moved" ] && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  if [ ! -e "$state/metadata-moved" ]; then
+    : > "$state/finish-publication"
+    wait "$publisher" 2>/dev/null || :
+    echo "publisher did not reach its final metadata check"
+    return 1
+  fi
+  write_lock_workspace_writers() { printf -v "$1" '%s' ""; }
+  export MAESTRO_LOCK_HEARTBEAT_STALE_SEC=1
+  write_lease_clear "$result" "$evidence" > "$state/clear.out" 2>&1 3>&1
+  rc=$?
+  : > "$state/finish-publication"
+  wait "$publisher" || { echo "publisher failed after the clearer was refused"; return 1; }
+  [ "$rc" -eq 11 ] || { echo "concurrent clear rc=$rc want 11"; return 1; }
+  grep -q 'generation claim is unavailable' "$state/clear.out" ||
+    { echo "clear did not contend on the publisher claim"; return 1; }
+  [ "$(write_lock_metadata_value "$lock/metadata" token)" = publisher ] ||
+    { echo "publisher lost ownership after concurrent clear"; return 1; }
+)
+t58_reclaimer_diagnostics_include_wait_budget() (
+  local dir lock state identity token holder out rc i
+  dir=$(ws reclaimer_wait_summary)
+  lock="$dir/.maestro-write.lock"
+  state="$dir/claim-holder"
+  dead_lock "$dir" task-reclaimer-aaaaaa
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  identity=$(write_lock_path_identity "$lock") || return 1
+  token=$(write_lock_metadata_value "$lock/metadata" token)
+  (
+    lock_claim_acquire "$lock" "$identity" "$token" || exit 1
+    : > "$state.ready"
+    while [ ! -e "$state.release" ]; do sleep 0.05; done
+    lock_claim_release "$lock" "$identity" "$token"
+  ) &
+  holder=$!
+  i=0
+  while [ ! -e "$state.ready" ] && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -e "$state.ready" ] || { echo "claim holder did not start"; return 1; }
+  write_lock_workspace_writers() {
+    printf -v "$1" '%s' ""
+    return 0
+  }
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  : > "$state.release"
+  wait "$holder" || return 1
+  [ "$rc" -eq 11 ] || { echo "reclaimer contention rc=$rc want 11"; return 1; }
+  printf '%s\n' "$out" | grep -q 'wait_budget=0s wait_elapsed=0s' ||
+    { echo "reclaimer contention omitted wait accounting: $out"; return 1; }
+)
+
+t59_valid_clear_identity_fences_same_token_successor() (
+  local dir lock metadata old replacement result evidence rc
+  dir=$(ws valid_clear_same_token)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  metadata="$lock/metadata"
+  old="$lock.observed"
+  replacement="$lock.successor"
+  result="$dir/result"
+  evidence="$dir/evidence"
+  prepare_generation "$lock" || return 1
+  printf 'token=replayed\npid=999999\nprocess_start=dead\njob_id=task-replayed-aaaaaa\nsession_id=test\nstarted_epoch=1\nquiescence=unconfirmed\nunconfirmed_job=task-replayed-aaaaaa\nunconfirmed_reason=deadline\n' > "$metadata"
+  sync_generation_field "$lock" || return 1
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  stat() { printf '7:42\n'; }
+  write_lock_workspace_writers() {
+    command mkdir "$replacement" || return 1
+    command cp "$metadata" "$replacement/metadata" || return 1
+    prepare_generation "$replacement" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb || return 1
+    sync_generation_field "$replacement" || return 1
+    command mv "$lock" "$old" || return 1
+    command mv "$replacement" "$lock" || return 1
+    printf -v "$1" '%s' ""
+    return 0
+  }
+  write_lease_clear "$result" "$evidence" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 11 ] || { echo "same-token clear rc=$rc want 11"; return 1; }
+  [ -f "$lock/generation" ] ||
+    { echo "same-token successor generation was removed"; return 1; }
+  [ "$(write_lock_metadata_value "$lock/metadata" token)" = replayed ] ||
+    { echo "same-token successor metadata changed"; return 1; }
+)
+
+t60_release_identity_fences_same_token_successor() (
+  local dir lock metadata old replacement evidence token
+  dir=$(ws release_same_token)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  metadata="$lock/metadata"
+  old="$lock.observed"
+  replacement="$lock.successor"
+  evidence="$dir/evidence"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  stat() { printf '7:42\n'; }
+  write_lock_acquire task-release-aaaaaa >/dev/null 2>&1 || return 1
+  token=$MAESTRO_LOCK_TOKEN
+  write_lock_workspace_writers() {
+    command mkdir "$replacement" || return 1
+    command cp "$metadata" "$replacement/metadata" || return 1
+    prepare_generation "$replacement" cccccccccccccccccccccccccccccccc || return 1
+    sync_generation_field "$replacement" || return 1
+    command mv "$lock" "$old" || return 1
+    command mv "$replacement" "$lock" || return 1
+    printf -v "$1" '%s' ""
+    return 0
+  }
+  write_lease_end "$evidence" >/dev/null 2>&1
+  [ -f "$lock/generation" ] ||
+    { echo "same-token successor was removed during release"; return 1; }
+  [ "$(write_lock_metadata_value "$lock/metadata" token)" = "$token" ] ||
+    { echo "same-token successor metadata changed during release"; return 1; }
+  [ "$MAESTRO_LOCK_ACQUIRED" -eq 1 ] ||
+    { echo "release dropped local ownership after rejecting a changed generation"; return 1; }
+)
+
+t61_killed_publisher_claim_is_recoverable() (
+  local dir lock identity generation record state publisher child result evidence rc candidate i
+  local shim real_mv
+  dir=$(ws killed_publisher_claim)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  state="$dir/interleave"
+  result="$dir/clear.result"
+  evidence="$dir/clear.evidence"
+  mkdir -p "$state"
+  shim="$state/shim"
+  real_mv=$(command -v mv) || return 1
+  mkdir -p "$shim"
+  cat > "$shim/mv" <<EOF
+#!/bin/sh
+"$real_mv" "\$@" || exit
+case "\$*" in
+  *"$lock/metadata")
+    sleep 10 &
+    printf '%s\n' "\$!" > "$state/child.pid"
+    wait "\$!"
+    ;;
+esac
+EOF
+  chmod +x "$shim/mv"
+  prepare_generation "$lock" || return 1
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  identity=$(write_lock_path_identity "$lock") || return 1
+  generation=$(cat "$lock/generation") || return 1
+  record=$(printf 'token=publisher\ngeneration=%s\npid=999999\nprocess_start=dead\njob_id=task-publisher-aaaaaa\nsession_id=test\nstarted_at=2020-01-01T00:00:00Z\nstarted_epoch=1\ndigest_before=unavailable' "$generation")
+  (
+    export PATH="$shim:$PATH"
+    write_lock_publish_metadata "$lock" "$identity" publisher "$record"
+  ) > "$state/publisher.out" 2>&1 &
+  publisher=$!
+  i=0
+  while [ ! -s "$state/child.pid" ] && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -s "$state/child.pid" ] ||
+    { echo "publisher did not enter its fenced metadata update"; return 1; }
+  child=$(cat "$state/child.pid")
+  kill -KILL "$publisher" 2>/dev/null || return 1
+  wait "$publisher" 2>/dev/null || :
+  kill -0 "$child" 2>/dev/null ||
+    { echo "blocked publication child exited before claim recovery"; return 1; }
+  write_lock_workspace_writers() { printf -v "$1" '%s' ""; }
+  export MAESTRO_LOCK_HEARTBEAT_STALE_SEC=1
+  write_lease_clear "$result" "$evidence" > "$state/clear.out" 2>&1 3>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    kill "$child" 2>/dev/null || :
+    echo "clear could not recover killed publisher claim: $(tr '\n' ' ' < "$state/clear.out")"
+    return 1
+  fi
+  [ ! -d "$lock" ] ||
+    { echo "killed publisher generation survived operator clear"; return 1; }
+  kill "$child" 2>/dev/null || :
+  for candidate in "$lock".reclaim.*; do
+    [ ! -e "$candidate" ] ||
+      { echo "killed publisher recovery leaked $candidate"; return 1; }
+  done
+)
+
+t62_acquisition_waits_for_the_generation_gate() (
+  local dir lock gate state holder acquirer rc i
+  dir=$(ws acquisition_generation_gate)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  state="$dir/gate-state"
+  mkdir -p "$state"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  gate=$(lock_claim_gate_path "$lock") || return 1
+  (
+    lock_claim_gate_acquire "$gate" || exit 1
+    : > "$state/ready"
+    while [ ! -e "$state/release" ]; do sleep 0.05; done
+    lock_claim_unlock
+  ) &
+  holder=$!
+  i=0
+  while [ ! -e "$state/ready" ] && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -e "$state/ready" ] ||
+    { echo "generation gate holder did not start"; return 1; }
+  (
+    write_lock_workspace_writers() { printf -v "$1" '%s' ""; }
+    export MAESTRO_LOCK_WAIT_SEC=3 MAESTRO_LOCK_WAIT_POLL_SEC=1
+    write_lock_acquire task-gate-acquirer-aaaaaa
+    rc=$?
+    printf '%s\n' "$rc" > "$state/acquire.rc"
+    if [ "$rc" -eq 0 ]; then write_lock_release; fi
+    exit "$rc"
+  ) > "$state/acquire.out" 2>&1 3>&1 &
+  acquirer=$!
+  sleep 0.3
+  if [ -d "$lock" ]; then
+    : > "$state/bypassed"
+  fi
+  : > "$state/release"
+  wait "$holder" || return 1
+  wait "$acquirer"
+  rc=$?
+  [ "$rc" -eq 0 ] ||
+    { echo "acquisition after gate release rc=$rc: $(tr '\n' ' ' < "$state/acquire.out")"; return 1; }
+  [ ! -e "$state/bypassed" ] ||
+    { echo "acquisition created the write lock while the generation gate was held"; return 1; }
+  [ ! -d "$lock" ] ||
+    { echo "acquisition left a write lock generation behind"; return 1; }
+)
+
+t63_release_rejects_a_preexisting_same_token_successor() (
+  local dir lock retired token successor_identity
+  dir=$(ws release_preexisting_successor)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  retired="$dir/retired"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  write_lock_acquire task-release-owner-aaaaaa >/dev/null 2>&1 || return 1
+  token=$MAESTRO_LOCK_TOKEN
+  command mv "$lock" "$retired" || return 1
+  prepare_generation "$lock" eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee || return 1
+  cp "$retired/metadata" "$lock/metadata" || return 1
+  sync_generation_field "$lock" || return 1
+  successor_identity=$(write_lock_path_identity "$lock") || return 1
+  write_lock_workspace_writers() { printf -v "$1" '%s' ""; }
+  write_lock_release
+  [ -d "$lock" ] ||
+    { echo "release removed a same-token successor present before release"; return 1; }
+  [ "$(write_lock_path_identity "$lock")" = "$successor_identity" ] ||
+    { echo "release replaced the same-token successor"; return 1; }
+  [ "$(write_lock_metadata_value "$lock/metadata" token)" = "$token" ] ||
+    { echo "release changed successor metadata"; return 1; }
+  [ "$MAESTRO_LOCK_ACQUIRED" -eq 1 ] ||
+    { echo "release dropped local ownership after rejecting a successor"; return 1; }
+)
+
+t64_owner_mutations_reject_a_preexisting_same_token_successor() (
+  local dir lock retired expected
+  dir=$(ws owner_mutation_preexisting_successor)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  retired="$dir/retired"
+  expected="$dir/successor.metadata"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  write_lock_acquire task-mutation-owner-aaaaaa >/dev/null 2>&1 || return 1
+  command mv "$lock" "$retired" || return 1
+  prepare_generation "$lock" ffffffffffffffffffffffffffffffff || return 1
+  cp "$retired/metadata" "$lock/metadata" || return 1
+  sync_generation_field "$lock" || return 1
+  cp "$lock/metadata" "$expected" || return 1
+  write_lock_set_job task-wrong-successor-aaaaaa >/dev/null 2>&1 || :
+  write_lock_poison task-wrong-successor-aaaaaa deadline >/dev/null 2>&1 || :
+  export MAESTRO_LOCK_HEARTBEAT_LAST_WRITE_EPOCH=0
+  export MAESTRO_LOCK_HEARTBEAT_LAST_TOKEN=""
+  write_lock_heartbeat_write >/dev/null 2>&1 || :
+  cmp "$expected" "$lock/metadata" ||
+    { echo "owner metadata mutation rewrote a same-token successor"; return 1; }
+  [ ! -e "$lock/metadata.new" ] ||
+    { echo "owner poison mutation staged data in a same-token successor"; return 1; }
+  [ ! -e "$lock/heartbeat" ] ||
+    { echo "owner heartbeat mutation wrote into a same-token successor"; return 1; }
+)
+
+t65_poison_finalize_rejects_a_preexisting_same_token_successor() (
+  local dir lock retired expected staged result evidence rc
+  dir=$(ws poison_finalize_preexisting_successor)
+  dir=$(cd "$dir" && pwd -P)
+  lock="$dir/.maestro-write.lock"
+  retired="$dir/retired"
+  expected="$dir/successor.metadata"
+  staged="$dir/successor.metadata.new"
+  result="$dir/result"
+  evidence="$dir/evidence"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  write_lock_acquire task-poison-owner-aaaaaa >/dev/null 2>&1 || return 1
+  write_lock_poison task-poison-owner-aaaaaa deadline >/dev/null 2>&1 || return 1
+  command mv "$lock" "$retired" || return 1
+  prepare_generation "$lock" 11111111111111111111111111111111 || return 1
+  cp "$retired/metadata" "$lock/metadata" || return 1
+  cp "$retired/metadata.new" "$lock/metadata.new" || return 1
+  sync_generation_field "$lock" || return 1
+  sync_generation_field "$lock" metadata.new || return 1
+  cp "$lock/metadata" "$expected" || return 1
+  cp "$lock/metadata.new" "$staged" || return 1
+  _write_lease_turn_event cancel-end task-poison-owner-aaaaaa deadline \
+    "$result" "$evidence"
+  rc=$?
+  [ "$rc" -eq 11 ] ||
+    { echo "poison finalize rc=$rc want 11 after generation replacement"; return 1; }
+  cmp "$expected" "$lock/metadata" ||
+    { echo "poison finalize rewrote a same-token successor"; return 1; }
+  cmp "$staged" "$lock/metadata.new" ||
+    { echo "poison finalize consumed successor staging metadata"; return 1; }
+)
+
+t66_failed_publication_retirement_blocks() (
+  local dir lock output rc
+  dir=$(ws failed_publication_retirement)
+  dir=$(cd "$dir" && pwd -P)
+  output="$dir/acquire.out"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  lock=$(write_lock_path) || return 1
+  mv() {
+    case "$*" in
+      *"$lock/metadata.tmp."*"$lock/metadata"|*"$lock $lock.reclaim."*) return 1 ;;
+    esac
+    command mv "$@"
+  }
+  write_lock_acquire task-publication-failure-aaaaaa > "$output" 2>&1 3>&1
+  rc=$?
+  [ "$rc" -eq 11 ] ||
+    { echo "failed publication retirement rc=$rc want 11: $(tr '\n' ' ' < "$output")"; return 1; }
+  [ -d "$lock" ] ||
+    { echo "failed retirement unexpectedly removed the canonical generation"; return 1; }
+  [ "$MAESTRO_LOCK_ACQUIRED" -eq 0 ] ||
+    { echo "failed publication granted local ownership"; return 1; }
+  grep -q 'could not be retired' "$output" ||
+    { echo "failed retirement diagnostic missing"; return 1; }
+)
+
+t67_identity_failure_retirement_blocks() (
+  local dir lock output rmdir_called rc
+  dir=$(ws identity_failure_retirement)
+  dir=$(cd "$dir" && pwd -P)
+  output="$dir/acquire.out"
+  rmdir_called="$dir/rmdir.called"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  lock=$(write_lock_path) || return 1
+  lock_claim_path_identity() { return 1; }
+  rmdir() { : > "$rmdir_called"; return 1; }
+  write_lock_acquire task-identity-failure-aaaaaa > "$output" 2>&1 3>&1
+  rc=$?
+  [ "$rc" -eq 11 ] ||
+    { echo "identity failure retirement rc=$rc want 11: $(tr '\n' ' ' < "$output")"; return 1; }
+  [ -d "$lock" ] ||
+    { echo "identity failure unexpectedly removed the canonical generation"; return 1; }
+  [ ! -e "$rmdir_called" ] ||
+    { echo "identity failure attempted an unfenced rmdir"; return 1; }
+  grep -q 'generation initialization failed.*retaining fail-closed lock' "$output" ||
+    { echo "identity failure diagnostic missing"; return 1; }
+)
+
+t68_token_failure_precedes_creation() (
+  local dir lock output rc
+  dir=$(ws token_failure_precedes_creation)
+  dir=$(cd "$dir" && pwd -P)
+  output="$dir/acquire.out"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  lock=$(write_lock_path) || return 1
+  od() { return 1; }
+  write_lock_acquire task-token-failure-aaaaaa > "$output" 2>&1
+  rc=$?
+  [ "$rc" -eq 3 ] ||
+    { echo "token generation failure rc=$rc want 3: $(tr '\n' ' ' < "$output")"; return 1; }
+  [ ! -e "$lock" ] ||
+    { echo "token generation failure created a canonical lock"; return 1; }
+)
+
+
+
 printf '=== Plan F green-phase verification ===\n'
 for t in t1 t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t16 t17 \
   t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 t29 t30 t31 t32 t33 t34 t35 t36 t37 t38 t39 t40 t41 t42 t43 t44 \
@@ -1327,7 +1990,22 @@ for t in t1 t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t1
   t47_unknown_lock_entry_is_not_deleted \
   t48_prelaunch_interrupt_releases_without_poison \
   t49_digest_recurses_through_nested_repositories \
-  t50_effective_poison_state_is_shared; do
+  t50_effective_poison_state_is_shared t51_wait_diagnostics_identify_waiter_budget \
+  t52_contention_progress_is_throttled t53_initializing_wait_respects_budget \
+  t54_atomic_clear_preserves_successor t55_metadata_only_clear_is_reported \
+  t56_orphan_identity_fences_successor_publication \
+  t57_publication_claim_blocks_concurrent_clear \
+  t58_reclaimer_diagnostics_include_wait_budget \
+  t59_valid_clear_identity_fences_same_token_successor \
+  t60_release_identity_fences_same_token_successor \
+  t61_killed_publisher_claim_is_recoverable \
+  t62_acquisition_waits_for_the_generation_gate \
+  t63_release_rejects_a_preexisting_same_token_successor \
+  t64_owner_mutations_reject_a_preexisting_same_token_successor \
+  t65_poison_finalize_rejects_a_preexisting_same_token_successor \
+  t66_failed_publication_retirement_blocks \
+  t67_identity_failure_retirement_blocks \
+  t68_token_failure_precedes_creation; do
   msg=$($t 2>&1) && ok "$t" || bad "$t" "${msg:-no detail}"
 done
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

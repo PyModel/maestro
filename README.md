@@ -74,14 +74,16 @@ The loop never ends in prose. Every run finishes on a machine-readable state:
 |:---:|---|---|---|
 | `0` | **VERIFIED_DONE** | Plan executed *and* the verify command passed locally | Review the diff — a claim is not proof |
 | `10` | **NEEDS_ANSWERS** | Codex hit real ambiguity and stopped instead of guessing | Answer the `QUESTIONS:` block, re-run |
-| `11` | **BLOCKED** | Missing access, a destructive step, lease contention, or an unconfirmed cancelled writer | Surface it; never improvise around it |
-| `12` | **STUCK** | Hit the iteration cap without verification | Read the attempts log, re-plan — don't just raise the cap |
+| `11` | **BLOCKED** | Missing access, a destructive step, lease contention, an unconfirmed cancelled writer, or a post-launch companion/process/result failure with no structured implementer result | Surface it; inspect companion-failure evidence and the current diff before a fresh dispatch |
+| `12` | **STUCK** | Hit the iteration cap without verification | Read the bounded attempt history appended to the plan, re-plan — don't just raise the cap |
 
 These codes describe `implementer-loop.sh`. The peer single-shot adapter uses rc `125` plus `MAESTRO_FINAL: WATCHDOG POISONED` for the same unconfirmed Write turn cancellation; `implementer-loop.sh` maps that outcome to `BLOCKED`/11.
 
 One Implementation run acquires one Lease interval across every Write turn and local Verification transaction, then releases or retains it once at the terminal state. The peer watchdog adapter acquires the same interval for its single Write turn.
+The loop evaluates `--verify` from the lease repository root, so root-relative
+verification does not depend on the shell directory that launched the loop.
 
-Write contention waits without arrival ordering only while the current lease has a confirmed release path. `MAESTRO_LOCK_WAIT_SEC` caps the wait (default 300 seconds; `0` disables it), and `MAESTRO_LOCK_WAIT_POLL_SEC` controls polling (default 5 seconds, minimum 1); invalid values disable waiting.
+Write contention waits without arrival ordering only while the current lease has a confirmed release path. `MAESTRO_LOCK_WAIT_SEC` caps the wait (default 300 seconds; `0` disables it), and `MAESTRO_LOCK_WAIT_POLL_SEC` controls polling (default 5 seconds, minimum 1); invalid values disable waiting. Progress is emitted on the first wait tick and then at most every 30 seconds. A terminal `held for` value is the owner's lease age; `wait_budget` and `wait_elapsed` identify the contender's actual wait window.
 
 Foreground write supervisors update a separate lease heartbeat every `MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC` (default 20 seconds, minimum 1; invalid values use 20). `MAESTRO_LOCK_HEARTBEAT_STALE_SEC` controls when a missed heartbeat is reported (default 90 seconds; `0` disables staleness reporting; invalid values use 90). A stale heartbeat is only a recovery candidate: `--clear-lease` still refuses while the recorded owner process is alive or unidentifiable, or any repository-global companion writer is visible.
 
