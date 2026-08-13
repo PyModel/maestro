@@ -34,6 +34,14 @@ companion_wrapper_accepts_effort() {
   return 1
 }
 
+companion_effort_acceptable() { # candidate top-level-config-effort
+  companion_wrapper_accepts_effort "$1" && return 0
+  case "$1" in
+    max|ultra) [ "$1" = "$2" ] ;;
+    *) return 1 ;;
+  esac
+}
+
 
 companion_version_is_newer() { # candidate current
   awk -v left="$1" -v right="$2" '
@@ -166,8 +174,8 @@ companion_pin() {
     echo "no Codex model/effort pinned — run: codex-model-select.sh <model> <debate-effort> <impl-effort> <impl-model>" >&2
     return 3
   fi
-  if ! companion_wrapper_accepts_effort "$impl_effort"; then
-    echo "unsupported implementation effort '$impl_effort' — choose none|minimal|low|medium|high|xhigh; max/ultra are debate-only" >&2
+  if ! companion_effort_acceptable "$impl_effort" "$debate_effort"; then
+    echo "unsupported implementation effort '$impl_effort' — the companion expresses only none|minimal|low|medium|high|xhigh per write job; max/ultra require the top-level debate effort to be the same value (currently '$debate_effort')" >&2
     return 3
   fi
   case "$impl_model" in
@@ -208,11 +216,14 @@ companion_start() { # companion prompt mode model effort lifecycle job-file stdo
   [ "$mode" = "write" ] && args+=(--write)
   args+=(--model "$MODEL")
   if [ "$mode" = "write" ]; then
-    if ! companion_wrapper_accepts_effort "$EFFORT"; then
+    if companion_wrapper_accepts_effort "$EFFORT"; then
+      args+=(--effort "$EFFORT")
+    elif companion_effort_acceptable "$EFFORT" "${COMPANION_CONFIG_EFFORT:-}"; then
+      progress "CODEX: companion cannot express implementation effort=$EFFORT as a flag; the pinned top-level config value is the same tier and governs this write dispatch"
+    else
       echo "companion cannot express implementation effort=$EFFORT; refusing to silently substitute the debate tier" >&2
       return 3
     fi
-    args+=(--effort "$EFFORT")
   elif companion_wrapper_accepts_effort "$EFFORT"; then
     args+=(--effort "$EFFORT")
   else
@@ -271,6 +282,18 @@ companion_verify_pin() { # companion job model effort lifecycle stdout stderr
     [ "$RECORDED_WRITE" = false ]; then
     return 0
   fi
+  # A write with max/ultra may omit --effort only when the pinned top-level
+  # config carries the identical tier; an absent/null recorded effort is then
+  # the companion's representation of that omitted flag.
+  case "$EXPECTED_EFFORT" in
+    max|ultra)
+      if [ "$RECORDED_MODEL" = "$EXPECTED_MODEL" ] &&
+        [ "$RECORDED_WRITE" = true ] &&
+        [ "${COMPANION_CONFIG_EFFORT:-}" = "$EXPECTED_EFFORT" ] &&
+        { [ -z "$EFFORT_FIELD" ] || [ "$RECORDED_EFFORT" = "null" ]; }; then
+        return 0
+      fi ;;
+  esac
   echo "Codex pin verification warning for $JOB: requested model=$EXPECTED_MODEL effort=$EXPECTED_EFFORT; recorded model=$RECORDED_MODEL effort=$RECORDED_EFFORT" >&2
   return 4
 }
@@ -631,7 +654,7 @@ _companion_turn_cleanup() { # profile-file [retain-job-lock]
 companion_turn() { # mode prompt-file max-idle poll result-file profile-file evidence-file lifecycle
   local mode="${1-}" prompt_file="${2-}" max_idle="${3-}" poll="${4-}"
   local result="${5-}" profile="${6-}" evidence="${7-}" lifecycle="${8-}"
-  local prompt C pin fields model effort impl_model job rc cleanup_rc derived
+  local prompt C pin fields model debate_effort effort impl_model job rc cleanup_rc derived
   local override_model="${MAESTRO_COMPANION_MODEL-}"
   local override_effort="${MAESTRO_COMPANION_EFFORT-}"
   local override_model_set=0 override_effort_set=0
@@ -672,6 +695,10 @@ companion_turn() { # mode prompt-file max-idle poll result-file profile-file evi
   pin=$(companion_pin) || return 3
   model=${pin%%$'\t'*}
   fields=${pin#*$'\t'}
+  debate_effort=${fields%%$'\t'*}
+  # ~/.codex/config.toml carries this top-level value; Codex uses it when a
+  # task omits --effort, and this is the only channel companion_start has for it.
+  COMPANION_CONFIG_EFFORT="$debate_effort"
   fields=${fields#*$'\t'}
   effort=${fields%%$'\t'*}
   impl_model=${fields#*$'\t'}

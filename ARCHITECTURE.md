@@ -143,7 +143,7 @@ Layering is strict and directional: `lib-process.sh` → `lib-companion.sh` →
 | Dependency | Role | Boundary |
 |---|---|---|
 | Claude Code | Host runtime; fires hooks; runs the orchestrator model | Contract: hook JSON payloads on stdin, exit codes |
-| Codex CLI + `openai-codex` plugin (`codex-companion.mjs`) | Executes background agent jobs | Contract: `codex task --background [--write] --model … --effort …`, `status --json`, `cancel`, `result`, `status --all --json`; a **compatibility probe** on `--help` refuses write dispatch if `task` is described without `--write` |
+| Codex CLI + `openai-codex` plugin (`codex-companion.mjs`) | Executes background agent jobs | Contract: `codex task --background [--write] --model … [--effort …]`, `status --json`, `cancel`, `result`, `status --all --json`; wrapper-expressible write efforts use `--effort`, while max/ultra omit it only when identical to the pinned top-level `model_reasoning_effort`; a **compatibility probe** on `--help` refuses write dispatch if `task` is described without `--write` |
 | `~/.codex/config.toml` | Codex configuration: model, reasoning efforts, MCP servers, `web_search` | Parsed as TOML; only true top-level keys are trusted |
 | Git | Repository scope, tree digests (`git hash-object --no-filters`), worktree/submodule discovery | Must be present in the working directory |
 
@@ -325,7 +325,10 @@ cancellation (unconfirmed quiescence).
 ### 4.4 Companion transport (Maestro → Codex)
 
 Implemented in `lib-companion.sh` via the plugin's `codex-companion.mjs`:
-`task --background [--write] --model <m> --effort <e> <prompt>`,
+`task --background [--write] --model <m> [--effort <e>] <prompt>`;
+write jobs omit `--effort` only for an exact max/ultra match with the pinned
+top-level `model_reasoning_effort`, otherwise the wrapper-expressible effort is
+passed explicitly.
 `status <job> --json`, `cancel <job>`, `result <job>`, `status --all --json`
 (repository-global writer visibility, parsed strictly, session filter
 deliberately stripped). Jobs are identified as `task-<id>-<id>`.
@@ -432,7 +435,8 @@ Pull requests and pushes to `main` both trigger it. There is no CD — the
   `task` synopsis lacks `--write` (guards against upstream flag drift).
 - The model pin is verified against the launched job's recorded
   `request.model`/`request.effort` (`companion_verify_pin`), warning on
-  mismatch.
+  mismatch; an absent/null effort is accepted only for an exact-match write
+  dispatch that omitted the wrapper flag.
 
 **Boundary statement.** The write path is coupled to the companion transport's
 JSON contract: status fields (`phase`, `elapsed`, `progressPreview`,

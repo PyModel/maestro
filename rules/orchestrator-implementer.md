@@ -12,7 +12,7 @@ bash ~/.claude/hooks/codex-model-select.sh --show
 bash ~/.claude/hooks/codex-model-select.sh <model> <debate-effort> <impl-effort>
 ```
 
-Effort guide: minimal/low for quick mechanical work, medium for default implementation, and **high for architecture debates, delicate refactors, and final-review judgment**. Debate effort may also use max/ultra through top-level Codex config; implementation effort is limited to none/minimal/low/medium/high/xhigh because the companion must express it explicitly per write job. Never accept a silent fallback from an unsupported implementation tier. Model availability depends on the user's ChatGPT plan; the script validates the name's shape only, and Codex itself rejects a model it cannot reach. “Keep current” is usable only when `--pin` succeeds; a fresh unpinned install cannot dispatch until the user selects values.
+Effort guide: minimal/low for quick mechanical work, medium for default implementation, and **high for architecture debates, delicate refactors, and final-review judgment**. Debate effort may also use max/ultra through top-level Codex config; implementation effort uses none/minimal/low/medium/high/xhigh per write job, while max/ultra are allowed only when the implementation effort exactly matches the pinned top-level debate effort and the companion omits the per-job flag. Never accept a silent fallback from an unsupported implementation tier. Model availability depends on the user's ChatGPT plan; the script validates the name's shape only, and Codex itself rejects a model it cannot reach. “Keep current” is usable only when `--pin` succeeds; a fresh unpinned install cannot dispatch until the user selects values.
 
 ## Dispatch
 

@@ -95,17 +95,17 @@ EOF
 
 t4_rejects_unexpressible_implementation_effort() {
   local home config impl output rc
-  home=$(new_home reject-impl-ultra)
+  home=$(new_home reject-impl-max)
   config="$home/.codex/config.toml"
   impl="$home/.codex/maestro-impl-effort"
   printf 'model = "old-model"\nmodel_reasoning_effort = "medium"\n' > "$config"
   printf 'medium\n' > "$impl"
   cp "$config" "$home/config.before"
   cp "$impl" "$home/impl.before"
-  output=$(HOME="$home" bash "$SELECTOR" new-model high ultra 2>&1); rc=$?
+  output=$(HOME="$home" bash "$SELECTOR" new-model high max 2>&1); rc=$?
   [ "$rc" -eq 3 ] || { echo "rc=$rc want 3: $output"; return 1; }
-  case "$output" in *'implementation effort'*'none | minimal | low | medium | high | xhigh'*) ;; *)
-    echo "rejection did not explain wrapper-supported implementation tiers: $output"; return 1 ;; esac
+  [ "$output" = "SELECT_ERROR: implementation effort 'max' cannot be expressed per write job (the companion accepts none|minimal|low|medium|high|xhigh); max/ultra are usable only when the top-level debate effort is the same value, currently 'high'" ] ||
+    { echo "unexpected rejection: $output"; return 1; }
   cmp -s "$config" "$home/config.before" || { echo "config changed after rejected implementation effort"; return 1; }
   cmp -s "$impl" "$home/impl.before" || { echo "implementation file changed after rejection"; return 1; }
 }
@@ -247,6 +247,47 @@ EOF
   cmp -s "$model" "$home/model.before" || { echo "impl model was not rolled back"; return 1; }
 }
 
+t11_matching_top_level_max_is_valid() {
+  local home config impl output pin show
+  home=$(new_home matching-top-level-max)
+  config="$home/.codex/config.toml"
+  impl="$home/.codex/maestro-impl-effort"
+  printf 'model = "old-model"\nmodel_reasoning_effort = "medium"\n' > "$config"
+  printf 'medium\n' > "$impl"
+  output=$(HOME="$home" bash "$SELECTOR" gpt-5.6-luna max max 2>&1) ||
+    { echo "selector rejected exact max match: $output"; return 1; }
+  pin=$(HOME="$home" bash "$SELECTOR" --pin) || return 1
+  [ "$pin" = $'gpt-5.6-luna\tmax\tmax\tgpt-5.6-luna' ] ||
+    { echo "pin=$pin"; return 1; }
+  show=$(HOME="$home" bash "$SELECTOR" --show) || return 1
+  case "$show" in *'impl-effort=max (via top-level config)'*) ;; *)
+    echo "show omitted exact-match diagnostic: $show"; return 1 ;; esac
+}
+
+t12_stored_mismatched_max_fails_pin() {
+  local home output show rc
+  home=$(new_home stored-mismatched-max)
+  printf 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\n' > "$home/.codex/config.toml"
+  printf 'max\n' > "$home/.codex/maestro-impl-effort"
+  output=$(HOME="$home" bash "$SELECTOR" --pin 2>&1); rc=$?
+  [ "$rc" -eq 3 ] || { echo "rc=$rc want 3: $output"; return 1; }
+  [ "$output" = "SELECT_ERROR: implementation effort 'max' cannot be expressed per write job (the companion accepts none|minimal|low|medium|high|xhigh); max/ultra are usable only when the top-level debate effort is the same value, currently 'high'" ] ||
+    { echo "unexpected stored-pin rejection: $output"; return 1; }
+  show=$(HOME="$home" bash "$SELECTOR" --show) || return 1
+  case "$show" in *'impl-effort=max (invalid — top-level effort is high)'*) ;; *)
+    echo "show omitted mismatch diagnostic: $show"; return 1 ;; esac
+}
+
+t13_scout_keeps_strict_effort_cap() {
+  local home output rc
+  home=$(new_home scout-strict-cap)
+  output=$(HOME="$home" bash "$SELECTOR" --scout gpt-5.6-luna max 2>&1); rc=$?
+  [ "$rc" -eq 3 ] || { echo "rc=$rc want 3: $output"; return 1; }
+  [ "$output" = "SELECT_ERROR: invalid scout effort 'max' (expected: none | minimal | low | medium | high | xhigh)" ] ||
+    { echo "scout cap changed: $output"; return 1; }
+  [ ! -e "$home/.codex/maestro-scout" ] || { echo "scout pin was written"; return 1; }
+}
+
 check() {
   local fn="$1" label="$2" detail
   if detail=$("$fn" 2>&1); then ok "$label"; else bad "$label" "${detail:-no detail}"; fi
@@ -263,5 +304,8 @@ check t7_missing_implementation_model_is_inherited "missing implementation model
 check t8_corrupt_implementation_model_fails_pin "corrupt implementation model fails closed"
 check t9_three_argument_repin_preserves_implementation_model "three-argument repin preserves the implementation model"
 check t10_failed_implementation_model_publish_rolls_back_all_files "failed implementation model publication rolls back all files"
+check t11_matching_top_level_max_is_valid "matching top-level max implementation effort is valid"
+check t12_stored_mismatched_max_fails_pin "stored mismatched max implementation effort fails pin"
+check t13_scout_keeps_strict_effort_cap "scout keeps the strict wrapper effort cap"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

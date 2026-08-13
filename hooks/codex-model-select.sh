@@ -13,7 +13,8 @@
 #   codex-model-select.sh --ask-on-start on|off|status
 #
 # Debate effort: none | minimal | low | medium | high | xhigh | max | ultra
-# Implementation effort: none | minimal | low | medium | high | xhigh
+# Implementation effort: none | minimal | low | medium | high | xhigh, or
+# max | ultra only when it exactly matches the top-level debate effort.
 # Exit codes: 0 = ok | 3 = bad args, invalid values, or failed publication
 set -uo pipefail
 
@@ -119,6 +120,14 @@ valid_effort() {
 valid_impl_effort() {
   case "$1" in
     none|minimal|low|medium|high|xhigh) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+impl_effort_acceptable() { # implementation-effort debate-effort
+  valid_impl_effort "$1" && return 0
+  case "$1" in
+    max|ultra) [ "$1" = "$2" ] ;;
     *) return 1 ;;
   esac
 }
@@ -238,7 +247,15 @@ show() {
   else
     echo "effort=${E:-(not pinned — Codex default)}"
   fi
-  echo "impl-effort=$I"
+  case "$I" in
+    max|ultra)
+      if [ "$I" = "$E" ]; then
+        echo "impl-effort=$I (via top-level config)"
+      else
+        echo "impl-effort=$I (invalid — top-level effort is $E)"
+      fi ;;
+    *) echo "impl-effort=$I" ;;
+  esac
   if [ -n "$IM" ] && valid_model "$IM"; then
     echo "impl-model=$IM"
   elif [ -f "$IMPL_MODEL_FILE" ] && [ -n "$IM" ]; then
@@ -272,8 +289,8 @@ pin() {
     echo "SELECT_ERROR: invalid debate effort '$E' (expected: none | minimal | low | medium | high | xhigh | max | ultra)" >&2
     return 3
   fi
-  if ! valid_impl_effort "$I"; then
-    echo "SELECT_ERROR: invalid implementation effort '$I' (expected: none | minimal | low | medium | high | xhigh; max/ultra are debate-only because the companion wrapper cannot express them for write jobs)" >&2
+  if ! impl_effort_acceptable "$I" "$E"; then
+    echo "SELECT_ERROR: implementation effort '$I' cannot be expressed per write job (the companion accepts none|minimal|low|medium|high|xhigh); max/ultra are usable only when the top-level debate effort is the same value, currently '$E'" >&2
     return 3
   fi
   if [ -n "$IM" ] && ! valid_model "$IM"; then
@@ -540,8 +557,8 @@ if ! valid_effort "$EFFORT"; then
   echo "SELECT_ERROR: invalid effort '$EFFORT' (expected: none | minimal | low | medium | high | xhigh | max | ultra)" >&2
   exit 3
 fi
-if ! valid_impl_effort "$IMPL_EFFORT"; then
-  echo "SELECT_ERROR: invalid implementation effort '$IMPL_EFFORT' (expected: none | minimal | low | medium | high | xhigh; max/ultra are debate-only because the companion wrapper cannot express them for write jobs)" >&2
+if ! impl_effort_acceptable "$IMPL_EFFORT" "$EFFORT"; then
+  echo "SELECT_ERROR: implementation effort '$IMPL_EFFORT' cannot be expressed per write job (the companion accepts none|minimal|low|medium|high|xhigh); max/ultra are usable only when the top-level debate effort is the same value, currently '$EFFORT'" >&2
   exit 3
 fi
 if ! valid_model "$IMPL_MODEL"; then

@@ -138,6 +138,42 @@ t0e_role_dispatch_uses_pinned_models() (
   [ "$rc" -eq 0 ] || { echo "write dispatch rc=$rc"; return 1; }
   grep -Fq '"--model","gpt-5.6-luna-max"' "$write_argv" ||
     { echo "write dispatch used the debate model: $(cat "$write_argv")"; return 1; }
+  grep -Fq '"--effort","high"' "$write_argv" ||
+    { echo "write dispatch omitted explicit high effort: $(cat "$write_argv")"; return 1; }
+)
+
+t0f_matching_top_level_effort_omits_write_flag() (
+  local argv="$TEST_ROOT/max-write.argv" calls="$TEST_ROOT/max-write.calls"
+  local job_file="$TEST_ROOT/max-write.job" out="$TEST_ROOT/max-write.stdout"
+  local err="$TEST_ROOT/max-write.stderr" output rc
+  : > "$calls"
+  export MAESTRO_TEST_ARGV="$argv" MAESTRO_TEST_CALL_LOG="$calls"
+  output=$(COMPANION_CONFIG_EFFORT=max companion_start "$FIXTURE" objective write \
+    gpt-5.6-luna max : "$job_file" "$out" "$err" 3>&1 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo "matching max write rc=$rc output=$output"; return 1; }
+  [ -s "$argv" ] || { echo "matching max write did not launch a task"; return 1; }
+  ! grep -Fq '"--effort"' "$argv" ||
+    { echo "matching max write passed an effort flag: $(cat "$argv")"; return 1; }
+  grep -q '^task ' "$calls" || { echo "matching max write did not launch a task"; return 1; }
+  case "$output" in
+    *'CODEX: companion cannot express implementation effort=max as a flag; the pinned top-level config value is the same tier and governs this write dispatch'*) ;;
+    *) echo "matching max progress missing: $output"; return 1 ;;
+  esac
+)
+
+t0g_mismatched_top_level_effort_refuses_write() (
+  local argv="$TEST_ROOT/mismatch-write.argv" calls="$TEST_ROOT/mismatch-write.calls"
+  local job_file="$TEST_ROOT/mismatch-write.job" out="$TEST_ROOT/mismatch-write.stdout"
+  local err="$TEST_ROOT/mismatch-write.stderr" output rc
+  : > "$calls"
+  export MAESTRO_TEST_ARGV="$argv" MAESTRO_TEST_CALL_LOG="$calls"
+  output=$(COMPANION_CONFIG_EFFORT=high companion_start "$FIXTURE" objective write \
+    gpt-5.6-luna max : "$job_file" "$out" "$err" 3>&1 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || { echo "mismatched max write was accepted: $output"; return 1; }
+  ! grep -q '^task ' "$calls" || { echo "mismatched max write launched a task"; return 1; }
+  [ ! -e "$argv" ] || { echo "mismatched max write produced task argv"; return 1; }
 )
 
 t0d_read_interrupt_never_cancels_unknown_writer() (
@@ -536,6 +572,8 @@ check t0_process_module_contract "deep process module owns bounded output and rc
 check t0b_companion_module_contract "companion interface requires an explicit mode"
 check t0c_failed_started_publication_cancels_job "failed launch publication cancels the unpublished job"
 check t0e_role_dispatch_uses_pinned_models "read and write dispatches use their pinned models"
+check t0f_matching_top_level_effort_omits_write_flag "matching top-level effort omits the write effort flag"
+check t0g_mismatched_top_level_effort_refuses_write "mismatched top-level effort refuses the write dispatch"
 check t0d_read_interrupt_never_cancels_unknown_writer "read interrupt never cancels an unknown writer"
 check t1_hanging_status_is_bounded "hanging status honors the companion timeout"
 check t2_timeout_reaps_process_group "timeout returns 125 and reaps the process group"

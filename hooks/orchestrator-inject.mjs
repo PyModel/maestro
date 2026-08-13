@@ -100,14 +100,12 @@ if (/(codex (model|settings|effort|config)|pick (the )?codex|change codex|set co
     'CODEX MODEL SETUP — ask the user for the debate model, implementation model, and separate role-specific efforts.\n' +
     'Show current settings first:  bash ~/.claude/hooks/codex-model-select.sh --show\n' +
     'Debate effort governs read-only discussions; implementation effort governs write jobs.\n' +
-    'Implementation model — default: gpt-5.6-luna-max (with impl effort xhigh).\n' +
+    'Implementation model — default: gpt-5.6-luna at effort max.\n' +
     'Alternatives: gpt-5.6-sol at low | medium | high; gpt-5.6-luna at xhigh;\n' +
-    'gpt-5.6-terra at xhigh; gpt-5.6-terra-max. Availability depends on the\n' +
-    "user's ChatGPT plan.\n" +
+    "gpt-5.6-terra at xhigh or max. Availability depends on the user's ChatGPT plan.\n" +
     'Debate default stays: model gpt-5.6-sol, effort max.\n' +
-    'Effort tiers max/ultra are debate-only — the companion wrapper accepts only\n' +
-    'none|minimal|low|medium|high|xhigh per write job, so a "max" tier on the\n' +
-    'implementation side is expressed as a *-max model name, not as an effort.\n' +
+    'max/ultra work on the implementation side only when the debate effort is the same value —\n' +
+    'the companion cannot pass them as a per-job flag, so the pinned top-level config value is what delivers that tier.\n' +
     'Apply their picks:  bash ~/.claude/hooks/codex-model-select.sh <model> <debate-effort> <impl-effort> <impl-model>\n' +
     'and confirm all four values in one line.'
   );
