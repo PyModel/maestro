@@ -145,10 +145,12 @@ t0e_role_dispatch_uses_pinned_models() (
 t0f_matching_top_level_effort_omits_write_flag() (
   local argv="$TEST_ROOT/max-write.argv" calls="$TEST_ROOT/max-write.calls"
   local job_file="$TEST_ROOT/max-write.job" out="$TEST_ROOT/max-write.stdout"
-  local err="$TEST_ROOT/max-write.stderr" output rc
+  local err="$TEST_ROOT/max-write.stderr" warning="$TEST_ROOT/max-write.warning"
+  local output job rc
   : > "$calls"
   export MAESTRO_TEST_ARGV="$argv" MAESTRO_TEST_CALL_LOG="$calls"
-  output=$(COMPANION_CONFIG_EFFORT=max companion_start "$FIXTURE" objective write \
+  export COMPANION_CONFIG_EFFORT=max
+  output=$(companion_start "$FIXTURE" objective write \
     gpt-5.6-luna max : "$job_file" "$out" "$err" 3>&1 2>&1)
   rc=$?
   [ "$rc" -eq 0 ] || { echo "matching max write rc=$rc output=$output"; return 1; }
@@ -160,6 +162,17 @@ t0f_matching_top_level_effort_omits_write_flag() (
     *'CODEX: companion cannot express implementation effort=max as a flag; the pinned top-level config value is the same tier and governs this write dispatch'*) ;;
     *) echo "matching max progress missing: $output"; return 1 ;;
   esac
+  job=$(cat "$job_file")
+  companion_verify_pin "$FIXTURE" "$job" gpt-5.6-luna max : "$out" "$err"
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo "matching max pin verification rc=$rc"; return 1; }
+  export COMPANION_CONFIG_EFFORT=high
+  companion_verify_pin "$FIXTURE" "$job" gpt-5.6-luna max : "$out" "$err" \
+    2> "$warning"
+  rc=$?
+  [ "$rc" -eq 4 ] || { echo "mismatched max pin verification rc=$rc"; return 1; }
+  grep -Fq "Codex pin verification warning for $job" "$warning" ||
+    { echo "mismatched max pin verification warning missing: $(cat "$warning")"; return 1; }
 )
 
 t0g_mismatched_top_level_effort_refuses_write() (

@@ -27,15 +27,22 @@ function nextSequenceValue(file, fallback) {
   return values[0];
 }
 
-function requestedFlag(name, fallback) {
-  if (!process.env.MAESTRO_TEST_ARGV) return fallback;
+function readRecordedArgv() {
+  if (!process.env.MAESTRO_TEST_ARGV) return null;
   try {
     const argv = JSON.parse(fs.readFileSync(process.env.MAESTRO_TEST_ARGV, "utf8"));
-    const index = argv.indexOf(name);
-    return typeof argv[index + 1] === "string" ? argv[index + 1] : fallback;
+    return Array.isArray(argv) ? argv : null;
   } catch {
-    return fallback;
+    return null;
   }
+}
+
+function requestedFlag(name, fallback, argv = readRecordedArgv()) {
+  if (!Array.isArray(argv)) return fallback;
+  const index = argv.indexOf(name);
+  return index >= 0 && typeof argv[index + 1] === "string"
+    ? argv[index + 1]
+    : null;
 }
 
 if (command === "--help") {
@@ -141,15 +148,20 @@ if (command === "status" && args.at(-1) === "--json") {
         process.env.MAESTRO_TEST_JOB_PHASE_FILE,
         process.env.MAESTRO_TEST_JOB_PHASE ?? "completed"
       );
-  const requestedModel = requestedFlag("--model", "gpt-5.6-sol");
-  const requestedEffort = requestedFlag("--effort", "high");
+  const recordedArgv = readRecordedArgv();
+  const requestedModel = requestedFlag("--model", "gpt-5.6-sol", recordedArgv);
+  const requestedEffort = requestedFlag("--effort", "high", recordedArgv);
+  const request = { model: requestedModel, effort: requestedEffort };
+  if (Array.isArray(recordedArgv)) {
+    request.write = recordedArgv.includes("--write");
+  }
   const job = {
     id: args[0],
     status,
     phase: status === "running" ? "running" : "done",
     elapsed: "1s",
     progressPreview: [],
-    request: { model: requestedModel, effort: requestedEffort }
+    request
   };
   if (process.env.MAESTRO_TEST_LOGFILE) {
     job.logFile = process.env.MAESTRO_TEST_LOGFILE;
