@@ -56,30 +56,146 @@ terminate_suite_tree() { # process-group leader
   for descendant in $descendants; do kill -KILL "$descendant" 2>/dev/null || :; done
 }
 
-if [ "$#" -gt 0 ]; then
-  suites="$*"
+suite_inventory() {
+    local suite_path suite
+    for suite_path in "$TEST_DIR"/*.sh; do
+        suite="${suite_path##*/}"
+        [ "$suite" = run.sh ] || printf '%s\n' "$suite"
+    done | LC_ALL=C sort
+}
+
+suite_cost() {
+    case "$1" in
+        liveness.sh) printf '%s\n' 166 ;;
+        stop-report.sh) printf '%s\n' 141 ;;
+        lease.sh) printf '%s\n' 83 ;;
+        bounded-calls.sh) printf '%s\n' 58 ;;
+        detection.sh) printf '%s\n' 39 ;;
+        job-lock.sh) printf '%s\n' 30 ;;
+        scout.sh) printf '%s\n' 25 ;;
+        discussion.sh) printf '%s\n' 22 ;;
+        commit-invariance.sh) printf '%s\n' 9 ;;
+        provenance-edge.sh) printf '%s\n' 8 ;;
+        orphan-lifecycle.sh) printf '%s\n' 8 ;;
+        gate.sh) printf '%s\n' 7 ;;
+        shared-git-dir.sh) printf '%s\n' 4 ;;
+        preflight.sh) printf '%s\n' 4 ;;
+        manual-check-and-submodules.sh) printf '%s\n' 4 ;;
+        install.sh) printf '%s\n' 4 ;;
+        runner-timeout.sh) printf '%s\n' 2 ;;
+        model-selector.sh) printf '%s\n' 2 ;;
+        *) printf '%s\n' 60 ;;
+    esac
+}
+
+usage() {
+    printf 'usage: %s [--list | --shard I/N | suite ...]\n' "$0" >&2
+}
+
+inventory=$(suite_inventory)
+inventory_suites=()
+while IFS= read -r suite; do
+    [ -n "$suite" ] || continue
+    inventory_suites[${#inventory_suites[@]}]="$suite"
+done <<EOF
+$inventory
+EOF
+
+suites=()
+shard_index=''
+shard_count=''
+if [ "$#" -eq 0 ]; then
+    suites=("${inventory_suites[@]}")
 else
-  suites="gate.sh
-install.sh
-model-selector.sh
-preflight.sh
-lease.sh
-job-lock.sh
-scout.sh
-liveness.sh
-stop-report.sh
-bounded-calls.sh
-runner-timeout.sh
-shared-git-dir.sh
-provenance-edge.sh
-discussion.sh
-detection.sh
-orphan-lifecycle.sh
-commit-invariance.sh
-manual-check-and-submodules.sh"
+    case "$1" in
+        --list)
+            [ "$#" -eq 1 ] || { usage; exit 2; }
+            printf '%s\n' "${inventory_suites[@]}"
+            exit 0
+            ;;
+        --shard)
+            if [ "$#" -ne 2 ]; then
+                usage
+                exit 2
+            fi
+            shard_spec="$2"
+            case "$shard_spec" in
+                */*) ;;
+                *)
+                    usage
+                    exit 2
+                    ;;
+            esac
+            case "$shard_spec" in
+                ''|*/*/*|/*|*/|*[!0-9/]*)
+                    usage
+                    exit 2
+                    ;;
+            esac
+            shard_index_text="${shard_spec%%/*}"
+            shard_count_text="${shard_spec#*/}"
+            shard_index=$((10#$shard_index_text))
+            shard_count=$((10#$shard_count_text))
+            if [ "$shard_index" -lt 1 ] ||
+                [ "$shard_count" -lt 1 ] ||
+                [ "$shard_index" -gt "$shard_count" ]; then
+                usage
+                exit 2
+            fi
+            ;;
+        *)
+            suites=("$@")
+            ;;
+    esac
 fi
 
-for suite in $suites; do
+if [ -n "$shard_index" ]; then
+    ordered_suites=()
+    ordered_costs=()
+    for suite in "${inventory_suites[@]}"; do
+        cost=$(suite_cost "$suite")
+        position=0
+        while [ "$position" -lt "${#ordered_suites[@]}" ] &&
+            [ "${ordered_costs[$position]}" -ge "$cost" ]; do
+            position=$((position + 1))
+        done
+        index=${#ordered_suites[@]}
+        while [ "$index" -gt "$position" ]; do
+            previous=$((index - 1))
+            ordered_suites[$index]="${ordered_suites[$previous]}"
+            ordered_costs[$index]="${ordered_costs[$previous]}"
+            index=$previous
+        done
+        ordered_suites[$position]="$suite"
+        ordered_costs[$position]="$cost"
+    done
+
+    shard_loads=()
+    assigned_shards=()
+    for ((shard = 1; shard <= shard_count; shard++)); do
+        shard_loads[$shard]=0
+    done
+    for ((suite_index = 0; suite_index < ${#ordered_suites[@]}; suite_index++)); do
+        target=1
+        cost="${ordered_costs[$suite_index]}"
+        for ((shard = 2; shard <= shard_count; shard++)); do
+            if [ "${shard_loads[$shard]}" -lt "${shard_loads[$target]}" ]; then
+                target=$shard
+            fi
+        done
+        assigned_shards[$suite_index]=$target
+        shard_loads[$target]=$((shard_loads[$target] + cost))
+    done
+
+    suites=()
+    for ((suite_index = 0; suite_index < ${#ordered_suites[@]}; suite_index++)); do
+        if [ "${assigned_shards[$suite_index]}" -eq "$shard_index" ]; then
+            suites[${#suites[@]}]="${ordered_suites[$suite_index]}"
+        fi
+    done
+fi
+
+for suite in "${suites[@]}"; do
   set -m
   bash "$TEST_DIR/$suite" &
   pid=$!

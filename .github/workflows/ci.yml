@@ -15,13 +15,18 @@ concurrency:
 
 jobs:
   tests:
+    name: tests (shard ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     # The hooks target macOS /bin/bash 3.2; macos-15 ships it as /bin/bash.
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - name: Run test suites
         # /bin first so run.sh's unqualified `bash` resolves to 3.2, not brew bash 5.
         run: |
           export PATH="/bin:$PATH"
-          /bin/bash tests/run.sh
+          /bin/bash tests/run.sh --shard ${{ matrix.shard }}/4
