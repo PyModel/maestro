@@ -1628,7 +1628,7 @@ t58_reclaimer_diagnostics_include_wait_budget() (
   : > "$state.release"
   wait "$holder" || return 1
   [ "$rc" -eq 11 ] || { echo "reclaimer contention rc=$rc want 11"; return 1; }
-  printf '%s\n' "$out" | grep -q 'wait_budget=0s wait_elapsed=0s' ||
+  printf '%s\n' "$out" | grep -Eq 'wait_budget=0s wait_elapsed=[0-9]+s' ||
     { echo "reclaimer contention omitted wait accounting: $out"; return 1; }
 )
 

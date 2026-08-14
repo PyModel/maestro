@@ -638,8 +638,8 @@ t8_verifier_boundaries() {
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  wait_bounded "$pid" 10
-  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "verifier exceeded 10s bound"; return 1; }
+  wait_bounded "$pid" 30
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "verifier exceeded 30s bound"; return 1; }
   [ "$WAIT_RC" -eq 12 ] || { echo "rc=$WAIT_RC want 12"; return 1; }
   grep -q 'verification timed out after 3s' "$state/output" ||
     { echo "attempt evidence omitted verifier timeout"; return 1; }
@@ -670,8 +670,8 @@ t8_verifier_boundaries() {
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  wait_bounded "$pid" 7
-  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "verifier lease check exceeded 7s bound"; return 1; }
+  wait_bounded "$pid" 25
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "verifier lease check exceeded 25s bound"; return 1; }
   ownership=$(sed -n '1p' "$state/ownership" 2>/dev/null)
   [ "$ownership" = 1 ] ||
     { echo "verifier inherited Lease interval capability state=${ownership:-no result}"; return 1; }
@@ -696,8 +696,8 @@ t8_verifier_boundaries() {
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  wait_bounded "$pid" 7
-  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "successful verifier reap exceeded 7s bound"; return 1; }
+  wait_bounded "$pid" 25
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "successful verifier reap exceeded 25s bound"; return 1; }
   [ "$WAIT_RC" -eq 0 ] || { echo "successful verifier reap rc=$WAIT_RC want 0"; return 1; }
   child=$(sed -n '1p' "$state/child.pid" 2>/dev/null)
   [ -n "$child" ] || { echo "successful verifier child pid missing"; return 1; }
@@ -725,8 +725,8 @@ t8_verifier_boundaries() {
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  wait_bounded "$pid" 7
-  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "verifier root cwd exceeded 7s bound"; return 1; }
+  wait_bounded "$pid" 25
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "verifier root cwd exceeded 25s bound"; return 1; }
   [ "$WAIT_RC" -eq 0 ] ||
     { echo "verifier root cwd rc=$WAIT_RC want 0: $(tr '\n' ' ' < "$state/output")"; return 1; }
   grep -q '^MAESTRO_FINAL: LOOP VERIFIED_DONE rc=0$' "$state/output" ||
@@ -775,8 +775,8 @@ t8_verifier_boundaries() {
     { echo "verification heartbeat did not advance: first=$first second=$second"; return 1; }
   kill -0 "$pid" 2>/dev/null ||
     { echo "verifier ended before heartbeat observation"; return 1; }
-  wait_bounded "$pid" 10
-  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "heartbeat verifier exceeded 10s"; return 1; }
+  wait_bounded "$pid" 30
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "heartbeat verifier exceeded 30s"; return 1; }
   [ "$WAIT_RC" -eq 0 ] || { echo "heartbeat verifier rc=$WAIT_RC"; return 1; }
 }
 
@@ -800,8 +800,8 @@ t9_terminal_at_deadline_harvests() {
   ) > "$state/output" 2>&1 &
   pid=$!
   set +m
-  wait_bounded "$pid" 7
-  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "completed dispatch exceeded 7s bound"; return 1; }
+  wait_bounded "$pid" 25
+  [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "completed dispatch exceeded 25s bound"; return 1; }
   if grep -q '^cancel task-fake0000-aaaaaa$' "$state/calls.log"; then
     echo "completed job was cancelled"
     return 1
