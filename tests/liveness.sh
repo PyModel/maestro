@@ -731,13 +731,13 @@ t8_verifier_boundaries() {
     { echo "verifier root cwd rc=$WAIT_RC want 0: $(tr '\n' ' ' < "$state/output")"; return 1; }
   grep -q '^MAESTRO_FINAL: LOOP VERIFIED_DONE rc=0$' "$state/output" ||
     { echo "verifier root cwd final missing: $(tr '\n' ' ' < "$state/output")"; return 1; }
-  local heartbeat first second verifier_alive
+  local heartbeat first second verifier_pid verifier_alive
   repo=$(new_repo verifier-heartbeat-repo)
   state="$TEST_ROOT/verifier-heartbeat-state"
   mkdir -p "$state"
   : > "$state/calls.log"
   status_empty > "$state/status.json"
-  verify="while [ ! -e '$state/allow-verifier-exit' ]; do sleep 0.1; done"
+  verify="printf '%s\n' \"\$BASHPID\" > '$state/verifier.pid'; while [ ! -e '$state/allow-verifier-exit' ]; do sleep 0.1; done"
   set -m
   (
     cd "$repo" &&
@@ -778,8 +778,11 @@ t8_verifier_boundaries() {
       *) [ "$second" -gt "$first" ] && break ;;
     esac
   done
-  kill -0 "$pid" 2>/dev/null
-  verifier_alive=$?
+  verifier_pid=$(sed -n '1p' "$state/verifier.pid" 2>/dev/null)
+  case "$verifier_pid" in
+    ''|*[!0-9]*) verifier_alive=1 ;;
+    *) kill -0 "$verifier_pid" 2>/dev/null; verifier_alive=$? ;;
+  esac
   : > "$state/allow-verifier-exit"
   case "$first:$second" in
     :*|*:|*[!0-9:]*) echo "invalid heartbeat epochs: first=$first second=$second"; return 1 ;;
