@@ -11,9 +11,27 @@ MAESTRO_JOB_LOCK_ACQUIRED=0
 export -n MAESTRO_JOB_LOCK_TOKEN MAESTRO_JOB_LOCK_DIR \
   MAESTRO_JOB_LOCK_IDENTITY MAESTRO_JOB_LOCK_ACQUIRED 2>/dev/null || :
 
+maestro_workspace_scope_root() {
+  local dir top parent selected=""
+  dir=$(pwd -P) || return 1
+  while :; do
+    if top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
+      top=$(cd "$top" 2>/dev/null && pwd -P) || return 1
+      selected=$top
+      dir=$(dirname "$top")
+    else
+      parent=$(dirname "$dir")
+      [ "$parent" != "$dir" ] || break
+      dir=$parent
+    fi
+  done
+  [ -n "$selected" ] || return 1
+  printf '%s\n' "$selected"
+}
+
 job_lock_path() {
   local workspace git_dir
-  workspace=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  workspace=$(maestro_workspace_scope_root) || return 1
   git_dir=$(git -C "$workspace" rev-parse --git-dir 2>/dev/null) || return 1
   case "$git_dir" in
     /*) ;;

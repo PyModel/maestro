@@ -211,7 +211,7 @@ Content, not refs, is what the next job reads — and anchoring to refs made the
 
 The digest value is self-describing (`tree-v3:…`). Version 3 marks the per-worktree scope; prior repo-wide `tree-v2` records are intentionally incompatible. A reader takes the **newest** record and *then* inspects the prefix: an unrecognised or `unavailable` value means **no observation** — never equal, never unequal. Selecting records by prefix instead would skip past newer records to a stale comparable one and manufacture the gap this exists to avoid. One consequence, and it is correct: the first dispatch after a digest-version change finds no comparable baseline, says nothing, and establishes a new one.
 
-Read a gap as *state diverged*, never as *the orchestrator cheated*. Lease metadata delimits an interval; it never identifies which process performed the write. The gap is recorded to `<common-git-dir>/maestro-provenance.log` and the observed state adopted, so it reports once rather than alarming forever — it does not block, and it never changes `LOOP_STATE` or an exit code.
+Read a gap as *state diverged*, never as *the orchestrator cheated*. Lease metadata delimits an interval; it never identifies which process performed the write. The gap is recorded to the current worktree's `<git-dir>/maestro-provenance.log` and the observed state adopted, so it reports once rather than alarming forever — it does not block, and it never changes `LOOP_STATE` or an exit code.
 
 A cancelled job may have left edits it never reported, so the tree can contain work with no report describing it. The provenance digest proves that the materialized tree changed; it never proves the job's intent completed.
 

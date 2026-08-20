@@ -72,6 +72,18 @@ echo "super: $SUPER"; echo "sub:   $SUB"
 SUB_RC=$(cat "$D/sub-rc.txt" 2>/dev/null)
 [ "$SUB_RC" = 11 ] || { echo "VERIFY FAIL: submodule overlap contention rc=$SUB_RC want 11"; exit 1; }
 
+SUPER_JOB=$(cd "$D/super" && bash -c "set -uo pipefail; . '$JOB_LIB'; job_lock_path")
+SUB_JOB=$(cd "$D/super/dep" && bash -c "set -uo pipefail; . '$JOB_LIB'; job_lock_path")
+echo "super job lock: $SUPER_JOB"; echo "sub job lock:   $SUB_JOB"
+[ "$SUPER_JOB" = "$SUB_JOB" ] ||
+  { echo "VERIFY FAIL: superproject/submodule job-lock paths differ"; exit 1; }
+(cd "$D/super" && bash -c "set -uo pipefail; . '$JOB_LIB'; progress_init() { :; }; job_lock_acquire write
+  cd '$D/super/dep'; unset MAESTRO_JOB_LOCK_TOKEN; export MAESTRO_LOCK_WAIT_SEC=0
+  job_lock_acquire write; echo \$? > '$D/sub-job-rc.txt'") >/dev/null 2>&1
+SUB_JOB_RC=$(cat "$D/sub-job-rc.txt" 2>/dev/null)
+[ "$SUB_JOB_RC" = 11 ] ||
+  { echo "VERIFY FAIL: submodule job-lock contention rc=$SUB_JOB_RC want 11"; exit 1; }
+
 # non-git fallback unchanged
 N=$(mktemp -d); F=$(cd "$N" && bash -c "set -uo pipefail; . '$LIB'; write_lock_path"); rm -rf "$N"
 case "$F" in */.maestro-write.lock) ;; *) echo "VERIFY FAIL: non-git fallback = $F"; exit 1;; esac

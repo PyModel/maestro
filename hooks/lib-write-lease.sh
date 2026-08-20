@@ -217,21 +217,7 @@ repo_digest_is_observed() {
 }
 
 write_lock_scope_root() {
-  local dir top parent selected=""
-  dir=$(pwd -P) || return 1
-  while :; do
-    if top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
-      top=$(cd "$top" 2>/dev/null && pwd -P) || return 1
-      selected=$top
-      dir=$(dirname "$top")
-    else
-      parent=$(dirname "$dir")
-      [ "$parent" != "$dir" ] || break
-      dir=$parent
-    fi
-  done
-  [ -n "$selected" ] || return 1
-  printf '%s\n' "$selected"
+  maestro_workspace_scope_root
 }
 
 write_lock_path() {
