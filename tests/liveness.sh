@@ -731,13 +731,13 @@ t8_verifier_boundaries() {
     { echo "verifier root cwd rc=$WAIT_RC want 0: $(tr '\n' ' ' < "$state/output")"; return 1; }
   grep -q '^MAESTRO_FINAL: LOOP VERIFIED_DONE rc=0$' "$state/output" ||
     { echo "verifier root cwd final missing: $(tr '\n' ' ' < "$state/output")"; return 1; }
-  local heartbeat first second
+  local heartbeat first second verifier_alive
   repo=$(new_repo verifier-heartbeat-repo)
   state="$TEST_ROOT/verifier-heartbeat-state"
   mkdir -p "$state"
   : > "$state/calls.log"
   status_empty > "$state/status.json"
-  verify='sleep 5'
+  verify="while [ ! -e '$state/allow-verifier-exit' ]; do sleep 0.1; done"
   set -m
   (
     cd "$repo" &&
@@ -748,7 +748,7 @@ t8_verifier_boundaries() {
         MAESTRO_TEST_STATUS="$state/status.json" \
         MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC=1 \
         MAESTRO_LOCK_HEARTBEAT_STALE_SEC=2 \
-        MAESTRO_VERIFY_TIMEOUT_SEC=8 \
+        MAESTRO_VERIFY_TIMEOUT_SEC=15 \
         bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify "$verify" \
           --max-iters 1 --poll 1
   ) > "$state/output" 2>&1 &
@@ -766,14 +766,27 @@ t8_verifier_boundaries() {
     { echo "verifier did not reach local verification"; return 1; }
   [ -f "$heartbeat" ] || { echo "verification heartbeat missing"; return 1; }
   first=$(sed -n 's/^epoch=//p' "$heartbeat" | head -1)
-  sleep 2
-  second=$(sed -n 's/^epoch=//p' "$heartbeat" | head -1)
+  case "$first" in
+    ''|*[!0-9]*) : > "$state/allow-verifier-exit"; echo "invalid first heartbeat epoch: $first"; return 1 ;;
+  esac
+  second=$first
+  for _ in 1 2 3 4 5 6; do
+    sleep 1
+    second=$(sed -n 's/^epoch=//p' "$heartbeat" | head -1)
+    case "$second" in
+      ''|*[!0-9]*) ;;
+      *) [ "$second" -gt "$first" ] && break ;;
+    esac
+  done
+  kill -0 "$pid" 2>/dev/null
+  verifier_alive=$?
+  : > "$state/allow-verifier-exit"
   case "$first:$second" in
     :*|*:|*[!0-9:]*) echo "invalid heartbeat epochs: first=$first second=$second"; return 1 ;;
   esac
   [ "$second" -gt "$first" ] ||
     { echo "verification heartbeat did not advance: first=$first second=$second"; return 1; }
-  kill -0 "$pid" 2>/dev/null ||
+  [ "$verifier_alive" -eq 0 ] ||
     { echo "verifier ended before heartbeat observation"; return 1; }
   wait_bounded "$pid" 30
   [ "$WAIT_TIMED_OUT" -eq 0 ] || { echo "heartbeat verifier exceeded 30s"; return 1; }
