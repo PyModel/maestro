@@ -78,7 +78,7 @@ echo "super job lock: $SUPER_JOB"; echo "sub job lock:   $SUB_JOB"
 [ "$SUPER_JOB" = "$SUB_JOB" ] ||
   { echo "VERIFY FAIL: superproject/submodule job-lock paths differ"; exit 1; }
 (cd "$D/super" && bash -c 'set -uo pipefail; . "$1"; progress_init() { :; }; job_lock_acquire write
-  cd "$2"; unset MAESTRO_JOB_LOCK_TOKEN; export MAESTRO_LOCK_WAIT_SEC=0
+  cd "$2" || exit 1; unset MAESTRO_JOB_LOCK_TOKEN; export MAESTRO_LOCK_WAIT_SEC=0
   job_lock_acquire write; echo $? > "$3"' _ \
   "$JOB_LIB" "$D/super/dep" "$D/sub-job-rc.txt") >/dev/null 2>&1
 SUB_JOB_RC=$(cat "$D/sub-job-rc.txt" 2>/dev/null)
