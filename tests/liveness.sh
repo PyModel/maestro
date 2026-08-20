@@ -737,7 +737,7 @@ t8_verifier_boundaries() {
   mkdir -p "$state"
   : > "$state/calls.log"
   status_empty > "$state/status.json"
-  verify="printf '%s\n' \"\$BASHPID\" > '$state/verifier.pid'; while [ ! -e '$state/allow-verifier-exit' ]; do sleep 0.1; done"
+  verify="printf '%s\n' \"\${BASHPID:-\$\$}\" > '$state/verifier.pid'; while [ ! -e '$state/allow-verifier-exit' ]; do sleep 0.1; done"
   set -m
   (
     cd "$repo" &&
