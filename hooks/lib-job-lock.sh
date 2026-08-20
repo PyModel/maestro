@@ -14,7 +14,7 @@ export -n MAESTRO_JOB_LOCK_TOKEN MAESTRO_JOB_LOCK_DIR \
 job_lock_path() {
   local workspace git_dir
   workspace=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
-  git_dir=$(git -C "$workspace" rev-parse --git-common-dir 2>/dev/null) || return 1
+  git_dir=$(git -C "$workspace" rev-parse --git-dir 2>/dev/null) || return 1
   case "$git_dir" in
     /*) ;;
     *) git_dir="$workspace/$git_dir" ;;
@@ -486,7 +486,7 @@ job_lock_acquire() { # read|write
   MAESTRO_JOB_LOCK_DIR=$(job_lock_path) || return 3
   metadata="$MAESTRO_JOB_LOCK_DIR/metadata"
 
-  wait_cap=${MAESTRO_LOCK_WAIT_SEC:-300}
+  wait_cap=${MAESTRO_LOCK_WAIT_SEC:-14400}
   wait_poll=${MAESTRO_LOCK_WAIT_POLL_SEC:-5}
   case "$wait_cap" in
     *[!0-9]*)

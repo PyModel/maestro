@@ -47,17 +47,20 @@ t1_clean_filter_cannot_hide_materialized_changes() {
   [ "$before" != "$after" ] || { echo "clean filter hid a working-tree byte change"; return 1; }
 }
 
-t2_prunable_worktree_does_not_disable_healthy_root() {
-  local repo worktree output rc
-  repo=$(new_repo prunable-main)
-  worktree="$TEST_ROOT/prunable-wt"
-  git -C "$repo" worktree add -q "$worktree" -b prunable-branch || return 1
-  rm -rf "$worktree"
-  git -C "$repo" worktree list --porcelain | grep -q '^prunable' ||
-    { echo "git did not mark removed worktree prunable"; return 1; }
-  output=$(digest "$repo"); rc=$?
-  [ "$rc" -eq 0 ] || { echo "digest rc=$rc with one healthy root"; return 1; }
-  case "$output" in tree-v2:*) ;; *) echo "digest=$output"; return 1 ;; esac
+t2_linked_worktree_changes_are_isolated() {
+  local repo worktree main_before main_after worktree_before worktree_after
+  repo=$(new_repo isolated-main)
+  worktree="$TEST_ROOT/isolated-wt"
+  git -C "$repo" worktree add -q "$worktree" -b isolated-branch >/dev/null 2>&1 || return 1
+  main_before=$(digest "$repo") || { echo "main digest failed"; return 1; }
+  worktree_before=$(digest "$worktree") || { echo "worktree digest failed"; return 1; }
+  printf 'worktree-only change\n' > "$worktree/seed.txt"
+  main_after=$(digest "$repo") || { echo "main digest after worktree edit failed"; return 1; }
+  worktree_after=$(digest "$worktree") || { echo "worktree digest after edit failed"; return 1; }
+  [ "$main_before" = "$main_after" ] ||
+    { echo "another worktree changed the main worktree digest"; return 1; }
+  [ "$worktree_before" != "$worktree_after" ] ||
+    { echo "worktree-local change was invisible"; return 1; }
 }
 
 t3_untracked_nested_repository_is_observed() {
@@ -170,7 +173,7 @@ EOF
   chmod +x "$shim/shasum"
   output=$(cd "$repo" && PATH="$shim:$PATH" bash -c "exec 3>&-; set -uo pipefail; . '$LIB'; repo_digest") 2>/dev/null ||
     { echo "digest failed when shasum was unavailable"; return 1; }
-  case "$output" in tree-v2:*) ;; *) echo "digest=$output"; return 1 ;; esac
+  case "$output" in tree-v3:*) ;; *) echo "digest=$output"; return 1 ;; esac
 }
 
 t6_provenance_append_never_follows_symlink() {
@@ -250,7 +253,7 @@ check() {
 
 printf '=== Provenance edge verification ===\n'
 check t1_clean_filter_cannot_hide_materialized_changes "digest hashes materialized bytes without clean filters"
-check t2_prunable_worktree_does_not_disable_healthy_root "one prunable worktree does not disable healthy roots"
+check t2_linked_worktree_changes_are_isolated "linked worktree changes remain outside this task's provenance"
 check t3_untracked_nested_repository_is_observed "untracked nested repositories are observed as materialized roots"
 check t4_release_publishes_baseline_before_handoff "baseline publication is serialized with lease handoff"
 check t5_digest_does_not_depend_on_shasum "digest remains available without the non-portable shasum utility"

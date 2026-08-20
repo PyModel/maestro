@@ -26,14 +26,13 @@ _MAESTRO_WRITE_LEASE_RETAIN=0
 export -n MAESTRO_LOCK_TOKEN MAESTRO_LOCK_DIR MAESTRO_LOCK_IDENTITY \
   MAESTRO_LOCK_ACQUIRED 2>/dev/null || :
 repo_digest() {
-  local inside worktrees roots root_list digest material tracked untracked paths entries
-  local regular_paths hashes link_output link_rc path type mode contents worktree nested_list candidate nested_top
+  local inside worktree roots root_list digest material tracked untracked paths entries
+  local regular_paths hashes link_output link_rc path type mode contents nested_list candidate nested_top
   local root_queue discovered root
   inside=$(git rev-parse --is-inside-work-tree 2>/dev/null) || return 1
   [ "$inside" = "true" ] || return 1
-  worktrees=$(git worktree list --porcelain 2>/dev/null) || return 1
-  worktrees=$(printf '%s\n' "$worktrees" | sed -n 's/^worktree //p' | LC_ALL=C sort) || return 1
-  [ -n "$worktrees" ] || return 1
+  worktree=$(write_lock_scope_root) || return 1
+  [ -d "$worktree" ] || return 1
   root_list=$(mktemp "${TMPDIR:-/tmp}/maestro-repo-roots.XXXXXX") || return 1
   root_queue="${root_list}.queue"
   discovered="${root_list}.discovered"
@@ -41,15 +40,7 @@ repo_digest() {
   if ! (
     : > "$root_list" || exit 1
     : > "$root_queue" || exit 1
-    while IFS= read -r worktree; do
-      [ -n "$worktree" ] || continue
-      if [ ! -d "$worktree" ] ||
-        ! git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        printf 'MAESTRO_DIGEST: skipping invalid/prunable worktree record: %s\n' "$worktree" >&2
-        continue
-      fi
-      printf '%s\n' "$worktree" >> "$root_queue" || exit 1
-    done <<< "$worktrees"
+    printf '%s\n' "$worktree" >> "$root_queue" || exit 1
 
     exec 9< "$root_queue" || exit 1
     while IFS= read -r root <&9; do
@@ -189,7 +180,7 @@ repo_digest() {
   fi
   rm -f "$material" "$tracked" "$untracked" "$paths" "$entries" "$regular_paths" "$hashes"
   [ -n "$digest" ] || return 1
-  printf 'tree-v2:%s\n' "$digest"
+  printf 'tree-v3:%s\n' "$digest"
 }
 
 repo_digest_bounded() {
@@ -220,7 +211,7 @@ repo_digest_bounded() {
 
 repo_digest_is_observed() {
   case "$1" in
-    tree-v2:*) return 0 ;;
+    tree-v3:*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -246,8 +237,7 @@ write_lock_scope_root() {
 write_lock_path() {
   local workspace git_dir
   if workspace=$(write_lock_scope_root); then
-    if { git_dir=$(git -C "$workspace" rev-parse --git-common-dir 2>/dev/null) && [ -n "$git_dir" ]; } ||
-      git_dir=$(git -C "$workspace" rev-parse --git-dir 2>/dev/null); then
+    if git_dir=$(git -C "$workspace" rev-parse --git-dir 2>/dev/null); then
       case "$git_dir" in
         /*) ;;
         *) git_dir="$workspace/$git_dir" ;;
@@ -593,9 +583,9 @@ write_lock_acquire() {
   MAESTRO_LOCK_DIR=$(write_lock_path) || return 3
   metadata="$MAESTRO_LOCK_DIR/metadata"
 
-  wait_cap=${MAESTRO_LOCK_WAIT_SEC:-300}
+  wait_cap=${MAESTRO_LOCK_WAIT_SEC:-14400}
   wait_poll=${MAESTRO_LOCK_WAIT_POLL_SEC:-5}
-  # A typo must fail fast: a 300-second fallback would turn bad input into a five-minute stall.
+  # A typo must fail fast: silently substituting a long default would hide bad input.
   case "$wait_cap" in
     *[!0-9]*)
       progress "MAESTRO_LOCK: invalid MAESTRO_LOCK_WAIT_SEC=$wait_cap; waiting disabled"
