@@ -196,8 +196,8 @@ kill without a recovery daemon.
 
 | Store | Location | Schema | Written by | Read by |
 |---|---|---|---|---|
-| Write Lease interval | `<git-common-dir>/maestro-write.lock/` | Directory (mutex via `mkdir`); `metadata` file: `token`, `pid`, `process_start`, `job_id`, `session_id`, `started_at`, `started_epoch`, `digest_before`, plus poison fields `quiescence=unconfirmed`, `unconfirmed_job`, `unconfirmed_reason`; `heartbeat` (`token`, `epoch`); staged poison `metadata.new`; generation claim `.reclaim/` | Lease owner; poison stager; reclaimers | Contenders, `--clear-lease`, gate lifecycle |
-| Provenance log | `<git-common-dir>/maestro-provenance.log` | One record per line, appended with `O_NOFOLLOW`, `0600`. `dispatch`/`orphan-adopted` records: `<timestamp> type=dispatch\|orphan-adopted job=<id> session=<id\|unknown> before=<tree-v2:…> after=<tree-v2:…>`; `gap` records: `<timestamp> type=gap prior_job=<id> session=<id\|unknown> expected=<tree-v2:…> observed=<tree-v2:…>` | Lease release (dispatch), acquisition (gap), stale reclaim (orphan-adopted) | Next acquirer (baseline comparison), `provenance_check` |
+| Write Lease interval | `<git-dir>/maestro-write.lock/` | Per-worktree directory (mutex via `mkdir`); `metadata` file: `token`, `pid`, `process_start`, `job_id`, `session_id`, `started_at`, `started_epoch`, `digest_before`, plus poison fields `quiescence=unconfirmed`, `unconfirmed_job`, `unconfirmed_reason`; `heartbeat` (`token`, `epoch`); staged poison `metadata.new`; generation claim `.reclaim/` | Lease owner; poison stager; reclaimers | Contenders in the same worktree, `--clear-lease`, gate lifecycle |
+| Provenance log | `<git-dir>/maestro-provenance.log` | Per-worktree records, one per line, appended with `O_NOFOLLOW`, `0600`. `dispatch`/`orphan-adopted` records: `<timestamp> type=dispatch\|orphan-adopted job=<id> session=<id\|unknown> before=<tree-v3:…> after=<tree-v3:…>`; `gap` records: `<timestamp> type=gap prior_job=<id> session=<id\|unknown> expected=<tree-v3:…> observed=<tree-v3:…>` | Lease release (dispatch), acquisition (gap), stale reclaim (orphan-adopted) | Next acquirer in that worktree (baseline comparison), `provenance_check` |
 | Discussion transcript | `~/.maestro/discussions/<workspace>-<pathhash12>-<slug>.md` | Markdown; turn headers `### Claude (turn N)` / `### Codex (turn N · model=… effort=…)`; sidecar `<T>.state` (`turns`, `awaiting_reply`, `rollback_bytes`); `<T>.lock/` with `metadata` | `discussion-loop.sh` | `discussion-loop.sh`, the orchestrator (relays), users |
 | Direct-edit authorization | `~/.maestro/direct-edit/maestro-direct-<sid>.flag` | Exactly `1\n`, owner-only `0600`, directory `0700` | `orchestrator-inject.mjs` | `orchestrator-gate.mjs` |
 | Session-start preference | `~/.maestro/ask-on-start` | Empty marker file; armed by default on first install, managed by `codex-model-select.sh --ask-on-start on\|off` and removed by uninstall | `install.mjs`, `codex-model-select.sh` | `session-start.mjs`, `uninstall.mjs` |
@@ -260,7 +260,7 @@ alive, or while the generation changed).
 
 ### 3.4 Schema design principles
 
-- **Self-describing records** (`tree-v2:…` digests, `state=…` facts) so a
+- **Self-describing records** (`tree-v3:…` digests, `state=…` facts) so a
   reader can detect "no observation" without guessing.
 - **Atomicity before durability**: every state transition is temp-file +
   rename; poison is staged *before* external cancellation is attempted.
@@ -339,7 +339,7 @@ Knobs are environment variables read at runtime, each validated and
 fail-safed (invalid values warn and fall back, never silently change
 semantics): `MAESTRO_MAX_DISPATCH_SEC` (2400 write / 1200 read), 
 `MAESTRO_VERIFY_TIMEOUT_SEC` (900), `MAESTRO_COMPANION_TIMEOUT_SEC` (120),
-`MAESTRO_DIGEST_TIMEOUT_SEC` (120), `MAESTRO_LOCK_WAIT_SEC` (300, `0` disables),
+`MAESTRO_DIGEST_TIMEOUT_SEC` (120), `MAESTRO_LOCK_WAIT_SEC` (14400, `0` disables),
 `MAESTRO_LOCK_WAIT_POLL_SEC` (5), `MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC` (20),
 `MAESTRO_LOCK_HEARTBEAT_STALE_SEC` (90), `MAESTRO_SESSION_ID`,
 `MAESTRO_SUITE_TIMEOUT_SEC` (600), `MAESTRO_MAX_ROUNDS` (6),
@@ -482,17 +482,18 @@ documented remedy is to be harder on the diff, not to pretend independence.
 
 ### 7.1 Scaling model
 
-Maestro is **deliberately non-horizontal**: one working tree permits exactly
-one write Lease interval at a time. Concurrency between sessions is handled by
-contention *waiting* (`MAESTRO_LOCK_WAIT_SEC`, default 300s, unordered,
-bounded) and generation-fenced reclaim, never by parallel writers. Vertical
-scaling is by model choice: the orchestrator model and the Codex
-model/effort tiers are runtime-selectable knobs (`codex-model-select.sh`),
-with separate effort tiers for debate vs. implementation.
+Maestro scales horizontally only through isolated Git worktrees: one
+orchestrator task and one write Lease interval per materialized worktree.
+Treehouse supplies and retains those pooled worktrees; Maestro deliberately
+depends only on standard Git `--git-dir` semantics and never parses Treehouse
+state. Sessions inside one worktree remain serialized by an unordered, bounded
+wait (`MAESTRO_LOCK_WAIT_SEC`, default 14400s) and generation-fenced reclaim.
+Separate worktrees may write their own branches concurrently.
 
 What the design optimizes instead:
 
-- **Serial safety** — one writer, bounded waits, no starvation beyond the cap.
+- **Local serial safety** — one writer per worktree, bounded waits, no duplicate dispatch.
+- **Task isolation** — write/job locks and provenance never cross a worktree boundary.
 - **Predictable termination** — every run has a hard ceiling and a
   machine-readable end state.
 - **Cheap re-entry** — a crashed run leaves files, not locks in memory;
@@ -500,12 +501,10 @@ What the design optimizes instead:
 
 **Worst-case lease hold.** One Lease interval spans, per iteration: dispatch
 (≤ 2400s) + local verification (≤ 900s) + two bounded tree digests (≤ 120s
-each) — up to `--max-iters` (default 4) iterations. A single run can therefore
-hold the exclusive lease for hours while competitors wait only
-`MAESTRO_LOCK_WAIT_SEC` (default 300s) before hard-`BLOCKED`. That is the
-accepted serialization cost of exclusive ownership: contention is resolved by
-waiting and queueing discipline, never by parallel writers, and the caps make
-the worst case finite.
+each) — up to `--max-iters` (default 4) iterations, or 14,160 seconds. The
+default 14,400-second contention cap covers that bounded run plus 240 seconds
+of orchestration overhead. A poison, malformed owner, or unconfirmed writer
+still fails closed instead of waiting blindly.
 
 ### 7.2 Performance techniques
 
@@ -514,7 +513,7 @@ the worst case finite.
 | Process supervision | Every spawned process runs in its own process group; TERM → 5s grace → KILL; descendants are reaped on every terminal path (verifier, dispatch, tests) |
 | Polling | Poll sleeps clip to the nearest idle or dispatch deadline; status calls reuse a bounded per-call timeout; log-size growth tracked to detect liveness without polling output lines; 4 consecutive empty/malformed statuses fail closed |
 | Budgets | `MAESTRO_MAX_DISPATCH_SEC` hard ceiling (2400s write / 1200s read, explicit values exact); midpoint warning; idle measured as elapsed time since last observed log growth (`--max-idle` default 300s, via bash `SECONDS` — wall-clock-derived, not a true monotonic clock); local verifier deadline 900s in its own group |
-| Tree digest | `git hash-object --no-filters` streams file content through Git itself (no `shasum` dependency); bounded by `MAESTRO_DIGEST_TIMEOUT_SEC` (120s); timeout degrades to `unavailable` (comparison disabled) rather than blocking dispatch; nested worktrees/submodules included, ignored paths excluded on cost grounds |
+| Tree digest | `git hash-object --no-filters` streams current-worktree content through Git itself (no `shasum` dependency); bounded by `MAESTRO_DIGEST_TIMEOUT_SEC` (120s); timeout degrades to `unavailable` (comparison disabled) rather than blocking dispatch; initialized submodules and non-ignored nested repositories included, other linked worktrees excluded |
 | Retry discipline | Loop iterations capped (`--max-iters`, default 4, 0 prohibited); discussion capped at 6 turns with configured retries; never dispatching the identical plan a third time is a rule-level discipline (`rules/orchestrator-implementer.md`), not an enforced technique |
 | I/O | Atomic renames for every state write; xargs-serial hashing preserves order; preview lines diffed against the previous sample to emit only deltas |
 

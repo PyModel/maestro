@@ -294,7 +294,7 @@ t5_repo_digest_survives_refactor() {
   rc=$?
   [ "$rc" -eq 0 ] || { echo "rc=$rc want 0"; return 1; }
   case "$output" in
-    tree-v2:*) ;;
+    tree-v3:*) ;;
     *) echo "digest=$output"; return 1 ;;
   esac
 }
@@ -592,7 +592,7 @@ check t1_hanging_status_is_bounded "hanging status honors the companion timeout"
 check t2_timeout_reaps_process_group "timeout returns 125 and reaps the process group"
 check t3_run_bounded_returns_wrapped_rc "bounded runner preserves stdout and command rc"
 check t4_invalid_companion_timeout_falls_back "invalid companion timeout falls back to 120s"
-check t5_repo_digest_survives_refactor "bounded repository digest still returns tree-v2"
+check t5_repo_digest_survives_refactor "bounded repository digest still returns tree-v3"
 check t6_poll_hanging_status_is_bounded "poll loop bounds repeated hanging statuses"
 check t7_fast_status_has_no_one_second_floor "five fast status calls finish under two seconds"
 check t8_explicit_read_ignores_inherited_lease "explicit read mode ignores inherited Lease interval state"

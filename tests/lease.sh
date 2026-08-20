@@ -421,7 +421,7 @@ t17() (
   local dir log; dir=$(ws legacy_baseline)
   git -C "$dir" init -q
   log="$dir/.git/maestro-provenance.log"
-  printf '2026-01-01T00:00:00Z type=dispatch job=legacy-job before=tree-v2:old after=tree-v2:old\n' > "$log"
+  printf '2026-01-01T00:00:00Z type=dispatch job=legacy-job before=tree-v3:old after=tree-v3:old\n' > "$log"
   cd "$dir" || exit 1; . "$LIB"; progress_init
   write_lock_acquire task-new00000-cccccc >/dev/null 2>&1
   grep -q ' type=gap prior_job=legacy-job ' "$log" ||
@@ -649,7 +649,7 @@ t27() (
       [ "$recorded_token" = "$MAESTRO_LOCK_TOKEN" ] &&
       [ "$recorded_pid" = "$$" ] || return 1
     sed -n '1,7p' "$metadata" > "$identity_before" || return 1
-    printf 'tree-v2:identity-published\n'
+    printf 'tree-v3:identity-published\n'
   }
   write_lock_acquire task-published-first-aaaaaa >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 0 ] || { echo "rc=$rc want 0"; return 1; }
@@ -666,7 +666,7 @@ t27() (
     ''|*[!0-9]*) echo "published pid is not numeric: $owner_pid"; return 1 ;;
   esac
   [ "$owner_pid" = "$$" ] || { echo "pid=$owner_pid want $$"; return 1; }
-  grep -qx 'digest_before=tree-v2:identity-published' "$metadata" ||
+  grep -qx 'digest_before=tree-v3:identity-published' "$metadata" ||
     { echo "digest ran before identity publication"; return 1; }
   write_lock_release >/dev/null 2>&1
   [ ! -d "$dir/.maestro-write.lock" ] ||
@@ -1980,6 +1980,32 @@ t68_token_failure_precedes_creation() (
     { echo "token generation failure created a canonical lock"; return 1; }
 )
 
+t69_default_wait_covers_a_default_implementation_run() (
+  local dir deadline_file before deadline budget out rc
+  dir=$(ws default_implementation_wait)
+  deadline_file="$dir/deadline"
+  cd "$dir" || exit 1
+  . "$LIB"
+  progress_init
+  PATH=$(confirmed_ps_path "$dir"); export PATH
+  write_lock_acquire task-default-wait-holder-aaaaaa >/dev/null 2>&1 || return 1
+  unset MAESTRO_LOCK_TOKEN MAESTRO_LOCK_WAIT_SEC
+  export MAESTRO_LOCK_WAIT_POLL_SEC=1
+  write_lock_wait_tick() {
+    printf '%s\n' "$1" > "$deadline_file"
+    return 1
+  }
+  before=$(date +%s)
+  out=$(write_lock_acquire 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  deadline=$(cat "$deadline_file") || return 1
+  budget=$((deadline - before))
+  [ "$budget" -ge 14399 ] && [ "$budget" -le 14401 ] ||
+    { echo "default wait budget=${budget}s want 14400s"; return 1; }
+  printf '%s\n' "$out" | grep -q 'wait_budget=14400s' ||
+    { echo "default wait diagnostic missing 14400s budget: $out"; return 1; }
+)
+
 
 
 printf '=== Plan F green-phase verification ===\n'
@@ -2005,7 +2031,8 @@ for t in t1 t2 t3 t4 t5 t5b t6 t7 t7b t8 t9 t9b t10a t10b t11 t12 t13 t14 t15 t1
   t65_poison_finalize_rejects_a_preexisting_same_token_successor \
   t66_failed_publication_retirement_blocks \
   t67_identity_failure_retirement_blocks \
-  t68_token_failure_precedes_creation; do
+  t68_token_failure_precedes_creation \
+  t69_default_wait_covers_a_default_implementation_run; do
   msg=$($t 2>&1) && ok "$t" || bad "$t" "${msg:-no detail}"
 done
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"

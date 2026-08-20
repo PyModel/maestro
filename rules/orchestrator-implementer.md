@@ -18,6 +18,16 @@ Effort guide: minimal/low for quick mechanical work, medium for default implemen
 
 ## Dispatch
 
+### Parallel terminals
+
+One orchestrator session owns one task and one worktree. For parallel work,
+run `treehouse get` in each terminal, then start exactly one orchestrator inside
+each leased shell. Never enter another active task's Treehouse path, switch or
+rewrite its branch, or dispatch two independent plans from one worktree.
+Treehouse owns allocation and return; Maestro never cleans, resets, merges, or
+returns the worktree. If two orchestrators share a worktree by mistake, Maestro
+serializes their jobs; this is safe fallback, not task isolation.
+
 ```
 # Claude Bash tool: run_in_background: true
 bash ~/.claude/hooks/implementer-loop.sh --plan <plan-file> --verify "<verify command>" [--max-iters 4]   # default
@@ -34,9 +44,9 @@ Write access is real — Codex edits your working tree directly. Scope the plan 
 
 **Orchestrator patience is mandatory.** After dispatching a write-mode job, yield immediately. Perform no workspace reads, verification commands, or diff review until that job reports completion. Reading a tree while Codex is still writing reviews a moving target and silently defeats the loop's final gate.
 
-One Implementation run holds one Lease interval across every Write turn and local Verification transaction. Its ownership domain spans linked worktrees and superproject/submodule overlaps. Contention waits up to `MAESTRO_LOCK_WAIT_SEC` (default 300 seconds, `0` disables waiting) only while the Lease interval has a confirmed release path; each sleep is clipped to the remaining cap. Stale reclaim is token-conditioned, and repository safety queries deliberately ignore companion session filtering and accept compact or pretty valid JSON only. A stale heartbeat is only a recovery candidate: `--clear-lease` still refuses while the recorded owner process is alive or unidentifiable, or any repository-global companion writer is visible. A metadata-less lock younger than five seconds may still be in its atomic-publication window and is not clearable. Never break the lock manually; if cancellation left quiescence unconfirmed, first prove no Codex job is writing, then run `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`.
+One Implementation run holds one Lease interval across every Write turn and local Verification transaction. Its ownership domain is one materialized worktree, including superproject/submodule overlaps; linked worktrees have independent domains. Contention waits up to `MAESTRO_LOCK_WAIT_SEC` (default 14,400 seconds, `0` disables waiting) only while the Lease interval has a confirmed release path; each sleep is clipped to the remaining cap. The default covers the bounded worst case of a default Implementation run, so a healthy holder does not require a manual requeue. Stale reclaim is token-conditioned, and repository safety queries deliberately ignore companion session filtering and accept compact or pretty valid JSON only. A stale heartbeat is only a recovery candidate: `--clear-lease` still refuses while the recorded owner process is alive or unidentifiable, or any same-worktree companion writer is visible. A metadata-less lock younger than five seconds may still be in its atomic-publication window and is not clearable. Never break the lock manually; if cancellation left quiescence unconfirmed, first prove no Codex job is writing, then run `bash ~/.claude/hooks/implementer-loop.sh --clear-lease`.
 
-All Maestro companion dispatches—Write turns, debates, and future Read adapters—serialize on a per-workspace job lock for the companion job's full lifetime. Recover a stale lock with `bash ~/.claude/hooks/implementer-loop.sh --clear-job-lock`; direct non-Maestro companion launches bypass this mutex because it is a Maestro convention, not a companion capability.
+All Maestro companion dispatches—Write turns, debates, and future Read adapters—serialize on a per-worktree job lock for the companion job's full lifetime. Recover a stale lock with `bash ~/.claude/hooks/implementer-loop.sh --clear-job-lock`; direct non-Maestro companion launches bypass this mutex because it is a Maestro convention, not a companion capability.
 
 **Scout** is read-only repository reconnaissance on a separately pinned small model. Pin it with `bash ~/.claude/hooks/codex-model-select.sh --scout <model> <effort>` and dispatch it with `bash ~/.claude/hooks/scout.sh --query <file>`; it serializes on the companion job lock and fails closed when unpinned.
 
@@ -187,11 +197,11 @@ One hole, now version-conditional:
 
 - Fixed on Claude Code versions whose subagent PreToolUse payloads carry `agent_id`/`agent_type`: the gate refuses the override when either is present. On older versions that omit the fields, the original hole remains — there is no cross-version schema guarantee.
 
-Fixed: lease scope now selects the outermost enclosing repository and its `--git-common-dir`, so linked worktrees and superproject/submodule entry points serialize one overlapping writable tree.
+Fixed: lease scope selects the outermost enclosing repository and its per-worktree `--git-dir`. Superproject/submodule entry points serialize because they overlap one materialized tree; linked worktrees do not because Treehouse tasks must run independently.
 
 **Detection, since prevention is unavailable.** A probe measured it: `Edit` and `Write` are blocked, while a `Bash` redirect, `sed -i`, and `git commit` all reached the tree and moved `HEAD`. Prevention would mean enumerating an unbounded set of write paths, so Maestro compares state instead — path-agnostic, and indifferent to whether bytes arrived via `Edit`, `Bash`, an MCP tool, or a workflow agent.
 
-Each write-mode acquisition digests the **materialized tree**—path, entry type, Git-visible executable mode, and actual bytes with clean filters disabled—for tracked and non-ignored untracked files across healthy linked worktrees, initialized submodules, and non-ignored nested repositories. Invalid/prunable worktree records are skipped independently instead of disabling every healthy root. Git itself hashes the final stream, so minimal Linux hosts do not need `shasum`. `MAESTRO_DIGEST_TIMEOUT_SEC` bounds a snapshot (default 120); expiry records `unavailable` and disables that comparison rather than blocking dispatch. Baseline/log publication stays inside the lease-generation claim and atomically replaces, never follows, a provenance-log symlink. `HEAD` and the index are deliberately *not* covered. A mismatch prints one line before the job starts:
+Each write-mode acquisition digests the current task's **materialized tree**—path, entry type, Git-visible executable mode, and actual bytes with clean filters disabled—for tracked and non-ignored untracked files in that worktree, its initialized submodules, and its non-ignored nested repositories. Other linked worktrees are deliberately excluded. Git itself hashes the final stream, so minimal Linux hosts do not need `shasum`. `MAESTRO_DIGEST_TIMEOUT_SEC` bounds a snapshot (default 120); expiry records `unavailable` and disables that comparison rather than blocking dispatch. Baseline/log publication stays inside the lease-generation claim and atomically replaces, never follows, a provenance-log symlink. `HEAD` and the index are deliberately *not* covered. A mismatch prints one line before the job starts:
 
 ```
 PROVENANCE: BASELINE GAP — tree at acquisition differs from the prior completed snapshot (prior_job=…, expected=…, observed=…); author unknown
@@ -199,9 +209,9 @@ PROVENANCE: BASELINE GAP — tree at acquisition differs from the prior complete
 
 Content, not refs, is what the next job reads — and anchoring to refs made the loop's own prescribed step fire the alarm. Reviewing a dispatch and committing it moved the digest without changing a byte on disk, so every round reported a gap: a 100% false-positive rate on the normal path, which is the alarm fatigue this design rejected when it ruled out sticky warnings. So committing does not move the digest; a `checkout`, `reset`, or stray `sed -i` that changes content still does. A history rewrite that preserves file content is invisible, which is intended.
 
-The digest value is self-describing (`tree-v2:…`). A reader takes the **newest** record and *then* inspects the prefix: an unrecognised or `unavailable` value means **no observation** — never equal, never unequal. Selecting records by prefix instead would skip past newer records to a stale comparable one and manufacture the gap this exists to avoid. One consequence, and it is correct: the first dispatch after a digest-version change finds no comparable baseline, says nothing, and establishes a new one.
+The digest value is self-describing (`tree-v3:…`). Version 3 marks the per-worktree scope; prior repo-wide `tree-v2` records are intentionally incompatible. A reader takes the **newest** record and *then* inspects the prefix: an unrecognised or `unavailable` value means **no observation** — never equal, never unequal. Selecting records by prefix instead would skip past newer records to a stale comparable one and manufacture the gap this exists to avoid. One consequence, and it is correct: the first dispatch after a digest-version change finds no comparable baseline, says nothing, and establishes a new one.
 
-Read a gap as *state diverged*, never as *the orchestrator cheated*. Lease metadata delimits an interval; it never identifies which process performed the write. The gap is recorded to `<common-git-dir>/maestro-provenance.log` and the observed state adopted, so it reports once rather than alarming forever — it does not block, and it never changes `LOOP_STATE` or an exit code.
+Read a gap as *state diverged*, never as *the orchestrator cheated*. Lease metadata delimits an interval; it never identifies which process performed the write. The gap is recorded to the current worktree's `<git-dir>/maestro-provenance.log` and the observed state adopted, so it reports once rather than alarming forever — it does not block, and it never changes `LOOP_STATE` or an exit code.
 
 A cancelled job may have left edits it never reported, so the tree can contain work with no report describing it. The provenance digest proves that the materialized tree changed; it never proves the job's intent completed.
 

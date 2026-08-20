@@ -916,6 +916,33 @@ t22_post_move_unlock_failure_does_not_reclassify_release() (
     { echo "post-move unlock failure diagnostic missing"; return 1; }
 )
 
+t23_default_wait_covers_a_default_implementation_run() (
+  local repo deadline_file before deadline budget output rc
+  repo="$TEST_ROOT/t23"
+  new_repo "$repo"
+  repo=$(cd "$repo" && pwd -P)
+  deadline_file="$repo/deadline"
+  cd "$repo" || exit 1
+  . "$COMPANION_LIB"
+  progress_init
+  job_lock_acquire write >/dev/null 2>&1 || return 1
+  unset MAESTRO_JOB_LOCK_TOKEN MAESTRO_LOCK_WAIT_SEC
+  export MAESTRO_LOCK_WAIT_POLL_SEC=1
+  job_lock_wait_tick() {
+    printf '%s\n' "$1" > "$deadline_file"
+    return 1
+  }
+  before=$(date +%s)
+  output=$(job_lock_acquire write 3>&1 >/dev/null 2>&1); rc=$?
+  [ "$rc" -eq 11 ] || { echo "rc=$rc want 11"; return 1; }
+  deadline=$(cat "$deadline_file") || return 1
+  budget=$((deadline - before))
+  [ "$budget" -ge 14399 ] && [ "$budget" -le 14401 ] ||
+    { echo "default wait budget=${budget}s want 14400s"; return 1; }
+  printf '%s\n' "$output" | grep -q 'companion dispatch blocked' ||
+    { echo "terminal contention diagnostic missing: $output"; return 1; }
+)
+
 
 
 
@@ -946,6 +973,7 @@ check t19_failed_publication_retirement_blocks "failed publication blocks when i
 check t20_identity_failure_retirement_blocks "identity failure blocks when its generation cannot retire"
 check t21_token_failure_precedes_creation "token generation fails before canonical creation"
 check t22_post_move_unlock_failure_does_not_reclassify_release "post-move gate cleanup failure does not reclassify release"
+check t23_default_wait_covers_a_default_implementation_run "default job-lock wait covers a default Implementation run"
 check t8_generation_claim_serializes_reclaimers "generation claims serialize reclaimers and preserve successors"
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
