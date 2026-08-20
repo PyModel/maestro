@@ -765,6 +765,14 @@ t8_verifier_boundaries() {
   grep -q 'LOOP: RESULT: DONE on iteration 1' "$state/output" ||
     { echo "verifier did not reach local verification"; return 1; }
   [ -f "$heartbeat" ] || { echo "verification heartbeat missing"; return 1; }
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    [ -s "$state/verifier.pid" ] && break
+    sleep 1
+  done
+  verifier_pid=$(sed -n '1p' "$state/verifier.pid" 2>/dev/null)
+  case "$verifier_pid" in
+    ''|*[!0-9]*) : > "$state/allow-verifier-exit"; echo "invalid verifier pid: $verifier_pid"; return 1 ;;
+  esac
   first=$(sed -n 's/^epoch=//p' "$heartbeat" | head -1)
   case "$first" in
     ''|*[!0-9]*) : > "$state/allow-verifier-exit"; echo "invalid first heartbeat epoch: $first"; return 1 ;;
@@ -778,11 +786,8 @@ t8_verifier_boundaries() {
       *) [ "$second" -gt "$first" ] && break ;;
     esac
   done
-  verifier_pid=$(sed -n '1p' "$state/verifier.pid" 2>/dev/null)
-  case "$verifier_pid" in
-    ''|*[!0-9]*) verifier_alive=1 ;;
-    *) kill -0 "$verifier_pid" 2>/dev/null; verifier_alive=$? ;;
-  esac
+  kill -0 "$verifier_pid" 2>/dev/null
+  verifier_alive=$?
   : > "$state/allow-verifier-exit"
   case "$first:$second" in
     :*|*:|*[!0-9:]*) echo "invalid heartbeat epochs: first=$first second=$second"; return 1 ;;
