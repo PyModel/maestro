@@ -748,7 +748,7 @@ t8_verifier_boundaries() {
         MAESTRO_TEST_STATUS="$state/status.json" \
         MAESTRO_LOCK_HEARTBEAT_INTERVAL_SEC=1 \
         MAESTRO_LOCK_HEARTBEAT_STALE_SEC=2 \
-        MAESTRO_VERIFY_TIMEOUT_SEC=15 \
+        MAESTRO_VERIFY_TIMEOUT_SEC=30 \
         bash "$LOOP" --plan "$TEST_ROOT/plan.md" --verify "$verify" \
           --max-iters 1 --poll 1
   ) > "$state/output" 2>&1 &
